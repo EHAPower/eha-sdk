@@ -1,0 +1,31 @@
+name: Tool
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: eha-tool
+      - uses: actions/checkout@v4
+        with:
+          repository: EHAPower/eha-sdk
+          path: eha-sdk
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Prepare Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy rustfmt
+      - name: Check tool and WebUI
+        working-directory: eha-tool
+        run: python3 scripts/check.py

@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <meta name="description" content="EHA 控制器本机维护与控制页面。">
+    <title>EHA Control Center</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/styles.css">
+    <script defer src="/vendor/echarts.min.js"></script>
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#main-content">跳到主要内容</a>
+    <div class="app-shell">
+      <aside class="sidebar" id="sidebar" aria-label="主导航" inert>
+        <a class="brand" href="#overview" aria-label="EHA Control Center，总览">
+          <span class="brand-mark" aria-hidden="true"><svg><use href="#icon-actuator"></use></svg></span>
+          <span><strong>EHA</strong><small>Control Center</small></span>
+        </a>
+        <button class="sidebar-close icon-button" id="sidebar-close" data-ui-control aria-label="关闭导航"><svg aria-hidden="true"><use href="#icon-x"></use></svg></button>
+        <div class="sidebar-note"><span class="status-dot neutral"></span>本机 SDK 会话与独立 ODrive USB 读取</div>
+        <nav class="nav-list" id="primary-nav">
+          <a href="#overview" data-route="overview" aria-current="page"><span class="nav-icon"><svg aria-hidden="true"><use href="#icon-grid"></use></svg></span><span>总览</span></a>
+          <a href="#telemetry" data-route="telemetry"><span class="nav-icon"><svg aria-hidden="true"><use href="#icon-wave"></use></svg></span><span>遥测与控制</span></a>
+          <a href="#configuration" data-route="configuration"><span class="nav-icon"><svg aria-hidden="true"><use href="#icon-sliders"></use></svg></span><span>配置</span></a>
+          <a href="#diagnostics" data-route="diagnostics"><span class="nav-icon"><svg aria-hidden="true"><use href="#icon-wrench"></use></svg></span><span>诊断与维护</span></a>
+        </nav>
+        <div class="sidebar-footer"><div class="firmware-mini"><span>数据边界</span><strong>分别标识</strong><small>读取结果、控制采用与设备动作不是同一结论。</small></div></div>
+      </aside>
+      <div class="sidebar-scrim" id="sidebar-scrim" hidden></div>
+      <div class="workspace">
+        <header class="topbar">
+          <button class="icon-button mobile-menu" id="menu-button" data-ui-control aria-label="打开导航" aria-expanded="false" aria-controls="sidebar"><svg aria-hidden="true"><use href="#icon-menu"></use></svg></button>
+          <div class="page-identity"><small>EHA Control Center</small><strong id="page-title">总览</strong></div>
+          <div class="topbar-actions"><label class="active-transport"><span>当前操作通路</span><select id="active-transport" aria-label="当前操作通路"><option value="usb">USB</option><option value="can">Customer CAN</option></select></label><a class="topbar-link" href="#overview"><svg aria-hidden="true"><use href="#icon-link"></use></svg>连接</a><button class="icon-button" id="theme-toggle" data-ui-control aria-label="切换至浅色主题" aria-pressed="false" title="切换主题"><svg aria-hidden="true"><use id="theme-icon" href="#icon-sun"></use></svg></button></div>
+        </header>
+        <section class="workspace-status" aria-label="当前状态">
+          <div id="connection-state" class="status-fact is-idle"><span class="status-dot neutral"></span><span><small>主机 / H723</small><strong>未连接</strong></span></div>
+          <div id="firmware-state" class="status-fact is-idle"><span class="status-dot neutral"></span><span><small>固件输出</small><strong>未读取</strong></span></div>
+          <div id="odrive-state" class="status-fact is-idle"><span class="status-dot neutral"></span><span><small>H723 所见 ODrive</small><strong>未读取</strong></span></div>
+          <div id="telemetry-age" class="status-fact is-idle"><span class="status-dot neutral"></span><span><small>H723 遥测</small><strong>无遥测</strong></span></div>
+          <button class="button danger compact global-stop" type="button" data-stop-control aria-label="停止 USB 控制"><svg aria-hidden="true"><use href="#icon-stop"></use></svg><span data-stop-label>停止 USB 控制</span></button>
+        </section>
+        <section id="journey" class="journey card" aria-live="polite"><strong id="journey-title">正在准备页面</strong><span id="journey-detail">正在读取本机 WebUI 服务的当前会话。</span><a id="journey-link" class="inline-link" href="#overview" hidden>前往下一步</a></section>
+        <section id="operation-summary" class="operation-summary" aria-live="polite" hidden><div><strong id="operation-title">最近操作</strong><p id="operation-detail"></p></div><a id="operation-link" class="inline-link" href="#configuration" hidden>查看维护结果</a><details class="operation-result compact-result" id="result-panel"><summary>原始结果</summary><pre id="result" aria-live="polite">尚无操作。</pre></details></section>
+        <main id="main-content" tabindex="-1">
+          <section class="page" data-page="overview" id="page-overview">
+            <header class="page-header"><div><p class="eyebrow">本机正式入口</p><h1>连接、观察与控制</h1><p>浏览器只连接运行 <code>eha-tool webui</code> 的本机进程。刷新或关闭页面不会发送停止控制、关闭会话或重发请求。</p></div></header>
+            <section class="hero-panel card" aria-label="EHA 概览">
+              <div class="hero-copy"><p class="eyebrow">设备会话</p><h2>从身份核对开始</h2><p>先明确连接通路和设备身份，再读取状态、遥测或提交持续目标。页面如实显示本机已取得的信息。</p><div class="hero-actions"><a class="button" href="#telemetry">查看遥测</a></div></div>
+              <div class="hero-schematic" aria-hidden="true"><svg class="actuator-visual" viewBox="0 0 300 150"><path d="M45 48h108a12 12 0 0112 12v30a12 12 0 01-12 12H45a12 12 0 01-12-12V60a12 12 0 0112-12zM165 68h72v16h-72zM237 56h22v40h-22zM70 62h34v26H70z"></path><path d="M45 120h210M45 114v12M255 114v12" class="actuator-line"></path></svg><span class="schematic-label">EHA actuator · reference</span></div>
+            </section>
+            <section class="metric-grid" aria-label="关键遥测">
+              <article class="metric-card card"><div class="metric-top"><span>位置（mm）</span><svg aria-hidden="true"><use href="#icon-position"></use></svg></div><strong id="metric-position" class="metric-value">—</strong><small id="metric-position-detail" class="metric-detail">等待当前遥测</small></article>
+              <article class="metric-card card"><div class="metric-top"><span>速度（mm/s）</span><svg aria-hidden="true"><use href="#icon-wave"></use></svg></div><strong id="metric-velocity" class="metric-value">—</strong><small id="metric-velocity-detail" class="metric-detail">等待当前遥测</small></article>
+              <article class="metric-card card"><div class="metric-top"><span>主要力（N）</span><svg aria-hidden="true"><use href="#icon-force"></use></svg></div><strong id="metric-force" class="metric-value">—</strong><small id="metric-force-detail" class="metric-detail">等待当前遥测</small></article>
+            </section>
+            <section class="card">
+              <div class="card-header"><div><h2>主机与 EHA 控制板连接</h2><p>连接由本机 SDK 会话持有；重新连接会重新核对身份。</p></div><span class="status-label is-idle">显式操作</span></div>
+              <div class="card-body"><div class="connection-grid">
+                <section class="connection-card" aria-labelledby="usb-connection-title">
+                  <div class="connection-card-header"><div><h3 id="usb-connection-title">USB</h3><p>从已发现的序列号中选择后，显式建立本地 SDK 会话。</p></div><span id="usb-connection-state" class="status-label is-idle">未连接</span></div>
+                  <form id="usb-connection-form" class="connection-form" data-transport="usb"><label>USB 序列号<select id="usb-serial" name="serial" autocomplete="off"><option value="">先刷新 USB 列表</option></select></label><div class="form-actions"><button type="button" id="discover-usb">刷新 USB 列表</button><button type="submit" class="primary" id="connect-usb">连接 USB</button><button type="button" id="reconnect-usb">重连 USB</button><button type="button" id="disconnect-usb">关闭 USB</button></div></form>
+                  <dl id="usb-identity" class="facts empty"><div><dt>设备身份</dt><dd>连接后显示 UID 与本次运行实例。</dd></div></dl>
+                </section>
+                <section class="connection-card" aria-labelledby="can-connection-title">
+                  <div class="connection-card-header"><div><h3 id="can-connection-title">Customer CAN</h3><p>选择已发现的 CAN 适配器，再明确节点号与通路速率。</p></div><span id="can-connection-state" class="status-label is-idle">未连接</span></div>
+                  <form id="can-connection-form" class="connection-form" data-transport="can"><label>CAN 适配器路径<select id="can-port" name="port" autocomplete="off"><option value="">先刷新 CAN 适配器</option></select></label><label>节点号<input name="node" type="number" min="0" max="255" inputmode="numeric" value="1" required></label><label>CAN profile<select name="profile"><option value="classical_500k">classical_500k</option><option value="classical_1m">classical_1m</option><option value="fd_500k_2m">fd_500k_2m</option><option value="fd_1m_2m" selected>fd_1m_2m</option><option value="fd_1m_5m">fd_1m_5m</option></select></label><div class="form-actions"><button type="button" id="discover-can">刷新 CAN 适配器</button><button type="submit" class="primary" id="connect-can">连接 CAN</button><button type="button" id="reconnect-can">重连 CAN</button><button type="button" id="disconnect-can">关闭 CAN</button></div></form>
+                  <dl id="can-identity" class="facts empty"><div><dt>设备身份</dt><dd>连接后显示节点、UID 与本次运行实例。</dd></div></dl>
+                </section>
+              </div></div>
+            </section>
+          </section>
+
+          <section class="page" data-page="telemetry" id="page-telemetry" hidden>
+            <header class="page-header"><div><p class="eyebrow">实时投影</p><h1>遥测与控制</h1><p>趋势只绘制本机缓存的当前运行实例数据；提交持续目标后，仍需通过状态与遥测判断实际影响。</p></div></header>
+            <section class="telemetry-layout">
+              <article class="card chart-card"><div class="card-header"><div><h2>趋势</h2><p>位置、速度、力共享时间轴，分别标注单位。</p></div><div class="action-row chart-actions"><label>窗口<select id="chart-window"><option value="10">10 秒</option><option value="30" selected>30 秒</option></select></label><button id="chart-pause" type="button">暂停绘图</button><button id="chart-clear" type="button">清除</button></div></div><div id="telemetry-chart" class="chart" role="img" aria-label="最新遥测位置、速度和力的趋势；没有数据时显示空状态。"></div><p id="chart-empty" class="chart-empty">等待当前运行实例的有效遥测。</p><p id="chart-summary" class="chart-summary">尚无可绘制的遥测数据。</p><section class="metric-grid compact-metrics" aria-label="当前遥测"><article class="metric-card card"><div class="metric-top"><span>位置（mm）</span><svg aria-hidden="true"><use href="#icon-position"></use></svg></div><strong id="live-position" class="metric-value">—</strong><small id="live-position-detail" class="metric-detail">等待当前遥测</small></article><article class="metric-card card"><div class="metric-top"><span>速度（mm/s）</span><svg aria-hidden="true"><use href="#icon-wave"></use></svg></div><strong id="live-velocity" class="metric-value">—</strong><small id="live-velocity-detail" class="metric-detail">等待当前遥测</small></article><article class="metric-card card"><div class="metric-top"><span>主要力（N）</span><svg aria-hidden="true"><use href="#icon-force"></use></svg></div><strong id="live-force" class="metric-value">—</strong><small id="live-force-detail" class="metric-detail">等待当前遥测</small></article></section><dl id="telemetry-values" class="facts telemetry-facts empty"><div><dt>等待</dt><dd>连接后，设备异步发来的新遥测会显示在这里。</dd></div></dl></article>
+              <aside class="card control-panel"><div class="control-section"><h2>持续目标</h2><p class="helper">输入只是待提交目标；选择模式不会发送请求。</p><dl id="control-submission" class="facts empty"><div><dt>最近本地提交</dt><dd>尚未提交控制目标。</dd></div></dl><dl id="control-adoption" class="facts empty"><div><dt>固件当前目标</dt><dd>等待当前运行实例的遥测。</dd></div></dl><fieldset class="mode-options"><legend>控制模式</legend><label><input type="radio" name="control-mode" value="position" checked><span>位置</span></label><label><input type="radio" name="control-mode" value="velocity"><span>速度</span></label><label><input type="radio" name="control-mode" value="force"><span>力</span></label><label><input type="radio" name="control-mode" value="impedance"><span>阻抗</span></label></fieldset><form class="command-form" data-command="position"><label>目标位置（mm）<input name="mm" type="number" step="any" required></label><button type="submit" class="primary">提交位置目标</button></form><form class="command-form" data-command="velocity" hidden><label>目标速度（mm/s）<input name="mm_s" type="number" step="any" required></label><button type="submit" class="primary">提交速度目标</button></form><form class="command-form" data-command="force" hidden><label>目标力（N）<input name="n" type="number" step="any" required></label><button type="submit" class="primary">提交力目标</button></form><form class="command-form" data-command="impedance" hidden><label>平衡位置（mm）<input name="equilibrium_mm" type="number" step="any" required></label><label>刚度（N/mm）<input name="stiffness_n_per_mm" type="number" step="any" required></label><label>阻尼（N·s/mm）<input name="damping_ns_per_mm" type="number" step="any" required></label><button type="submit" class="primary">提交阻抗目标</button></form></div><div class="control-section heartbeat-panel"><div class="panel-heading"><div><h2>心跳调度</h2><p>停止心跳不会发送停止控制。</p></div><span id="heartbeat-state" class="status-label is-idle">心跳未启用</span></div><div class="action-row"><button data-action="heartbeat_start" class="primary">启用心跳</button><button data-action="heartbeat_stop">停止心跳</button><button data-action="heartbeat_once">发送一次心跳</button></div><dl id="heartbeat" class="facts empty"><div><dt>本地调度</dt><dd>尚未取得心跳状态。</dd></div></dl></div><div class="control-section stop-section"><button id="stop-button" class="button danger stop-button" type="button" data-stop-control aria-label="停止 USB 控制"><svg aria-hidden="true"><use href="#icon-stop"></use></svg><span data-stop-label>停止 USB 控制</span></button><p>只向当前操作通路发送停止控制意图。</p></div></aside>
+            </section>
+          </section>
+
+          <section class="page" data-page="configuration" id="page-configuration" hidden>
+            <header class="page-header"><div><p class="eyebrow">维护配置</p><h1>配置</h1><p>操作前读取完整配置记录；保存后的结果由设备侧维护并读回。若结果未知，保留操作键并只读查询。</p></div></header>
+            <section class="card"><div class="card-header"><div><h2>配置记录</h2><p>配置以完整 JSON 记录编辑和校验。</p></div></div><div class="card-body config-stack"><div class="action-row"><button data-action="config_read" data-view="user">读取用户配置</button><button data-action="config_read" data-view="factory">读取出厂配置</button><button data-action="config_read" data-view="startup">读取启动配置</button></div><p id="config-draft-state" class="helper">草稿尚未从设备读取。</p><label class="textarea-field">完整 JSON 配置记录<textarea id="config-record" rows="16" spellcheck="false" aria-describedby="config-help config-draft-state"></textarea></label><p id="config-help" class="helper">校验不访问设备。保存会在设备侧完成维护并读回。</p><div class="action-row"><button id="validate-config" type="button">校验 JSON</button><button id="save-config" type="button" class="primary">保存并读回</button><button id="restore-factory" type="button" class="danger">恢复出厂配置</button></div></div></section>
+            <section class="card maintenance-card"><div class="card-header"><div><h2>维护结果</h2><p>使用维护操作键查询或释放已结清结果。</p></div></div><div class="card-body maintenance-grid"><label>维护操作键<input id="operation-key" autocomplete="off" placeholder="72 位十六进制操作键"></label><p id="operation-key-state" class="helper">操作键尚未关联本页会话。</p><div class="form-actions"><button id="query-result" type="button">查询结果</button><button id="release-result" type="button">释放已结清结果</button></div></div></section>
+          </section>
+
+          <section class="page" data-page="diagnostics" id="page-diagnostics" hidden>
+            <header class="page-header"><div><p class="eyebrow">独立证据</p><h1>诊断与维护</h1><p>H723 状态、H723 所见 ODrive 与 ODrive USB 是独立数据来源，页面不会将其中一项读取成功推定为另一项正常。</p></div></header>
+            <section id="firmware" class="card"><div class="card-header"><div><h2>H723 当前状态与诊断</h2><p>读取成功只代表取得快照；状态、故障和控制影响需要分别判断。</p></div><div class="action-row"><button data-action="status">读取状态</button><button data-action="measurements">读取测量</button><button data-action="diagnostics">读取诊断</button></div></div><div class="card-body"><p class="helper">位置、速度、力和控制影响的当前事实请在 <a class="inline-link" href="#telemetry">遥测与控制</a> 中查看。</p><h3>诊断摘要</h3><div id="diagnostic-summary" class="diagnostic-list empty-state">尚未读取诊断。</div><details><summary>状态、测量与诊断原文</summary><pre id="observations">尚无读取结果。</pre></details></div></section>
+            <section id="driver" class="card"><div class="card-header"><div><h2>H723 所见的 ODrive</h2><p>这是固件经内部链路持有的驱动摘要。H723 新遥测不提升该摘要的新鲜度。</p></div><span id="driver-age" class="status-label is-idle">尚未取得</span></div><div class="card-body"><dl id="h723-odrive" class="facts empty"><div><dt>数据来源</dt><dd>连接并收到包含驱动摘要的 H723 状态后显示。</dd></div></dl></div></section>
+            <section id="odrive-usb" class="card"><div class="card-header"><div><h2>ODrive USB 独立只读</h2><p>按需直接读取 ODrive USB；不依赖 H723 连接、不自动轮询，也不能证明 H723 与驱动之间的 CAN 通信正常。</p></div><span id="odrive-usb-state" class="status-label is-idle">尚未读取</span></div><div class="card-body"><div class="form-grid odrive-form"><label>ODrive USB 序列号<select id="odrive-serial" autocomplete="off"><option value="">先发现 ODrive USB</option></select></label><div class="form-actions"><button id="discover-odrive" type="button">发现 ODrive USB</button><button id="read-odrive" type="button" class="primary">读取 ODrive</button></div></div><dl id="odrive-identity" class="facts empty"><div><dt>身份与时间</dt><dd>只在你点击读取后显示。</dd></div></dl><div class="diagnostic-columns"><div><h3>轴与校准状态</h3><dl id="odrive-status" class="facts empty"><div><dt>未读取</dt><dd>直接 USB 读取结果将在这里显示。</dd></div></dl></div><div><h3>驱动量测</h3><dl id="odrive-metrics" class="facts empty"><div><dt>未读取</dt><dd>不可取得的字段会保留缺失原因。</dd></div></dl></div></div><details><summary>ODrive USB 原始只读快照</summary><pre id="odrive-raw">尚未读取。</pre></details></div></section>
+            <section class="card danger-card"><div class="card-header"><div><h2>应用维护</h2><p>请求应用复位或进入更新入口；断连不证明新应用或更新入口已经启动。</p></div></div><div class="card-body action-row"><button id="reset-application" type="button" class="danger">请求应用复位</button><button id="enter-update" type="button" class="danger">请求进入更新入口</button></div></section>
+          </section>
+          <footer><p>此页面仅绑定 <code>127.0.0.1</code>。本机其他网页不能跨来源调用写入接口。</p></footer>
+        </main>
+      </div>
+    </div>
+    <div id="notice" class="notice" hidden>
+      <p id="notice-message" role="status" aria-live="polite" aria-atomic="true"></p>
+      <button id="notice-close" class="icon-button" type="button" aria-label="关闭消息"><svg aria-hidden="true"><use href="#icon-x"></use></svg></button>
+    </div>
+    <svg class="svg-sprite" aria-hidden="true">
+      <symbol id="icon-grid" viewBox="0 0 24 24"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"></path></symbol>
+      <symbol id="icon-link" viewBox="0 0 24 24"><path d="M9.5 14.5l5-5M7.5 17.5h-1a4 4 0 010-8h3M16.5 6.5h1a4 4 0 010 8h-3"></path></symbol>
+      <symbol id="icon-wave" viewBox="0 0 24 24"><path d="M3 12h3l2-6 4 12 3-9 2 3h4"></path></symbol>
+      <symbol id="icon-sliders" viewBox="0 0 24 24"><path d="M4 7h9M17 7h3M4 17h3M11 17h9M13 4v6M7 14v6"></path></symbol>
+      <symbol id="icon-wrench" viewBox="0 0 24 24"><path d="M14 6a5 5 0 01-6 6L4 16l4 4 4-4a5 5 0 006-6l-3 2-3-3z"></path></symbol>
+      <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"></path></symbol>
+      <symbol id="icon-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"></path></symbol>
+      <symbol id="icon-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></symbol>
+      <symbol id="icon-moon" viewBox="0 0 24 24"><path d="M20 15.5A8.5 8.5 0 018.5 4 8.5 8.5 0 1020 15.5z"></path></symbol>
+      <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12"></rect></symbol>
+      <symbol id="icon-position" viewBox="0 0 24 24"><path d="M4 12h16M8 8l-4 4 4 4M16 8l4 4-4 4"></path></symbol>
+      <symbol id="icon-force" viewBox="0 0 24 24"><path d="M12 3v11M8 11l4 4 4-4M5 20h14"></path></symbol>
+      <symbol id="icon-actuator" viewBox="0 0 24 24"><path d="M4 7h10v10H4zM14 10h5v4h-5M19 8h2v8h-2"></path></symbol>
+    </svg>
+  </body>
+</html>
