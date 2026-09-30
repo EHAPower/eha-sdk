@@ -1,0 +1,55 @@
+[workspace]
+resolver = "3"
+members = ["crates/config", "crates/protocol", "crates/transport"]
+
+[package]
+name = "eha-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["desktop"]
+desktop = ["config/schema", "dep:nusb", "dep:serialport", "dep:jsonschema", "dep:serde_json"]
+
+[dependencies]
+protocol = { path = "crates/protocol" }
+transport = { path = "crates/transport" }
+config = { package = "eha-config", path = "crates/config" }
+nusb = { version = "0.2.7", optional = true }
+serialport = { version = "4.8", default-features = false, optional = true }
+jsonschema = { version = "0.56.0", default-features = false, optional = true }
+serde_json = { version = "1.0.151", optional = true }
+
+[[example]]
+name = "board_check"
+required-features = ["desktop"]
+
+[[example]]
+name = "reconnect_readonly"
+required-features = ["desktop"]
+
+[workspace.package]
+edition = "2024"
+version = "4.0.0-dev.2"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+panic = "abort"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+panic = "deny"
+unreachable = "deny"

@@ -1,0 +1,286 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "EHA 控制器配置",
+  "description": "完整配置的主机校验规则。出厂配置由具体产品或批次独立提供，设备适用性与目标固件匹配由交付流程核对。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format_version", "config"],
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "持久记录格式版本；版本相同不证明目标固件或设备匹配。"
+    },
+    "config": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["external_can", "measurements", "control", "protection", "runtime"],
+      "properties": {
+        "external_can": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "profile"],
+          "properties": {
+            "id": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 127,
+              "description": "外部 CAN 逻辑节点号；0 是普通节点号，消息标识映射由 CAN 通信绑定规定，不作为原始帧 ID 检查。"
+            },
+            "profile": {
+              "type": "string",
+              "enum": ["classical_500k", "classical_1m", "fd_500k_2m", "fd_500k_500k", "fd_1m_2m", "fd_1m_5m", "fd_1m_8m"],
+              "description": "外部 CAN 模式与位速率组合；FD 名称的两个速率依次为仲裁段和数据段，不证明总线负载或其他节点匹配。"
+            }
+          }
+        },
+        "measurements": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["position", "pressure"],
+          "properties": {
+            "position": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "BRT27 原始计数到产品位置及速度估算的参数。",
+              "required": ["reference_count", "mm_per_count", "direction", "velocity_estimator_window_ms", "velocity_filter_time_constant_ms", "max_gap_ms"],
+              "properties": {
+                "reference_count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295,
+                  "description": "产品位置零点对应的 BRT27 原始计数，单位 count；零点不代表行程边界。"
+                },
+                "mm_per_count": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "description": "单个原始计数对应位移，单位 mm/count；方向由 direction 单独表达，不以负比例代替。"
+                },
+                "direction": {
+                  "type": "string",
+                  "enum": ["increasing", "decreasing"],
+                  "description": "原始计数增大时产品位置增大或减小。"
+                },
+                "velocity_estimator_window_ms": {
+                  "type": "integer",
+                  "minimum": 2,
+                  "maximum": 127,
+                  "description": "速度拟合窗口最大跨度，单位 ms；对应 1 kHz 输入下最多 128 点，至少 3 个不同时间的连续点才产生速度。"
+                },
+                "velocity_filter_time_constant_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000,
+                  "description": "速度低通时间常数，单位 ms；0 表示旁路低通。"
+                },
+                "max_gap_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000,
+                  "description": "相邻位置样本允许连续的最大取得间隔，单位 ms；超出后重建历史，与窗口跨度独立，不是反馈新鲜度阈值。"
+                }
+              }
+            },
+            "pressure": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "A/B 原始 ADC 计数到 MPa 的独立标定及成组压力滤波参数。",
+              "required": ["a", "b", "filter_time_constant_ms", "max_gap_ms"],
+              "properties": {
+                "a": {
+                  "$ref": "#/$defs/pressureCalibration",
+                  "description": "压力 A 通道标定端点。"
+                },
+                "b": {
+                  "$ref": "#/$defs/pressureCalibration",
+                  "description": "压力 B 通道标定端点。"
+                },
+                "filter_time_constant_ms": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 1000,
+                  "description": "每侧压力低通时间常数，单位 ms；0 表示旁路低通。"
+                },
+                "max_gap_ms": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000,
+                  "description": "相邻完整 A/B 样本对允许连续的最大取得间隔，单位 ms；超出后重建压力滤波历史。"
+                }
+              }
+            }
+          }
+        },
+        "control": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "固定控制参数；三种 PID 分别整定，Force 与 Impedance 共用压差内环参数。实际控制目标不属于启动配置。",
+          "required": ["position", "velocity", "pressure", "hydraulics", "motor_direction", "positive_force_pressure_channel"],
+          "properties": {
+            "position": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "绝对位置 PID；D 项使用测量线速度。",
+              "required": ["kp_rpm_per_mm", "ki_rpm_per_mm_s", "kd_rpm_s_per_mm"],
+              "properties": {
+                "kp_rpm_per_mm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "位置比例增益，单位 rpm/mm。"
+                },
+                "ki_rpm_per_mm_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "位置积分增益，单位 rpm/(mm·s)；0 关闭积分。"
+                },
+                "kd_rpm_s_per_mm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "测量速度阻尼增益，单位 rpm·s/mm。"
+                }
+              }
+            },
+            "velocity": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "线速度 PID；与已限幅目标的流量前馈相加。",
+              "required": ["kp_rpm_per_mm_s", "ki_rpm_per_mm", "kd_rpm_s2_per_mm"],
+              "properties": {
+                "kp_rpm_per_mm_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "速度比例增益，单位 rpm/(mm/s)。"
+                },
+                "ki_rpm_per_mm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "速度积分增益，单位 rpm/mm；0 关闭积分。"
+                },
+                "kd_rpm_s2_per_mm": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "速度误差微分增益，单位 rpm·s²/mm；0 关闭微分历史。"
+                }
+              }
+            },
+            "pressure": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Force 与 Impedance 的共用压差 PID；各控制器独立持有数值历史。",
+              "required": ["kp_rpm_per_mpa", "ki_rpm_per_mpa_s", "kd_rpm_s_per_mpa"],
+              "properties": {
+                "kp_rpm_per_mpa": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "压差比例增益，单位 rpm/MPa。"
+                },
+                "ki_rpm_per_mpa_s": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "压差积分增益，单位 rpm/(MPa·s)；0 关闭积分。"
+                },
+                "kd_rpm_s_per_mpa": {
+                  "type": "number",
+                  "minimum": 0,
+                  "description": "压差误差微分增益，单位 rpm·s/MPa；0 关闭微分历史。"
+                }
+              }
+            },
+            "hydraulics": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "两腔有效面积相等的液压模型；实装等面积前提由交付方核对。",
+              "required": ["effective_area_mm2", "pump_displacement_cm3_rev"],
+              "properties": {
+                "effective_area_mm2": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "description": "两腔共同的有效受压面积，单位 mm²；同一面积用于力/压差和流量换算。"
+                },
+                "pump_displacement_cm3_rev": {
+                  "type": "number",
+                  "exclusiveMinimum": 0,
+                  "description": "泵每转排量，单位 cm³/rev；1 cm³ = 1 cc。"
+                }
+              }
+            },
+            "motor_direction": {
+              "type": "string",
+              "enum": ["positive", "negative"],
+              "description": "产品位置增大所需的电机轴转速符号；positive 为正，negative 为负，与位移计数方向及正力压力通道独立。"
+            },
+            "positive_force_pressure_channel": {
+              "type": "string",
+              "enum": ["a", "b"],
+              "description": "升压产生产品正力的电气压力通道；a 使用 P_A-P_B，b 使用 P_B-P_A，不交换测量通道。"
+            }
+          }
+        },
+        "protection": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "运行保护的完整软硬范围；关系、适用性和控制后果由主机检查及运行决策分别维护。",
+          "required": ["soft_position_min_mm", "soft_position_max_mm", "hard_position_min_mm", "hard_position_max_mm", "soft_velocity_max_mm_s", "hard_velocity_max_mm_s", "soft_pressure_max_mpa", "hard_pressure_max_mpa", "soft_force_max_n", "hard_force_max_n", "soft_motor_speed_max_rpm", "hard_motor_speed_max_rpm"],
+          "properties": {
+            "soft_position_min_mm": {"type": "number", "description": "位置软下限，单位 mm。"},
+            "soft_position_max_mm": {"type": "number", "description": "位置软上限，单位 mm。"},
+            "hard_position_min_mm": {"type": "number", "description": "位置硬下限，单位 mm。"},
+            "hard_position_max_mm": {"type": "number", "description": "位置硬上限，单位 mm。"},
+            "soft_velocity_max_mm_s": {"type": "number", "exclusiveMinimum": 0, "description": "活塞杆线速度软幅值上限，单位 mm/s；范围为该值的负值至正值。限制速度参考，并换算四模式正常输出幅值。"},
+            "hard_velocity_max_mm_s": {"type": "number", "exclusiveMinimum": 0, "description": "活塞杆线速度硬幅值上限，单位 mm/s；范围为该值的负值至正值。"},
+            "soft_pressure_max_mpa": {"type": "number", "exclusiveMinimum": 0, "description": "A/B 两腔共用的压力软幅值上限，单位 MPa；各腔范围均为该值的负值至正值，分别判断。"},
+            "hard_pressure_max_mpa": {"type": "number", "exclusiveMinimum": 0, "description": "A/B 两腔共用的压力硬幅值上限，单位 MPa；各腔范围均为该值的负值至正值，分别判断。"},
+            "soft_force_max_n": {"type": "number", "exclusiveMinimum": 0, "description": "估算力软幅值上限，单位 N；范围为该值的负值至正值。同时限制直接 Force 目标准入和阻抗合成参考力。"},
+            "hard_force_max_n": {"type": "number", "exclusiveMinimum": 0, "description": "估算力硬幅值上限，单位 N；范围为该值的负值至正值。"},
+            "soft_motor_speed_max_rpm": {"type": "number", "exclusiveMinimum": 0, "description": "电机轴转速软幅值上限，单位 rpm。"},
+            "hard_motor_speed_max_rpm": {"type": "number", "exclusiveMinimum": 0, "description": "电机轴转速硬幅值上限，单位 rpm。"}
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "主机心跳与遥测频率，以及主机联系、测量和设备运行的时效参数。",
+          "required": ["host_heartbeat_hz", "telemetry_hz", "host_contact_max_age_ms", "position_max_age_ms", "pressure_pair_max_age_ms", "driver_state_max_age_ms", "driver_operation_timeout_ms"],
+          "properties": {
+            "host_heartbeat_hz": {"type": "integer", "minimum": 1, "maximum": 100, "description": "每个入口的主机心跳频率，单位 Hz。"},
+            "telemetry_hz": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "对外遥测发布频率，单位 Hz。"},
+            "host_contact_max_age_ms": {"type": "integer", "minimum": 10, "maximum": 1000, "description": "每个入口主机联系允许的最大年龄，单位 ms。"},
+            "position_max_age_ms": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "位置及派生速度允许的最大年龄，单位 ms。"},
+            "pressure_pair_max_age_ms": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "同次完整 A/B 压力对允许的最大年龄，单位 ms。"},
+            "driver_state_max_age_ms": {"type": "integer", "minimum": 100, "maximum": 1000, "description": "设备状态允许的最大年龄，单位 ms。"},
+            "driver_operation_timeout_ms": {"type": "integer", "minimum": 200, "maximum": 10000, "description": "一次设备操作的最大期限，单位 ms。"}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "pressureCalibration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["raw_min", "raw_max", "min_mpa", "max_mpa"],
+      "properties": {
+        "raw_min": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65534,
+          "description": "低标定端 ADC 原始计数，单位 count；主机补充检查小于同通道 raw_max。"
+        },
+        "raw_max": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "高标定端 ADC 原始计数，单位 count；主机补充检查大于同通道 raw_min。"
+        },
+        "min_mpa": {
+          "type": "number",
+          "description": "低标定端对应压力，单位 MPa；允许负值，主机补充检查小于同通道 max_mpa。"
+        },
+        "max_mpa": {
+          "type": "number",
+          "description": "高标定端对应压力，单位 MPa；主机补充检查大于同通道 min_mpa，端点外同斜率外推，端点不是控制限位。"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,22 @@
+name: SDK
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup component add clippy rustfmt
+          rustup target add thumbv7em-none-eabihf
+      - name: Check SDK and public libraries
+        run: python3 scripts/check.py

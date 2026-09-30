@@ -1,0 +1,14 @@
+# Copyright The eha_controller Contributors
+
+[package]
+name = "transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

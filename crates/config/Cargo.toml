@@ -1,0 +1,18 @@
+# Copyright The eha_controller Contributors
+
+[package]
+name = "eha-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+schema = []
+
+[dependencies]
+serde-json-core = { version = "0.6.0", default-features = false }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true
