@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-//! EHA V4 配置的共享字段、JSON 编解码与静态换算。
+//! EHA 配置的共享字段、JSON 编解码与静态换算。
 //!
 //! [`Config`] 在固定缓冲中编解码完整 JSON 记录。它不访问存储，不选择启动配置，不处理
 //! JSONC 主机文件，不执行业务参数校验，也不决定维护许可和复位。
