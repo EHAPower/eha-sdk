@@ -1,6 +1,6 @@
 /* Copyright The eha_controller Contributors */
 
-/* V3 Control Center 的颜色、侧栏、状态条与卡片层级；本页只呈现真实会话数据。 */
+/* Control Center 的颜色、侧栏、状态条与卡片层级；本页只呈现真实会话数据。 */
 :root {
   color-scheme: dark;
   --bg: #080d14;
