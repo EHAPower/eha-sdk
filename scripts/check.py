@@ -1,5 +1,5 @@
 # Copyright The eha_controller Contributors
-"""检查工具的 Rust 与 WebUI，并构建本机 release 产物；不访问设备。"""
+"""检查工具的 Rust 与 WebUI，并构建 release 产物；不访问设备。"""
 
 import argparse
 from pathlib import Path
