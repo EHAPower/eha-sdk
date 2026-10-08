@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 //! 持久桌面工具会话。
 //!

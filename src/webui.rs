@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 //! `eha-tool webui` 的仅本机 SDK 会话与静态资源服务。
 
 use crate::session::{Command, ConnectionRequest, ToolSession};

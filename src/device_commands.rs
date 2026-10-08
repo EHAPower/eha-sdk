@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 //! 官方工具对桌面 SDK 的最小单次调用入口。
 //!

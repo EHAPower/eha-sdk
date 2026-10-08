@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 import test from "node:test";
 import assert from "node:assert/strict";
 import { TelemetryHistory, selectedContactGuidance, seriesWindow } from "../static/telemetry.js";

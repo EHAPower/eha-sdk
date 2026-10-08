@@ -1,4 +1,5 @@
 {
+  "copyright": "Copyright The eha-tool Contributors",
   "name": "eha-tool-webui",
   "private": true,
   "type": "module",

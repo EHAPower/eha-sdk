@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 use clap::{CommandFactory, Parser, Subcommand};
 use std::{

@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 const CHANNELS = [
   { id: "position", name: "位置", unit: "mm", color: "--primary" },

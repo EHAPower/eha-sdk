@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 //! 持久 Shell，所有设备动作经过与 CLI/WebUI 相同的 `ToolSession`。
 

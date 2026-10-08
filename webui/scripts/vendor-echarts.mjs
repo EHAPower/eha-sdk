@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 // 将 npm 安装的离线图表资源及其许可证复制到静态发布目录。
 
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";

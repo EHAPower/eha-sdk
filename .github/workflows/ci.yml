@@ -1,3 +1,5 @@
+# Copyright The eha-tool Contributors
+
 name: Tool
 
 on:
@@ -28,4 +30,9 @@ jobs:
           rustup component add clippy rustfmt
       - name: Check tool and WebUI
         working-directory: eha-tool
-        run: python3 scripts/check.py
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets --locked
+          node --test webui/tests/*.test.js
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo build --release --locked

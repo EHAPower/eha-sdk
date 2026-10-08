@@ -1,3 +1,5 @@
+# Copyright The eha-tool Contributors
+
 /target/
 node_modules/
 /.venv/

@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 //! CLI 的本地配置检查输出；校验规则由 `eha_sdk::configuration` 唯一维护。
 

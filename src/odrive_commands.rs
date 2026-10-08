@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 //! ODrive USB 只读入口；设备协议和子进程期限由 SDK 负责。
 

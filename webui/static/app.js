@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-tool Contributors
 
 import { createTelemetryChart, selectedContactGuidance } from "./telemetry.js";
 
