@@ -1,13 +1,12 @@
 // Copyright The eha-sdk Contributors
 //! 通过公开 SDK 留存实板查询、心跳、停止和保存读回证据。
 //! 用法：board_check usb SERIAL OUTDIR [save-current|reconnect]
-//!       board_check can PORT NODE PROFILE OUTDIR [save-current|reconnect]
+//!       board_check can CONTEXT NODE MODE OUTDIR [PYTHON] [save-current|reconnect]
 //! save-current 明确请求以相同容量/业务配置、不同 JSON 空白保存一次，再实际读回。
 //! inspect / reconnect-readonly / result:KEYHEX 只读，适用于异常后的取证。
 //! 可用 EHA_EXPECT_UID 指定24位十六进制设备 UID；decode OUTDIR 只解码已有文件。
 use eha_sdk::{
-    can::{self, CanOptions},
-    config::ExternalCanProfile,
+    can::{CanChannelFactory, CanConnector, CanOptions, python::PythonCanOptions},
     host::{Client, Reply, Wait},
     protocol::{
         Response,
@@ -18,11 +17,12 @@ use eha_sdk::{
 use std::{
     error::Error,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 enum Connector {
     Usb(usb::UsbConnector),
-    Can(can::CanConnector),
+    Can(CanConnector),
 }
 impl Connector {
     fn open(&mut self) -> Result<eha_sdk::host::backend::Backend, Box<dyn Error>> {
@@ -79,9 +79,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (mut connector,out,mode)=match args.first().map(String::as_str){
         Some("usb") if args.len()>=3=>(Connector::Usb(usb::UsbConnector::new(&args[1])?),PathBuf::from(&args[2]),args.get(3).map(String::as_str)),
         Some("can") if args.len()>=5=>{
-            let profile=match args[3].as_str(){"classical_500k"=>ExternalCanProfile::Classical500K,"classical_1m"=>ExternalCanProfile::Classical1M,"fd_500k_2m"=>ExternalCanProfile::Fd500K2M,"fd_1m_2m"=>ExternalCanProfile::Fd1M2M,"fd_1m_5m"=>ExternalCanProfile::Fd1M5M,_=>return Err("CANable2 不支持该 profile".into())};
-            (Connector::Can(can::CanConnector::new(CanOptions::canable2(&args[1],args[2].parse()?,profile))),PathBuf::from(&args[4]),args.get(5).map(String::as_str))},
-        _=>return Err("board_check usb SERIAL OUTDIR [save-current|reconnect] | can PORT NODE PROFILE OUTDIR [save-current|reconnect]".into()),
+            let mode=match args[3].as_str(){"classic"=>eha_sdk::transport::can::Mode::Classic,"fd"=>eha_sdk::transport::can::Mode::Fd,_=>return Err("CAN MODE 必须为 classic 或 fd".into())};
+            let (python, operation)=match args.get(5).map(String::as_str){
+                Some(value @ ("inspect"|"reconnect-readonly"|"save-current")) => (None, Some(value)),
+                Some(value) if value.starts_with("result:") => (None, Some(value)),
+                Some(python) => (Some(python.to_owned()), args.get(6).map(String::as_str)),
+                None => (None, None),
+            };
+            let factory: Arc<dyn CanChannelFactory>=Arc::new(match python {Some(python)=>PythonCanOptions::with_python(args[1].clone(),python),None=>PythonCanOptions::new(args[1].clone())});
+            (Connector::Can(CanConnector::new(CanOptions{node:args[2].parse()?,mode},factory)?),PathBuf::from(&args[4]),operation)},
+        _=>return Err("board_check usb SERIAL OUTDIR [save-current|reconnect] | can CONTEXT NODE MODE OUTDIR [PYTHON] [save-current|reconnect]".into()),
     };
     std::fs::create_dir_all(&out)?;
     let mut client = Client::new(connector.open()?);

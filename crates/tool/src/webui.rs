@@ -359,8 +359,9 @@ struct CanScanView {
 }
 struct CanScanJob {
     request: tiny_http::Request,
-    port: String,
-    profile: String,
+    channel: String,
+    mode: String,
+    python: Option<String>,
     connectors: Vec<(u8, CanNodeConnector)>,
 }
 impl CanScanView {
@@ -373,9 +374,10 @@ impl CanScanView {
                 let mut errors = Vec::new();
                 for (node, connector) in job.connectors {
                     let request = ConnectionRequest::Can {
-                        port: job.port.clone(),
+                        channel: job.channel.clone(),
                         node,
-                        profile: job.profile.clone(),
+                        mode: job.mode.clone(),
+                        python: job.python.clone(),
                     };
                     let mut session = ToolSession::new().with_timeout(Duration::from_millis(250));
                     match session.connect_shared_can(request, connector) {
@@ -610,16 +612,6 @@ fn handle_request_with_scan_body(
                 request,
                 200,
                 json!({"ok":true,"devices":devices.into_iter().map(|device| json!({"serial":device.serial,"description":device.description})).collect::<Vec<_>>() }),
-            ),
-            Err(error) => respond_json(request, 503, json!({"ok":false,"message":error})),
-        };
-    }
-    if path == "/api/can/devices" && method == Method::Get {
-        return match eha_sdk::can::discover_serial_candidates() {
-            Ok(devices) => respond_json(
-                request,
-                200,
-                json!({"ok":true,"devices":devices.into_iter().map(|device| json!({"port":device.port,"serial":device.serial,"description":device.description})).collect::<Vec<_>>() }),
             ),
             Err(error) => respond_json(request, 503, json!({"ok":false,"message":error})),
         };
@@ -861,27 +853,31 @@ fn handle_request_with_scan_body(
                         json!({"ok":false,"message":"试验进行中；CAN 连接已拒绝。"}),
                     );
                 }
-                let Some(port) = body.get("port").and_then(Value::as_str) else {
+                let Some(channel) = body.get("channel").and_then(Value::as_str) else {
                     return respond_json(
                         request,
                         400,
-                        json!({"ok":false,"message":"必须明确 CAN port"}),
+                        json!({"ok":false,"message":"必须明确外部 CAN 通道"}),
                     );
                 };
-                let Some(profile) = body.get("profile").and_then(Value::as_str) else {
+                let Some(mode) = body.get("mode").and_then(Value::as_str) else {
                     return respond_json(
                         request,
                         400,
-                        json!({"ok":false,"message":"必须明确 CAN profile"}),
+                        json!({"ok":false,"message":"必须明确 CAN 帧格式"}),
                     );
                 };
+                let python = body
+                    .get("python")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let nodes = match body_nodes(&body) {
                     Ok(nodes) => nodes,
                     Err(message) => {
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match workbench.connect_can(port.into(), profile.into(), &nodes, false) {
+                match workbench.connect_can(channel.into(), mode.into(), python, &nodes, false) {
                     Ok(value) => respond_json(request, 200, value),
                     Err(message) => {
                         respond_json(request, 409, json!({"ok":false,"message":message}))
@@ -899,27 +895,33 @@ fn handle_request_with_scan_body(
                 if let Err(message) = workbench.can_scan_guard() {
                     return respond_json(request, 409, json!({"ok":false,"message":message}));
                 }
-                let Some(port) = body.get("port").and_then(Value::as_str) else {
+                let Some(channel) = body.get("channel").and_then(Value::as_str) else {
                     return respond_json(
                         request,
                         400,
-                        json!({"ok":false,"message":"必须明确 CAN port"}),
+                        json!({"ok":false,"message":"必须明确外部 CAN 通道"}),
                     );
                 };
-                let Some(profile) = body.get("profile").and_then(Value::as_str) else {
+                let Some(mode) = body.get("mode").and_then(Value::as_str) else {
                     return respond_json(
                         request,
                         400,
-                        json!({"ok":false,"message":"必须明确 CAN profile"}),
+                        json!({"ok":false,"message":"必须明确 CAN 帧格式"}),
                     );
                 };
+                let python = body
+                    .get("python")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let nodes = match scan_nodes(&body) {
                     Ok(nodes) => nodes,
                     Err(message) => {
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                if let Err(message) = workbench.ensure_network(port.into(), profile.into()) {
+                if let Err(message) =
+                    workbench.ensure_network(channel.into(), mode.into(), python.clone())
+                {
                     return respond_json(request, 409, json!({"ok":false,"message":message}));
                 }
                 let mut connectors = Vec::with_capacity(nodes.len());
@@ -937,8 +939,9 @@ fn handle_request_with_scan_body(
                 }
                 let job = CanScanJob {
                     request,
-                    port: port.into(),
-                    profile: profile.into(),
+                    channel: channel.into(),
+                    mode: mode.into(),
+                    python,
                     connectors,
                 };
                 match scan.start(job) {

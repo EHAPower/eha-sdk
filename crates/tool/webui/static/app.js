@@ -191,9 +191,10 @@ function syncConnectionForm(transport, connection) {
   if (connectionFormSources[transport] === source) return;
   if (transport === "usb") selectSavedOption($("#usb-serial"), connection.serial);
   if (transport === "can") {
-    selectSavedOption($("#can-port"), connection.port);
+    $("#can-channel").value = connection.channel || "";
     $("#can-connection-form input[name=node]").value = connection.node ?? "";
-    $("#can-connection-form select[name=profile]").value = connection.profile || "";
+    $("#can-connection-form select[name=mode]").value = connection.mode || "fd";
+    $("#can-connection-form input[name=python]").value = connection.python || "";
   }
   connectionFormSources[transport] = source;
 }
@@ -664,7 +665,6 @@ async function discoverDevices(transport, announce = true) {
   if (transport === "odrive") setOdriveBusy(true);
   updateActionAvailability();
   const source = transport === "odrive" ? { path:"/api/odrive/devices", select:"#odrive-serial", key:"serial_number", name:"ODrive USB" }
-    : transport === "can" ? { path:"/api/can/devices", select:"#can-port", key:"port", name:"CAN 适配器" }
     : { path:"/api/devices", select:"#usb-serial", key:"serial", name:"USB" };
   try {
     const body = await get(source.path, { timeout:transport === "odrive" ? 8000 : 5000 });
@@ -742,19 +742,19 @@ function renderCanScanResults(errors = []) {
   for (const entry of errors) { const line = document.createElement("p"); line.className = "helper is-warning"; line.textContent = `节点 ${entry.node}：${entry.message}`; root.append(line); }
 }
 async function scanCanNodes() {
-  const port = $("#can-port").value; const profile = $("#can-connection-form select[name=profile]").value;
+  const channel = $("#can-channel").value.trim(); const mode = $("#can-connection-form select[name=mode]").value; const python = $("#can-connection-form input[name=python]").value.trim();
   const start_node = Number($("#can-scan-start").value); const end_node = Number($("#can-scan-end").value);
-  if (!port) return setNotice("请先选择 CAN 适配器路径。", "is-error");
+  if (!channel) return setNotice("请先填写外部 CAN 通道。", "is-error");
   if (!Number.isInteger(start_node) || !Number.isInteger(end_node) || start_node < 0 || end_node > 127 || start_node > end_node) return setNotice("扫描范围必须是 0 至 127 的递增整数。", "is-error");
-  const body = await run("/api/can/scan", { transport:"can", port, profile, start_node, end_node }, "扫描 CAN 节点");
+  const body = await run("/api/can/scan", { transport:"can", channel, mode, python:python || null, start_node, end_node }, "扫描 CAN 节点");
   if (!body) return;
   canScanNodes = (body.nodes || []).filter((entry) => Number.isInteger(entry.node)); renderCanScanResults(body.errors || []);
 }
 async function connectCanNodes() {
-  const port = $("#can-port").value; const profile = $("#can-connection-form select[name=profile]").value; const nodes = selectedCanScanNodes();
-  if (!port) return setNotice("请先选择 CAN 适配器路径。", "is-error");
+  const channel = $("#can-channel").value.trim(); const mode = $("#can-connection-form select[name=mode]").value; const python = $("#can-connection-form input[name=python]").value.trim(); const nodes = selectedCanScanNodes();
+  if (!channel) return setNotice("请先填写外部 CAN 通道。", "is-error");
   if (!nodes.length) return setNotice("至少选择一个已扫描节点。", "is-error");
-  const body = await run("/api/can/connect", { transport:"can", port, profile, nodes }, "连接所选 CAN 节点");
+  const body = await run("/api/can/connect", { transport:"can", channel, mode, python:python || null, nodes }, "连接所选 CAN 节点");
   if (body?.errors?.length) renderCanScanResults(body.errors);
 }
 $("#active-transport").addEventListener("change", (event) => selectTransport(event.target.value));
@@ -768,16 +768,17 @@ for (const transport of ["usb", "can"]) {
       if (!serial) return setNotice("请先从列表选择 USB 序列号。", "is-error");
       return run("/api/connect", { transport, serial }, "连接并核对身份");
     }
-    const port = String(values.get("port") || "");
-    if (!port) return setNotice("请先从列表选择 CAN 适配器路径。", "is-error");
+    const channel = String(values.get("channel") || "").trim();
+    if (!channel) return setNotice("请先填写外部 CAN 通道。", "is-error");
     const rawNode = String(values.get("node") ?? "").trim();
     const node = Number(rawNode);
     if (!rawNode || !Number.isInteger(node) || node < 0 || node > 127) return setNotice("Customer CAN 节点号必须为 0 至 127 的整数。", "is-error");
-    run("/api/connect", { transport, port, node, profile:values.get("profile") }, "连接并核对身份");
+    const python = String(values.get("python") || "").trim();
+    run("/api/connect", { transport, channel, node, mode:values.get("mode"), python:python || null }, "连接并核对身份");
   });
   $("#disconnect-" + transport).addEventListener("click", () => run("/api/disconnect", { transport }, "关闭本地连接"));
   $("#reconnect-" + transport).addEventListener("click", () => run("/api/reconnect", { transport }, "重新连接"));
-  $("#discover-" + transport).addEventListener("click", () => discoverDevices(transport));
+  if (transport === "usb") $("#discover-" + transport).addEventListener("click", () => discoverDevices(transport));
 }
 $("#can-scan-nodes").addEventListener("click", scanCanNodes);
 $("#can-connect-nodes").addEventListener("click", connectCanNodes);

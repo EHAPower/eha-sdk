@@ -105,8 +105,6 @@ enum Command {
 #[derive(Subcommand)]
 enum DeviceCommand {
     List,
-    /// 刷新 CANable2 USB 串口候选；不打开串口或探测总线。
-    ListCan,
     Select {
         selector: String,
     },
@@ -114,9 +112,13 @@ enum DeviceCommand {
     Clear,
     Connect,
     ConnectCan {
-        port: String,
+        /// 外部 python-can 配置中的通道上下文名。
+        channel: String,
         node: u8,
-        profile: String,
+        /// `classic` 或 `fd`；省略时为 `fd`。
+        mode: Option<String>,
+        /// 运行 python-can 的 Python；省略时使用平台默认解释器。
+        python: Option<String>,
     },
     Disconnect,
     Reconnect,
@@ -229,10 +231,6 @@ impl Session {
                 self.listed = devices::discover()?;
                 print_devices(&self.listed);
             }
-            DeviceCommand::ListCan => {
-                let devices = eha_sdk::can::discover_serial_candidates()?;
-                print_can_devices(&devices);
-            }
             DeviceCommand::Select { selector } => {
                 let serial = if selector.len() < 24 && selector.bytes().all(|c| c.is_ascii_digit())
                 {
@@ -269,15 +267,17 @@ impl Session {
                 )?;
             }
             DeviceCommand::ConnectCan {
-                port,
+                channel,
                 node,
-                profile,
+                mode,
+                python,
             } => print_snapshot(
                 self.tool
                     .connect(ConnectionRequest::Can {
-                        port,
+                        channel,
                         node,
-                        profile,
+                        mode: mode.unwrap_or_else(|| "fd".into()),
+                        python,
                     })
                     .map_err(|error| error.to_string())?,
             )?,
@@ -325,22 +325,6 @@ pub fn print_devices(devices: &[Device]) {
         );
     }
     println!("以上为 USB 枚举信息，未核对应用固件身份或运行状态。")
-}
-pub fn print_can_devices(devices: &[eha_sdk::can::SerialCandidate]) {
-    if devices.is_empty() {
-        println!("未发现 CANable2 USB 串口候选。仍可执行本地配置检查。");
-        return;
-    }
-    for device in devices {
-        let serial = device.serial.as_deref().unwrap_or("无序列号");
-        println!(
-            "{}  {}  {}",
-            device.port.escape_debug(),
-            serial.escape_debug(),
-            device.description.escape_debug()
-        );
-    }
-    println!("以上为 CANable2 USB 串口枚举信息；连接时仍会核对 SLCAN 与应用固件身份。");
 }
 fn print_result(result: &crate::session::CommandResult) -> Result<(), String> {
     println!(

@@ -13,14 +13,13 @@ workspace = true
 
 [features]
 default = ["desktop"]
-desktop = ["config/schema", "dep:nusb", "dep:serialport", "dep:jsonschema", "dep:serde_json"]
+desktop = ["config/schema", "dep:nusb", "dep:jsonschema", "dep:serde_json"]
 
 [dependencies]
 protocol = { path = "crates/protocol" }
 transport = { path = "crates/transport" }
 config = { package = "eha-config", path = "crates/config" }
 nusb = { version = "0.2.7", optional = true }
-serialport = { version = "4.8", default-features = false, optional = true }
 jsonschema = { version = "0.56.0", default-features = false, optional = true }
 serde_json = { version = "1.0.151", optional = true }
 

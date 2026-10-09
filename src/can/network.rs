@@ -1,13 +1,8 @@
 // Copyright The eha-sdk Contributors
-
-//! 一个 CANable2 串口上的多节点逻辑 endpoint。
-//!
-//! 物理串口、SLCAN 配置与 line parser 只由一个 Bus worker 持有。每个节点另有自己的
-//! 传输编号、分片组装、心跳 pump 与 host backend，因此节点之间不会共用业务会话。
+//! 多个 EHA 逻辑端点共享一条外部提供的 CAN 通道。
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::Write,
     sync::{
         Arc, Mutex,
         mpsc::{self, Receiver, Sender, SyncSender},
@@ -16,54 +11,43 @@ use std::{
     time::{Duration, Instant},
 };
 
-use config::ExternalCanProfile;
-use serialport::SerialPort;
 use transport::can::{
-    Frame, Mode, ReceiveResult, Receiver as CanReceiver, RxBuffers, RxReconnectState, SubmitEvent,
-    SubmitResult, Transmitter, TxBuffers, TxReconnectState, TxToken,
+    Frame, Mode, Receiver as CanReceiver, RxBuffers, RxReconnectState, SubmitEvent, SubmitResult,
+    Transmitter, TxBuffers, TxReconnectState, TxToken,
 };
 
 use super::{
-    AdapterProbe, MAX_RX_CHUNKS_PER_TURN, MAX_SLCAN_LINE, SERIAL_TIMEOUT, configure, decode_frame,
-    encode_frame, lane_from_index, profile_mode,
+    CanChannel, CanChannelFactory, GENERATION, RECEIVE_TIMEOUT, lane_from_index, receive_frame,
+    send_timeout,
 };
 use crate::host::backend::{Backend, Command, EventSink, Pump, SendRequest};
 
 const MAX_NETWORK_CONTROL_PER_TURN: usize = 32;
-const MAX_NETWORK_FRAMES_PER_TURN: usize = 32;
+const MAX_NETWORK_FRAMES_PER_TURN: usize = 4;
 const MAX_NETWORK_RETIREMENTS_PER_TURN: usize = 128;
 const MAX_NODE_EVENTS_PER_TURN: usize = 32;
 const NODE_EVENT_QUEUE: usize = 64;
+const NETWORK_IO_BUDGET: Duration = Duration::from_millis(2);
 
-/// 共享 CANable2 SLCAN 串口的当前状态。
+/// 共享通道的当前生命周期。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CanNetworkStatus {
-    /// 串口已配置，节点可以附加。
     Active,
-    /// 已发现串口故障，正在等待所有旧 node 保存 CAN 传输保护状态。
     Quiescing { reason: String },
-    /// 所有旧 node 都已隔离并保存状态；调用方可显式 [`CanNetwork::recover`]。
     Terminated { reason: String },
 }
 
-/// 共享 CANable2 SLCAN 串口的唯一所有者。
+/// 多个 EHA 逻辑节点共享通道时唯一的 I/O 拥有者。
 ///
-/// 调用方必须在全部 [`CanNodeConnector`] 和其 [`Backend`] 存活期间保留此对象。串口读写
-/// 发生故障时，网络会终止全部节点，且不会自动重开串口或重放任何业务消息、心跳；调用方
-/// 必须在确认 [`Self::status`] 为 [`CanNetworkStatus::Terminated`] 后，显式调用
-/// [`Self::recover`]。恢复只重新打开同一 port/profile 并保留 CAN 编号/保护窗口；它不附加
-/// 节点，也不恢复业务消息、心跳或 [`crate::host::Client`] 身份。
+/// 通道错误会断开所有已附加节点，绝不自动重开或重放。全部节点发布续接保护状态后，
+/// 调用方才可显式调用 `recover`。
 pub struct CanNetwork {
     control: SyncSender<NetworkCommand>,
     status: Arc<Mutex<CanNetworkStatus>>,
     join: Option<JoinHandle<()>>,
 }
 
-/// 一个固定 CAN node 的可重开逻辑 endpoint 工厂。
-///
-/// 同一时刻一个 node 只能打开一个 [`Backend`]。关闭旧 backend 后可在同一
-/// [`CanNetwork`] 中再次 [`Self::open`]；续接只保留 CAN 编号和保护窗口，绝不保存或
-/// 重放待发送业务、心跳或 [`crate::host::Client`] 的业务身份。
+/// 经由 CanNetwork 连接的固定 EHA 逻辑节点。
 #[derive(Clone)]
 pub struct CanNodeConnector {
     node: u8,
@@ -71,15 +55,17 @@ pub struct CanNodeConnector {
 }
 
 impl CanNetwork {
-    /// 打开一个明确 profile 的 CANable2 串口，并取得唯一 I/O owner。
-    pub fn new(port: String, profile: ExternalCanProfile) -> Result<Self, String> {
-        let (serial, mode, probe) = open_serial(&port, profile)?;
+    /// 打开一条外部已配置通道，并令本网络成为它唯一的 I/O 拥有者。
+    pub fn new(factory: Arc<dyn CanChannelFactory>, mode: Mode) -> Result<Self, String> {
+        let channel = factory
+            .open()
+            .map_err(|error| format!("无法打开外部 CAN 通道: {error}"))?;
         let (control, commands) = mpsc::sync_channel(32);
         let status = Arc::new(Mutex::new(CanNetworkStatus::Active));
         let worker_status = Arc::clone(&status);
         let join = std::thread::Builder::new()
             .name("eha-sdk-can-network".into())
-            .spawn(move || run_network(serial, mode, probe, port, profile, commands, worker_status))
+            .spawn(move || run_network(channel, factory, mode, commands, worker_status))
             .map_err(|error| error.to_string())?;
         Ok(Self {
             control,
@@ -88,8 +74,6 @@ impl CanNetwork {
         })
     }
 
-    /// 返回当前网络状态；[`CanNetworkStatus::Terminated`] 后只能由用户明确调用
-    /// [`Self::recover`]，不会因 [`CanNodeConnector::open`] 自动重开。
     #[must_use]
     pub fn status(&self) -> CanNetworkStatus {
         self.status
@@ -100,11 +84,7 @@ impl CanNetwork {
             })
     }
 
-    /// 显式重新打开 `new` 时锁定的同一串口和 profile。
-    ///
-    /// 仅当 [`Self::status`] 为 [`CanNetworkStatus::Terminated`] 时成功。它只恢复总线及保存的
-    /// CAN 传输保护状态，不附加任何 node；调用方必须显式选择一个已断开的会话并重新核对
-    /// Identity，其他 node 保持断开。
+    /// 网络终止后显式取得一条新的外部通道。
     pub fn recover(&self) -> Result<(), String> {
         let (reply, receive) = mpsc::sync_channel(1);
         self.control
@@ -115,18 +95,7 @@ impl CanNetwork {
             .map_err(|_| "共享 CAN 网络在恢复完成前已关闭".to_owned())?
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_transport_fault_for_test(&self) -> Result<(), String> {
-        let (reply, receive) = mpsc::sync_channel(1);
-        self.control
-            .send(NetworkCommand::InjectTransportFault { reply })
-            .map_err(|_| "共享 CAN 网络已关闭".to_owned())?;
-        receive
-            .recv()
-            .map_err(|_| "共享 CAN 网络在注入测试故障前已关闭".to_owned())?
-    }
-
-    /// 取得一个明确 node 的 connector；不发送任何 CAN 帧。
+    /// 取得某个节点的连接器；不会发送任何帧。
     pub fn node(&self, node: u8) -> Result<CanNodeConnector, String> {
         if node > 127 {
             return Err("EHA CAN 逻辑节点号必须在 0..=127".into());
@@ -148,10 +117,7 @@ impl Drop for CanNetwork {
 }
 
 impl CanNodeConnector {
-    /// 打开此 node 的独立 host backend；不会打开第二个串口。
-    ///
-    /// 若相同 node 仍有活跃 backend，或网络已终止，则返回错误；调用方不得把该错误当作
-    /// 可以自动重放原业务的依据。
+    /// 打开独立主机后端；实体通道仍由网络独占。
     pub fn open(&self) -> Result<Backend, String> {
         let (reply, receive) = mpsc::sync_channel(1);
         self.control
@@ -174,15 +140,16 @@ enum NetworkCommand {
     Recover {
         reply: SyncSender<Result<(), String>>,
     },
-    #[cfg(test)]
-    InjectTransportFault {
-        reply: SyncSender<Result<(), String>>,
-    },
     Shutdown,
 }
 
 enum BusEvent {
     Frame(NodeFrame),
+    Abort {
+        node: u8,
+        lease: u64,
+        reason: String,
+    },
 }
 
 struct NodeFrame {
@@ -190,6 +157,8 @@ struct NodeFrame {
     lease: u64,
     lane: usize,
     pending: transport::can::PendingFrame,
+    deadline: Instant,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 struct RetiredNode {
@@ -207,6 +176,7 @@ enum NodeEvent {
         may_have_sent: bool,
         detail: Option<String>,
     },
+    TransportError(String),
     Disconnect(String),
 }
 
@@ -220,8 +190,6 @@ struct NodeReconnectState {
     rx: RxReconnectState,
 }
 
-/// 已注册 node 的集合与 CAN ID 路由。它只接受已附加节点，避免把未知节点的帧误交给
-/// 任意 Client。
 pub(crate) struct Routes {
     nodes: BTreeSet<u8>,
 }
@@ -232,7 +200,6 @@ impl Routes {
             nodes: BTreeSet::new(),
         }
     }
-
     pub(crate) fn attach(&mut self, node: u8) -> Result<(), String> {
         if node > 127 {
             return Err("EHA CAN 逻辑节点号必须在 0..=127".into());
@@ -242,11 +209,9 @@ impl Routes {
         }
         Ok(())
     }
-
     pub(crate) fn detach(&mut self, node: u8) {
         self.nodes.remove(&node);
     }
-
     pub(crate) fn recipient(&self, id: u32) -> Option<u8> {
         if id > 0x1fff_ffff {
             return None;
@@ -257,24 +222,9 @@ impl Routes {
 }
 
 enum NetworkPhase {
-    Active(Box<dyn SerialPort>),
+    Active(Box<dyn CanChannel>),
     Quiescing { reason: String },
     Terminated { reason: String },
-}
-
-fn open_serial(
-    port: &str,
-    profile: ExternalCanProfile,
-) -> Result<(Box<dyn SerialPort>, Mode, AdapterProbe), String> {
-    let mode = profile_mode(profile)?;
-    let mut serial = serialport::new(port, 115_200)
-        .dtr_on_open(true)
-        .timeout(SERIAL_TIMEOUT)
-        .open()
-        .map_err(|error| format!("无法打开 CANable2 串口 {port}: {error}"))?;
-    let probe = configure(&mut *serial, profile)
-        .map_err(|error| format!("CANable2 SLCAN 配置失败: {error}"))?;
-    Ok((serial, mode, probe))
 }
 
 fn set_status(status: &Arc<Mutex<CanNetworkStatus>>, next: CanNetworkStatus) {
@@ -284,11 +234,9 @@ fn set_status(status: &Arc<Mutex<CanNetworkStatus>>, next: CanNetworkStatus) {
 }
 
 fn run_network(
-    serial: Box<dyn SerialPort>,
+    channel: Box<dyn CanChannel>,
+    factory: Arc<dyn CanChannelFactory>,
     mode: Mode,
-    probe: AdapterProbe,
-    port_path: String,
-    profile: ExternalCanProfile,
     commands: Receiver<NetworkCommand>,
     status: Arc<Mutex<CanNetworkStatus>>,
 ) {
@@ -297,54 +245,74 @@ fn run_network(
     let mut routes = Routes::new();
     let mut nodes = BTreeMap::<u8, NodeHandle>::new();
     let mut reconnect = BTreeMap::<u8, NodeReconnectState>::new();
-    let mut line = Vec::with_capacity(MAX_SLCAN_LINE);
-    let mut read_buffer = [0_u8; 512];
     let epoch = Instant::now();
     let mut next_lease = 1_u64;
-
-    let _ = probe;
-    let mut phase = NetworkPhase::Active(serial);
+    let mut phase = NetworkPhase::Active(channel);
     loop {
         match &mut phase {
-            NetworkPhase::Active(port) => {
+            NetworkPhase::Active(channel) => {
                 retire_nodes(&retired_nodes, &mut nodes, &mut routes, &mut reconnect);
                 let mut failure = None;
+                let io_deadline = Instant::now() + NETWORK_IO_BUDGET;
                 for _ in 0..MAX_NETWORK_FRAMES_PER_TURN {
-                    let Ok(BusEvent::Frame(frame)) = bus_events.try_recv() else {
+                    if Instant::now() >= io_deadline {
+                        break;
+                    }
+                    let Ok(event) = bus_events.try_recv() else {
                         break;
                     };
-                    let Some(handle) = nodes
-                        .get(&frame.node)
-                        .filter(|handle| handle.lease == frame.lease)
-                    else {
-                        continue;
-                    };
-                    let outcome = encode_frame(&frame.pending.frame).and_then(|line| {
-                        port.write_all(&line)
-                            .and_then(|()| port.flush())
-                            .map_err(|error| error.to_string())
-                    });
-                    match outcome {
-                        Ok(()) => {
-                            let _ = handle.events.send(NodeEvent::Submitted {
-                                lane: frame.lane,
-                                token: frame.pending.token,
-                                result: SubmitResult::Accepted,
-                                may_have_sent: false,
-                                detail: None,
-                            });
+                    match event {
+                        BusEvent::Abort {
+                            node,
+                            lease,
+                            reason,
+                        } => {
+                            if nodes.get(&node).is_some_and(|handle| handle.lease == lease) {
+                                failure = Some(reason);
+                                break;
+                            }
                         }
-                        Err(error) => {
-                            let reason = format!("CANable2 串口写入失败: {error}");
-                            let _ = handle.events.send(NodeEvent::Submitted {
-                                lane: frame.lane,
-                                token: frame.pending.token,
-                                result: SubmitResult::Failed,
-                                may_have_sent: true,
-                                detail: Some(reason.clone()),
-                            });
-                            failure = Some(reason);
-                            break;
+                        BusEvent::Frame(frame) => {
+                            let Some(handle) = nodes
+                                .get(&frame.node)
+                                .filter(|handle| handle.lease == frame.lease)
+                            else {
+                                continue;
+                            };
+                            let Some(timeout) = send_timeout(frame.deadline, &frame.cancelled)
+                            else {
+                                let _ = handle.events.send(NodeEvent::Submitted {
+                                    lane: frame.lane,
+                                    token: frame.pending.token,
+                                    result: SubmitResult::Failed,
+                                    may_have_sent: false,
+                                    detail: Some("CAN 帧交给驱动前已取消或到期".into()),
+                                });
+                                continue;
+                            };
+                            match channel.send(&frame.pending.frame, timeout) {
+                                Ok(()) => {
+                                    let _ = handle.events.send(NodeEvent::Submitted {
+                                        lane: frame.lane,
+                                        token: frame.pending.token,
+                                        result: SubmitResult::Accepted,
+                                        may_have_sent: false,
+                                        detail: None,
+                                    });
+                                }
+                                Err(error) => {
+                                    let reason = format!("外部 CAN 驱动提交失败: {error}");
+                                    let _ = handle.events.send(NodeEvent::Submitted {
+                                        lane: frame.lane,
+                                        token: frame.pending.token,
+                                        result: SubmitResult::Failed,
+                                        may_have_sent: true,
+                                        detail: Some(reason.clone()),
+                                    });
+                                    failure = Some(reason);
+                                    break;
+                                }
+                            }
                         }
                     }
                 }
@@ -361,42 +329,40 @@ fn run_network(
                             NetworkCommand::Recover { reply } => {
                                 let _ = reply.send(Err("共享 CAN 网络仍处于运行状态".into()));
                             }
-                            #[cfg(test)]
-                            NetworkCommand::InjectTransportFault { reply } => {
-                                failure = Some("测试注入的 CANable2 串口故障".into());
-                                let _ = reply.send(Ok(()));
+                            NetworkCommand::Attach { node, reply } => attach_node(
+                                node,
+                                reply,
+                                mode,
+                                epoch,
+                                &mut next_lease,
+                                &mut routes,
+                                &mut reconnect,
+                                &mut nodes,
+                                &events,
+                                &retired,
+                            ),
+                        }
+                    }
+                }
+                if failure.is_none() {
+                    let receive_deadline = Instant::now() + NETWORK_IO_BUDGET;
+                    for _ in 0..MAX_NETWORK_FRAMES_PER_TURN {
+                        if Instant::now() >= receive_deadline {
+                            break;
+                        }
+                        match channel.receive(RECEIVE_TIMEOUT) {
+                            Ok(Some(frame)) => route_frame(frame, &routes, &nodes),
+                            Ok(None) => break,
+                            Err(error) => {
+                                let reason = format!("外部 CAN 通道接收失败: {error}");
+                                transport_error_all(&nodes, &reason);
+                                failure = Some(reason);
                                 break;
-                            }
-                            NetworkCommand::Attach { node, reply } => {
-                                attach_node(
-                                    node,
-                                    reply,
-                                    mode,
-                                    epoch,
-                                    &mut next_lease,
-                                    &mut routes,
-                                    &mut reconnect,
-                                    &mut nodes,
-                                    &events,
-                                    &retired,
-                                );
                             }
                         }
                     }
                 }
-                if failure.is_none()
-                    && let Err(error) = drain_network_received(
-                        &mut **port,
-                        &mut line,
-                        &mut read_buffer,
-                        &routes,
-                        &nodes,
-                    )
-                {
-                    failure = Some(format!("CANable2 串口接收失败: {error}"));
-                }
                 if let Some(reason) = failure {
-                    line.clear();
                     disconnect_all(&nodes, &reason);
                     set_status(
                         &status,
@@ -438,24 +404,16 @@ fn run_network(
                         "共享 CAN 网络已终止（{reason}）；请先显式恢复"
                     )));
                 }
-                Ok(NetworkCommand::Recover { reply }) => match open_serial(&port_path, profile) {
-                    Ok((serial, recovered_mode, _probe)) => {
-                        if recovered_mode != mode {
-                            let _ = reply.send(Err("恢复的 CAN profile 模式与原网络不一致".into()));
-                            continue;
-                        }
+                Ok(NetworkCommand::Recover { reply }) => match factory.open() {
+                    Ok(channel) => {
                         set_status(&status, CanNetworkStatus::Active);
-                        phase = NetworkPhase::Active(serial);
+                        phase = NetworkPhase::Active(channel);
                         let _ = reply.send(Ok(()));
                     }
                     Err(error) => {
-                        let _ = reply.send(Err(error));
+                        let _ = reply.send(Err(format!("无法打开外部 CAN 通道: {error}")));
                     }
                 },
-                #[cfg(test)]
-                Ok(NetworkCommand::InjectTransportFault { reply }) => {
-                    let _ = reply.send(Err("共享 CAN 网络已终止；请调用 recover".into()));
-                }
             },
         }
     }
@@ -470,11 +428,6 @@ fn reject_while_quiescing(command: NetworkCommand) -> bool {
             false
         }
         NetworkCommand::Recover { reply } => {
-            let _ = reply.send(Err("共享 CAN 网络尚未保存全部节点传输状态".into()));
-            false
-        }
-        #[cfg(test)]
-        NetworkCommand::InjectTransportFault { reply } => {
             let _ = reply.send(Err("共享 CAN 网络尚未保存全部节点传输状态".into()));
             false
         }
@@ -506,13 +459,12 @@ fn attach_node(
         return;
     };
     *next_lease = next;
-    let state = reconnect.remove(&node);
     match spawn_node(
         node,
         lease,
         mode,
         epoch,
-        state,
+        reconnect.remove(&node),
         events.clone(),
         retired.clone(),
     ) {
@@ -557,6 +509,21 @@ fn disconnect_all(nodes: &BTreeMap<u8, NodeHandle>, reason: &str) {
     }
 }
 
+fn transport_error_all(nodes: &BTreeMap<u8, NodeHandle>, reason: &str) {
+    for handle in nodes.values() {
+        let _ = handle.events.send(NodeEvent::TransportError(reason.into()));
+    }
+}
+
+fn route_frame(frame: Frame, routes: &Routes, nodes: &BTreeMap<u8, NodeHandle>) {
+    let Some(node) = routes.recipient(frame.id) else {
+        return;
+    };
+    if let Some(handle) = nodes.get(&node) {
+        let _ = handle.events.send(NodeEvent::Frame(frame));
+    }
+}
+
 fn spawn_node(
     node: u8,
     lease: u64,
@@ -582,7 +549,7 @@ fn spawn_node(
                 receive,
                 events,
                 retired,
-            })
+            });
         })
         .map_err(|error| error.to_string())?;
     backend.attach_join(join);
@@ -658,14 +625,14 @@ fn run_node(runtime: NodeRuntime) {
                 node,
                 protocol::Direction::HostToFirmware,
                 mode,
-                1,
+                GENERATION,
                 tx_buffers,
             ),
             CanReceiver::new(
                 node,
                 protocol::Direction::FirmwareToHost,
                 mode,
-                1,
+                GENERATION,
                 rx_buffers,
             ),
         ) {
@@ -684,6 +651,7 @@ fn run_node(runtime: NodeRuntime) {
     let mut pump = Pump::new(commands, sink.clone()).with_epoch(epoch);
     let mut active: [Option<NodeActive>; 3] = [None, None, None];
     let mut awaiting = [false; 3];
+    let mut aborting = false;
     let mut running = true;
     while running && pump.poll() {
         for _ in 0..MAX_NODE_EVENTS_PER_TURN {
@@ -694,6 +662,7 @@ fn run_node(runtime: NodeRuntime) {
                 NodeEvent::Frame(frame) => {
                     receive_frame(&mut receiver, &sink, &frame, pump.now_ms())
                 }
+                NodeEvent::TransportError(reason) => sink.transport_error(reason, Vec::new()),
                 NodeEvent::Submitted {
                     lane,
                     token,
@@ -702,9 +671,13 @@ fn run_node(runtime: NodeRuntime) {
                     detail,
                 } => {
                     awaiting[lane] = false;
+                    if aborting {
+                        // 外部驱动结果未知时，请求已过期。共享通道正在隔离，不能将迟到的
+                        // 本地确认变成一次成功的 EHA 提交。
+                        continue;
+                    }
                     let request = active[lane].as_mut();
-                    let completion = transmitter.complete(token, result, pump.now_ms());
-                    match completion {
+                    match transmitter.complete(token, result, pump.now_ms()) {
                         Ok(SubmitEvent::MessageCommitted { .. }) => {
                             if let Some(request) = active[lane].take() {
                                 sink.submitted(request.request.id);
@@ -740,9 +713,29 @@ fn run_node(runtime: NodeRuntime) {
                 Vec::new(),
             );
         }
+        if aborting {
+            std::thread::yield_now();
+            continue;
+        }
         for (lane, awaiting_lane) in awaiting.iter_mut().enumerate() {
             start_node_request(lane, &mut pump, &mut transmitter, &mut active);
             if *awaiting_lane {
+                let expired_while_waiting = active[lane]
+                    .as_ref()
+                    .is_some_and(|request| request.request.expired());
+                if expired_while_waiting {
+                    let request = active[lane]
+                        .as_mut()
+                        .expect("awaiting lane owns an active request");
+                    request.may_have_sent = true;
+                    let _ = bus.send(BusEvent::Abort {
+                        node,
+                        lease,
+                        reason: "等待外部 CAN 驱动结果时请求已取消或到期；已隔离共享通道".into(),
+                    });
+                    aborting = true;
+                    break;
+                }
                 continue;
             }
             if let Some(pending) = transmitter.next_frame(lane_from_index(lane)) {
@@ -753,6 +746,18 @@ fn run_node(runtime: NodeRuntime) {
                         lease,
                         lane,
                         pending,
+                        deadline: active[lane]
+                            .as_ref()
+                            .expect("active request owns pending frame")
+                            .request
+                            .deadline,
+                        cancelled: Arc::clone(
+                            &active[lane]
+                                .as_ref()
+                                .expect("active request owns pending frame")
+                                .request
+                                .cancelled,
+                        ),
                     }))
                     .is_err()
                 {
@@ -815,79 +820,166 @@ fn start_node_request(
     }
 }
 
-fn receive_frame(receiver: &mut CanReceiver<'_>, sink: &EventSink, frame: &Frame, now_ms: u64) {
-    match receiver.receive(frame, now_ms, receiver.generation()) {
-        ReceiveResult::Complete { lane, .. } => {
-            let Some(message) = receiver.take_completed(lane) else {
-                sink.transport_error("CAN 完整消息缓冲丢失", Vec::new());
-                return;
-            };
-            let bytes = message.as_bytes().to_vec();
-            match receiver.replace_buffer(lane, message.into_buffer()) {
-                Ok(()) => sink.received(bytes),
-                Err(error) => {
-                    sink.transport_error(format!("CAN 完整消息缓冲无法归还: {error:?}"), Vec::new())
-                }
-            }
-        }
-        ReceiveResult::Rejected { reason } => {
-            sink.transport_error(format!("CAN 帧不满足绑定: {reason:?}"), Vec::new())
-        }
-        ReceiveResult::Ignored | ReceiveResult::Incomplete { .. } => {}
-    }
-}
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
 
-fn drain_network_received(
-    port: &mut dyn SerialPort,
-    line: &mut Vec<u8>,
-    buffer: &mut [u8],
-    routes: &Routes,
-    nodes: &BTreeMap<u8, NodeHandle>,
-) -> std::io::Result<()> {
-    let mut remaining = port.bytes_to_read().map_err(std::io::Error::from)?;
-    for _ in 0..MAX_RX_CHUNKS_PER_TURN {
-        if remaining == 0 {
-            break;
-        }
-        let request = remaining.min(buffer.len() as u32) as usize;
-        match port.read(&mut buffer[..request]) {
-            Ok(0) => break,
-            Ok(length) => {
-                remaining = remaining.saturating_sub(length as u32);
-                for byte in &buffer[..length] {
-                    if *byte == b'\r' {
-                        let raw = std::mem::take(line);
-                        *line = Vec::with_capacity(MAX_SLCAN_LINE);
-                        route_line(raw, routes, nodes);
-                    } else if line.len() == MAX_SLCAN_LINE {
-                        line.clear();
-                    } else {
-                        line.push(*byte);
-                    }
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                break;
-            }
-            Err(error) => return Err(error),
+    use super::*;
+
+    struct FakeFactory(Mutex<VecDeque<Box<dyn CanChannel>>>);
+
+    impl CanChannelFactory for FakeFactory {
+        fn open(&self) -> Result<Box<dyn CanChannel>, String> {
+            self.0
+                .lock()
+                .map_err(|_| "fake channel lock poisoned".to_owned())?
+                .pop_front()
+                .ok_or_else(|| "no fake channel".into())
         }
     }
-    Ok(())
-}
 
-fn route_line(raw: Vec<u8>, routes: &Routes, nodes: &BTreeMap<u8, NodeHandle>) {
-    let Ok(Some(frame)) = decode_frame(&raw) else {
-        return;
-    };
-    let Some(node) = routes.recipient(frame.id) else {
-        return;
-    };
-    if let Some(handle) = nodes.get(&node) {
-        let _ = handle.events.send(NodeEvent::Frame(frame));
+    struct FakeChannel {
+        receives_fail: Arc<AtomicBool>,
+        sends_fail: Arc<AtomicBool>,
+        sends: Arc<AtomicUsize>,
+    }
+
+    impl CanChannel for FakeChannel {
+        fn send(&mut self, _: &Frame, _: Duration) -> Result<(), String> {
+            self.sends.fetch_add(1, Ordering::Relaxed);
+            if self.sends_fail.load(Ordering::Acquire) {
+                Err("fake send fault".into())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn receive(&mut self, _: Duration) -> Result<Option<Frame>, String> {
+            if self.receives_fail.load(Ordering::Acquire) {
+                Err("fake receive fault".into())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    fn wait_for_status(network: &CanNetwork, expected: impl Fn(&CanNetworkStatus) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !expected(&network.status()) {
+            assert!(
+                Instant::now() < deadline,
+                "network did not reach expected status"
+            );
+            std::thread::yield_now();
+        }
+    }
+
+    fn position_request(id: u64) -> Command {
+        let message = protocol::Message::Position(1.0);
+        let mut bytes = vec![0; message.encoded_len().expect("position length")];
+        protocol::encode(message, &mut bytes).expect("position encodes");
+        Command::Send(SendRequest {
+            id,
+            bytes,
+            deadline: Instant::now() + Duration::from_secs(1),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    #[test]
+    fn receive_failure_is_reported_to_all_nodes_and_requires_explicit_recover() {
+        let receive_fault = Arc::new(AtomicBool::new(false));
+        let send_fault = Arc::new(AtomicBool::new(false));
+        let factory = Arc::new(FakeFactory(Mutex::new(VecDeque::from([
+            Box::new(FakeChannel {
+                receives_fail: Arc::clone(&receive_fault),
+                sends_fail: Arc::clone(&send_fault),
+                sends: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn CanChannel>,
+            Box::new(FakeChannel {
+                receives_fail: Arc::new(AtomicBool::new(false)),
+                sends_fail: Arc::new(AtomicBool::new(false)),
+                sends: Arc::new(AtomicUsize::new(0)),
+            }) as Box<dyn CanChannel>,
+        ]))));
+        let network = CanNetwork::new(factory, Mode::Fd).expect("network opens");
+        let first = network
+            .node(1)
+            .expect("valid node")
+            .open()
+            .expect("first opens");
+        let second = network
+            .node(2)
+            .expect("valid node")
+            .open()
+            .expect("second opens");
+        receive_fault.store(true, Ordering::Release);
+        wait_for_status(&network, |status| {
+            matches!(status, CanNetworkStatus::Terminated { .. })
+        });
+        for backend in [&first, &second] {
+            let (lock, _) = &*backend.sink.0;
+            let inbox = lock.lock().expect("event inbox available");
+            assert_eq!(inbox.transport.errors, 1);
+            assert!(inbox.disconnected.is_some());
+        }
+        assert!(network.node(3).expect("valid node").open().is_err());
+        network
+            .recover()
+            .expect("explicit recovery opens the next channel");
+        assert_eq!(network.status(), CanNetworkStatus::Active);
+    }
+
+    #[test]
+    fn send_failure_is_never_replayed_after_explicit_recover() {
+        let first_sends = Arc::new(AtomicUsize::new(0));
+        let second_sends = Arc::new(AtomicUsize::new(0));
+        let factory = Arc::new(FakeFactory(Mutex::new(VecDeque::from([
+            Box::new(FakeChannel {
+                receives_fail: Arc::new(AtomicBool::new(false)),
+                sends_fail: Arc::new(AtomicBool::new(true)),
+                sends: Arc::clone(&first_sends),
+            }) as Box<dyn CanChannel>,
+            Box::new(FakeChannel {
+                receives_fail: Arc::new(AtomicBool::new(false)),
+                sends_fail: Arc::new(AtomicBool::new(false)),
+                sends: Arc::clone(&second_sends),
+            }) as Box<dyn CanChannel>,
+        ]))));
+        let network = CanNetwork::new(factory, Mode::Fd).expect("network opens");
+        let first = network
+            .node(1)
+            .expect("valid node")
+            .open()
+            .expect("node opens");
+        first
+            .tx
+            .send(position_request(7))
+            .expect("request reaches node");
+        wait_for_status(&network, |status| {
+            matches!(status, CanNetworkStatus::Terminated { .. })
+        });
+        assert_eq!(first_sends.load(Ordering::Relaxed), 1);
+        network
+            .recover()
+            .expect("explicit recovery opens next channel");
+        let recovered = network
+            .node(1)
+            .expect("valid node")
+            .open()
+            .expect("node explicitly reopens");
+        std::thread::sleep(Duration::from_millis(2));
+        assert_eq!(
+            second_sends.load(Ordering::Relaxed),
+            0,
+            "old request is not replayed"
+        );
+        drop(recovered);
     }
 }

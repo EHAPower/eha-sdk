@@ -479,9 +479,10 @@ pub(crate) fn session_fixture(
         .expect("fixture Identity succeeds");
     let mut session = ToolSession::new().with_timeout(Duration::from_millis(100));
     session.request = Some(ConnectionRequest::Can {
-        port: format!("fixture-{node}"),
+        channel: format!("fixture-{node}"),
         node,
-        profile: "fd_1m_2m".into(),
+        mode: "fd".into(),
+        python: None,
     });
     session.identity = Some(identity);
     session.client = Some(client);

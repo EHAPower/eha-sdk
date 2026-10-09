@@ -5,6 +5,7 @@ import argparse
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 
 def main():
@@ -12,6 +13,7 @@ def main():
     root = Path(__file__).resolve().parents[1]
     commands = [
         ["cargo", "fmt", "--all", "--", "--check"],
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_python_can.py"],
         ["cargo", "test", "--workspace", "--all-targets", "--locked"],
         ["node", "--test", *[
             str(path.relative_to(root))

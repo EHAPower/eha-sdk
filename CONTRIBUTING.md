@@ -13,7 +13,8 @@
 | SDK 与工具构建、二次开发 | Git、Rust stable、Cargo、原生链接器；Rust 包由 `Cargo.toml`／`Cargo.lock` 管理 |
 | 完整软件检查 | Python 3、Node.js 24、Clippy、rustfmt、`thumbv7em-none-eabihf` target；Python 脚本仅使用标准库 |
 | 更新工具 Web UI vendor 资源 | Node.js 24、npm；前端包由 `crates/tool/webui/package.json`／`package-lock.json` 管理 |
-| 已构建工具运行 | 匹配主机系统和架构的可执行文件；页面资源已内嵌，EHA 操作不需要 Python 或 Node.js |
+| 已构建工具运行（仅 USB） | 匹配主机系统和架构的可执行文件；页面资源已内嵌，EHA 操作不需要 Python 或 Node.js |
+| 已构建工具运行（外部 CAN） | Python 3 与 `python-can>=4.6.1,<5`，以及部署方已配置的 CAN 驱动、权限、通道与总线参数；见 [CAN 接入指南](CAN接入指南.md#主机-can-通道) |
 | ODrive USB 独立只读（可选） | Python 3、`odrive==0.5.1.post0`（自带 Fibre）、PyUSB、libusb 1.0，以及 USB 驱动／访问权限 |
 
 ## 构建与检查

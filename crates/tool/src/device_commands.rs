@@ -14,8 +14,7 @@ use std::{
 
 use clap::{Args, Subcommand};
 use eha_sdk::{
-    can::{self, CanOptions},
-    config::{Config, ExternalCanProfile},
+    config::Config,
     host::{Client, Failure, Reply, Wait},
     protocol::{
         Response,
@@ -36,17 +35,20 @@ pub struct DeviceCommand {
     #[arg(long)]
     json: bool,
     /// USB 设备的完整序列号；SDK 会重新枚举并认领 `ff:45:01` Bulk 接口。
-    #[arg(long, conflicts_with = "can_port")]
+    #[arg(long, conflicts_with = "can_channel")]
     usb: Option<String>,
-    /// CANable2 SLCAN 串口路径，例如 `/dev/cu.usbmodem…` 或 `COM3`。
+    /// 外部 python-can 配置中的 CAN 通道上下文名。
     #[arg(long, conflicts_with = "usb")]
-    can_port: Option<String>,
-    /// CAN 逻辑节点号；仅与 `--can-port` 一起使用。
-    #[arg(long, requires = "can_port")]
+    can_channel: Option<String>,
+    /// CAN 逻辑节点号；仅与 `--can-channel` 一起使用。
+    #[arg(long, requires = "can_channel")]
     node: Option<u8>,
-    /// 已由目标实际采用的 CAN 配置，例如 `fd_1m_5m`；仅与 `--can-port` 一起使用。
-    #[arg(long, requires = "can_port")]
-    profile: Option<String>,
+    /// CAN 帧格式：`classic` 或 `fd`；省略时为 `fd`。
+    #[arg(long, requires = "can_channel", default_value = "fd")]
+    can_mode: String,
+    /// 运行 python-can 的 Python 路径；省略时使用平台默认解释器。
+    #[arg(long, requires = "can_channel")]
+    can_python: Option<String>,
     /// 单次本地提交或固件回复等待上限，单位秒。
     #[arg(long, default_value_t = 5)]
     timeout_secs: u64,
@@ -152,16 +154,14 @@ pub fn run(command: DeviceCommand) -> Result<(), String> {
     }
     let wait = Wait::new(Duration::from_secs(command.timeout_secs));
     let selected_usb = command.usb.is_some();
-    let backend = match (command.usb, command.can_port) {
+    let backend = match (command.usb, command.can_channel) {
         (Some(serial), None) => usb::open(&serial)?,
-        (None, Some(port)) => {
+        (None, Some(channel)) => {
             let node = command.node.ok_or("CAN 通路需要 --node")?;
-            let profile =
-                parse_profile(command.profile.as_deref().ok_or("CAN 通路需要 --profile")?)?;
-            can::open(CanOptions::canable2(port, node, profile))?
+            crate::session::open_can(channel, node, &command.can_mode, command.can_python)?
         }
         (None, None) => {
-            return Err("请选择 --usb SERIAL 或 --can-port PORT --node N --profile NAME".into());
+            return Err("请选择 --usb SERIAL 或 --can-channel CONTEXT --node N".into());
         }
         (Some(_), Some(_)) => return Err("USB 与 CAN 通路不能同时选择".into()),
     };
@@ -174,15 +174,16 @@ pub fn run(command: DeviceCommand) -> Result<(), String> {
 }
 
 fn run_session(command: DeviceCommand) -> Result<(), String> {
-    let request = match (command.usb, command.can_port) {
+    let request = match (command.usb, command.can_channel) {
         (Some(serial), None) => ConnectionRequest::Usb { serial },
-        (None, Some(port)) => ConnectionRequest::Can {
-            port,
+        (None, Some(channel)) => ConnectionRequest::Can {
+            channel,
             node: command.node.ok_or("CAN 通路需要 --node")?,
-            profile: command.profile.ok_or("CAN 通路需要 --profile")?,
+            mode: command.can_mode,
+            python: command.can_python,
         },
         (None, None) => {
-            return Err("请选择 --usb SERIAL 或 --can-port PORT --node N --profile NAME".into());
+            return Err("请选择 --usb SERIAL 或 --can-channel CONTEXT --node N".into());
         }
         (Some(_), Some(_)) => return Err("USB 与 CAN 通路不能同时选择".into()),
     };
@@ -644,19 +645,6 @@ fn format_sdk_error(error: eha_sdk::host::Error) -> String {
     output
 }
 
-fn parse_profile(value: &str) -> Result<ExternalCanProfile, String> {
-    match value {
-        "classical_500k" => Ok(ExternalCanProfile::Classical500K),
-        "classical_1m" => Ok(ExternalCanProfile::Classical1M),
-        "fd_500k_2m" => Ok(ExternalCanProfile::Fd500K2M),
-        "fd_500k_500k" => Ok(ExternalCanProfile::Fd500K500K),
-        "fd_1m_2m" => Ok(ExternalCanProfile::Fd1M2M),
-        "fd_1m_5m" => Ok(ExternalCanProfile::Fd1M5M),
-        "fd_1m_8m" => Ok(ExternalCanProfile::Fd1M8M),
-        _ => Err("未知 --profile；可用值：classical_500k、classical_1m、fd_500k_2m、fd_500k_500k、fd_1m_2m、fd_1m_5m、fd_1m_8m".into()),
-    }
-}
-
 fn key_hex(key: MaintenanceKey) -> String {
     hex_bytes(&key.to_bytes())
 }
@@ -673,9 +661,10 @@ mod tests {
         DeviceCommand {
             json: false,
             usb: Some("missing-usb-serial".into()),
-            can_port: None,
+            can_channel: None,
             node: None,
-            profile: None,
+            can_mode: "fd".into(),
+            can_python: None,
             timeout_secs: 5,
             action: Action::VelocityTest { mm_s, seconds: 1 },
         }

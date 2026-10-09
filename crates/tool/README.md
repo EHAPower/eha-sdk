@@ -16,7 +16,7 @@
 
 ```mermaid
 flowchart LR
-    D["devices / can-devices<br/>只枚举候选"] --> T["选择完整 USB 序列号<br/>或 CAN 端口、节点、配置组"]
+    D["devices<br/>只枚举 USB 候选"] --> T["选择完整 USB 序列号<br/>或已配置 CAN 通道、节点、帧形态"]
     T --> I["连接并核对 Identity"]
     I --> A{所需工作}
     A --> C["device<br/>一次查询、维护或动作"]
@@ -30,33 +30,32 @@ flowchart LR
 
 枚举不会打开设备或扫描总线，不能说明连接或 Identity 已核对。`device` 的每个动作新建本地
 会话、核对 Identity、执行一个动作后关闭本地句柄；单次调用返回后不保留会话或心跳。USB 目标使用完整
-序列号；CAN 目标必须同时给出实际的 `--can-port`、`--node` 和 `--profile`。支持的配置组为
-`classical_500k`、`classical_1m`、`fd_500k_2m`、`fd_1m_2m`、`fd_1m_5m`，必须与设备实际采用的
-通信配置一致。
+序列号；CAN 目标必须给出 `--can-channel` 与 `--node`，可选 `--can-mode classic|fd`（默认 `fd`）和
+`--can-python` 指定带 `python-can` 的解释器。通道上下文、设备权限和总线参数由部署方的系统／驱动层配置；
+`--can-mode` 必须匹配设备实际启动的 Classic／FD 帧形态，不设置主机速率。详见 [CAN 接入指南](../../CAN接入指南.md#主机-can-通道)。
 
 | 需要 | 入口 | 关键边界 |
 | --- | --- | --- |
 | 本地完整配置检查 | `config-check FILE` | 不访问设备。 |
-| 候选发现 | `devices`、`can-devices` | `--json` 供自动化；CANable2 SLCAN 候选不打开串口。 |
+| 候选发现 | `devices` | `--json` 供自动化；只枚举 USB 候选，不发现 CAN 设备。 |
 | 单次查询、维护或控制提交 | `device TARGET ACTION` | 动作前核对 Identity；`--timeout-secs` 默认 5 秒；`device --json` 输出结构化结果。 |
 | 单次观察或心跳 | `device TARGET telemetry SECONDS`、`heartbeat-test SECONDS` | 前者不启动心跳或提交控制；后者只显式启停心跳，不发送 Stop。 |
 | 连续会话或串行自动化 | `shell` | 同一 SDK 会话可保留心跳和缓存遥测。 |
 | 本机页面、试验和记录 | `webui` | 仅监听 `127.0.0.1`。 |
 | ODrive USB 只读快照 | `odrive` | 与 H723 会话独立，不控制设备。 |
 
-以下值是占位符，执行前必须替换为已核对的实际目标；端口路径保留为实际主机上的路径，例如
-`/dev/cu.usbmodem…` 或 `COM3`。
+以下值是占位符，执行前必须替换为已核对的实际目标。CAN 上下文是部署方在外部驱动中配置的名称，
+不是设备路径、厂商名或工具可枚举的标识。
 
 ```sh
 export EHA_USB_SERIAL='实际完整 USB 序列号'
-export EHA_CAN_PORT='实际 CANable2 串口路径'
+export EHA_CAN_CHANNEL='EHA_PRODUCTION'
 export EHA_CAN_NODE='实际 Customer CAN 节点号'
-export EHA_CAN_PROFILE='实际 CAN 配置组'
+export EHA_CAN_MODE='fd'
 
 eha-tool devices --json
-eha-tool can-devices --json
 eha-tool device --usb "$EHA_USB_SERIAL" inspect
-eha-tool device --can-port "$EHA_CAN_PORT" --node "$EHA_CAN_NODE" --profile "$EHA_CAN_PROFILE" status
+eha-tool device --can-channel "$EHA_CAN_CHANNEL" --node "$EHA_CAN_NODE" --can-mode "$EHA_CAN_MODE" status
 ```
 
 `inspect --json` 只输出身份、运行实例和更新路由；`--version` 不访问设备。无参数仅在标准输入和输出
@@ -103,8 +102,9 @@ eha-tool odrive --python /path/to/python --timeout-secs 10 --json status --seria
 
 `eha-tool shell`（或终端中的无参数调用）持有一个 SDK 会话。先用 `device list` 取得候选，以完整序列号
 或该次列表中的短数字序号 `device select`，再 `device connect`；CAN 直接使用
-`device connect-can PORT NODE PROFILE`。连接和 `device reconnect` 都核对 Identity。`device show`、
-`device clear`、`device snapshot`、`device disconnect` 管理本地选择或会话；`device list-can` 只刷新候选。
+`device connect-can CONTEXT NODE [classic|fd] [PYTHON]`。连接和 `device reconnect` 都核对 Identity。
+`device show`、`device clear`、`device snapshot`、`device disconnect` 管理本地选择或会话；Shell 不发现 CAN
+设备，`CONTEXT` 由外部驱动配置。
 
 | Shell 工作 | 命令 | 边界 |
 | --- | --- | --- |
@@ -186,7 +186,7 @@ eha-tool webui --runs-dir /path/to/eha-runs
 
 | 页面或操作 | 行为与边界 |
 | --- | --- |
-| 总览与连接 | 先刷新候选；USB 选择完整序列号，CAN 填写适配器路径、实际节点和配置组。连接/重连核对 Identity；关闭只关闭该通路。USB、CAN 的会话、心跳、草稿和维护操作键分开保存。 |
+| 总览与连接 | 刷新候选只作用于 USB；CAN 填写外部驱动的通道上下文、实际节点、`classic`／`fd` 帧形态和可选 Python 解释器。连接/重连核对 Identity；关闭只关闭该通路。USB、CAN 的会话、心跳、草稿和维护操作键分开保存。 |
 | 诊断与遥测 | 状态、测量、诊断和被动遥测均对应当前操作通路。图表的旧数据、缺失值和未知影响不能证明当前输出或实际执行；暂停绘图只影响浏览器展示。 |
 | 普通控制 | 先启用当前通路心跳，再提交已选定的位置、速度、力或阻抗参数。提交只到本地发送边界；停止心跳、关闭页面或断开连接不会停止控制，普通停止须点“停止控制”。 |
 | 配置和维护 | 表单只按当前 Schema 编辑/比较，完整 JSON 原文是唯一完整记录；导入和导出都不访问设备。保存前校验完整 JSON，保存后以读回为准。未知结果保留操作键并查询原结果，不重发；断连不能证明新应用或更新入口已启动。 |
@@ -216,10 +216,10 @@ Startup 与 Status 作只读预检，全部通过才提交一次试验目标，�
 
 #### 共享 CAN 与多节点试验
 
-一个 CAN 适配器可承载多个明确选择的节点，但每个节点有独立身份、会话、心跳、遥测与结果，不能相互替代。
+一个外部 CAN 通道可承载多个明确选择的节点，但每个节点有独立身份、会话、心跳、遥测与结果，不能相互替代。
 扫描范围为 0 至 127，只查询 Identity、不启心跳；已有会话保留心跳或持续目标时，先显式停止并核对、关闭
-心跳后再扫描。串口故障结束所有节点的本次连接，不会自动重开或重放动作；重新可用后须显式重连指定节点
-并重新核对身份，其余节点仍断开，心跳和目标均须另行操作。
+心跳后再扫描。外部驱动通道故障结束所有节点的本次连接，不会自动重开、切换设备或重放动作；重新可用后须
+由部署方确认驱动状态，再显式重连指定节点并重新核对身份，其余节点仍断开，心跳和目标均须另行操作。
 
 群组试验的每个成员都要独立通过只读预检，任一失败即不提交群组需求。提交或停止结果按节点分别显示；
 部分提交、部分停止、超时或未知结果时，不自动重试、补发或归纳为成功。群组开始后的“停止本次试验”使用

@@ -9,12 +9,14 @@
 use std::{
     collections::VecDeque,
     path::Path,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use eha_sdk::{
-    can::{CanConnector, CanNodeConnector, CanOptions},
-    config::ExternalCanProfile,
+    can::{
+        CanChannelFactory, CanConnector, CanNodeConnector, CanOptions, python::PythonCanOptions,
+    },
     host::{
         Client, ClientState, Error as SdkError, Failure, LocalSubmission, OperationSubmission,
         Reply, Wait,
@@ -47,9 +49,10 @@ pub enum ConnectionRequest {
         serial: String,
     },
     Can {
-        port: String,
+        channel: String,
         node: u8,
-        profile: String,
+        mode: String,
+        python: Option<String>,
     },
 }
 
@@ -1717,20 +1720,41 @@ fn validate_trial_facts(
     Ok(())
 }
 
+pub(crate) fn open_can(
+    channel: String,
+    node: u8,
+    mode: &str,
+    python: Option<String>,
+) -> Result<eha_sdk::host::backend::Backend, String> {
+    let mut connector = CanConnector::new(
+        CanOptions {
+            node,
+            mode: parse_can_mode(mode).map_err(|error| error.message)?,
+        },
+        python_factory(channel, python),
+    )?;
+    connector.open()
+}
+
 fn connector_for(request: &ConnectionRequest) -> Result<Connector, SessionError> {
     match request {
         ConnectionRequest::Usb { serial } => UsbConnector::new(serial.clone())
             .map(Connector::Usb)
             .map_err(open_error),
         ConnectionRequest::Can {
-            port,
+            channel,
             node,
-            profile,
-        } => Ok(Connector::Can(CanConnector::new(CanOptions::canable2(
-            port.clone(),
-            *node,
-            parse_profile(profile)?,
-        )))),
+            mode,
+            python,
+        } => CanConnector::new(
+            CanOptions {
+                node: *node,
+                mode: parse_can_mode(mode)?,
+            },
+            python_factory(channel.clone(), python.clone()),
+        )
+        .map(Connector::Can)
+        .map_err(open_error),
     }
 }
 
@@ -1780,17 +1804,19 @@ fn operation_submission_data(
     json!({"local_submission": true, "operation_key": value, "device_execution": "unconfirmed"})
 }
 
-fn parse_profile(value: &str) -> Result<ExternalCanProfile, SessionError> {
+pub(crate) fn parse_can_mode(value: &str) -> Result<eha_sdk::transport::can::Mode, SessionError> {
     match value {
-        "classical_500k" => Ok(ExternalCanProfile::Classical500K),
-        "classical_1m" => Ok(ExternalCanProfile::Classical1M),
-        "fd_500k_2m" => Ok(ExternalCanProfile::Fd500K2M),
-        "fd_500k_500k" => Ok(ExternalCanProfile::Fd500K500K),
-        "fd_1m_2m" => Ok(ExternalCanProfile::Fd1M2M),
-        "fd_1m_5m" => Ok(ExternalCanProfile::Fd1M5M),
-        "fd_1m_8m" => Ok(ExternalCanProfile::Fd1M8M),
-        _ => Err(invalid("未知 CAN profile")),
+        "classic" => Ok(eha_sdk::transport::can::Mode::Classic),
+        "fd" => Ok(eha_sdk::transport::can::Mode::Fd),
+        _ => Err(invalid("未知 CAN 帧格式；可用值：classic、fd")),
     }
+}
+
+fn python_factory(channel: String, python: Option<String>) -> Arc<dyn CanChannelFactory> {
+    Arc::new(match python {
+        Some(python) => PythonCanOptions::with_python(channel, python),
+        None => PythonCanOptions::new(channel),
+    })
 }
 fn parse_view(value: &str) -> Result<ConfigView, SessionError> {
     match value {

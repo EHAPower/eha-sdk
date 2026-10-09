@@ -331,7 +331,7 @@ impl Backend {
                 tx,
                 sink: sink.clone(),
                 join: None,
-                boundary: "共享 CAN 串口 write/flush；不证明适配器或总线接收",
+                boundary: "共享 CAN 驱动 send 返回；不证明总线 ACK 或设备采用",
             },
             rx,
             sink,

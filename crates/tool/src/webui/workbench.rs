@@ -8,15 +8,15 @@
 use crate::session::{
     Command, CommandResult, ConnectionRequest, SessionError, ToolSession, TrialRequest,
 };
-use eha_sdk::{
-    can::{CanNetwork, CanNetworkStatus, CanNodeConnector},
-    config::ExternalCanProfile,
+use eha_sdk::can::{
+    CanChannelFactory, CanNetwork, CanNetworkStatus, CanNodeConnector, python::PythonCanOptions,
 };
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::PathBuf,
+    sync::Arc,
 };
 
 const TREND_CAPACITY: usize = 4_096;
@@ -38,12 +38,13 @@ impl Transport {
 
 pub(crate) struct CanNetworkState {
     network: CanNetwork,
-    port: String,
-    profile: String,
+    channel: String,
+    mode: String,
+    python: Option<String>,
 }
 
 /// 进程唯一的 WebUI 会话 owner。CAN 节点独立保存 SDK Client/身份/趋势/记录/试验，
-/// 但由一个 `CanNetwork` 持有适配器串口。
+/// 但由一个 `CanNetwork` 持有外部 CAN 通道。
 pub(crate) struct Workbench {
     usb: ToolSession,
     can_nodes: BTreeMap<u8, ToolSession>,
@@ -154,22 +155,29 @@ impl Workbench {
             .node(node)
     }
 
-    pub(crate) fn ensure_network(&mut self, port: String, profile: String) -> Result<(), String> {
-        let parsed = parse_profile(&profile)?;
+    pub(crate) fn ensure_network(
+        &mut self,
+        channel: String,
+        mode: String,
+        python: Option<String>,
+    ) -> Result<(), String> {
+        let parsed =
+            crate::session::parse_can_mode(&mode).map_err(|error| error.message.to_string())?;
         if let Some(network) = self.can_network.as_ref() {
-            if network.port == port && network.profile == profile {
+            if network.channel == channel && network.mode == mode && network.python == python {
                 return Ok(());
             }
             return Err(
-                "CAN 网络已绑定到另一条串口或 profile；请在没有已持有 CAN 会话时重新启动 WebUI。"
+                "CAN 网络已绑定到另一外部通道或帧格式；请在没有已持有 CAN 会话时重新启动 WebUI。"
                     .into(),
             );
         }
-        let network = CanNetwork::new(port.clone(), parsed)?;
+        let network = CanNetwork::new(python_factory(channel.clone(), python.clone()), parsed)?;
         self.can_network = Some(CanNetworkState {
             network,
-            port,
-            profile,
+            channel,
+            mode,
+            python,
         });
         Ok(())
     }
@@ -181,12 +189,13 @@ impl Workbench {
                 Ok(json!({"connected": true}))
             }
             ConnectionRequest::Can {
-                port,
+                channel,
                 node,
-                profile,
+                mode,
+                python,
             } => {
                 let result = self
-                    .connect_can(port, profile, &[node], true)
+                    .connect_can(channel, mode, python, &[node], true)
                     .map_err(session_error)?;
                 if result["ok"] == true {
                     Ok(result)
@@ -203,19 +212,21 @@ impl Workbench {
     /// 返回每个节点的真实结果；失败节点绝不触发重试或重新编号。
     pub(crate) fn connect_can(
         &mut self,
-        port: String,
-        profile: String,
+        channel: String,
+        mode: String,
+        python: Option<String>,
         nodes: &[u8],
         set_default: bool,
     ) -> Result<Value, String> {
         validate_nodes(nodes)?;
-        self.ensure_network(port.clone(), profile.clone())?;
+        self.ensure_network(channel.clone(), mode.clone(), python.clone())?;
         let mut results = Vec::with_capacity(nodes.len());
         for &node in nodes {
             let request = ConnectionRequest::Can {
-                port: port.clone(),
+                channel: channel.clone(),
                 node,
-                profile: profile.clone(),
+                mode: mode.clone(),
+                python: python.clone(),
             };
             let result = if let Some(session) = self.can_nodes.get_mut(&node) {
                 let snapshot = session.snapshot();
@@ -809,17 +820,11 @@ fn group_member_terminal(session: &ToolSession) -> bool {
     )
 }
 
-fn parse_profile(value: &str) -> Result<ExternalCanProfile, String> {
-    match value {
-        "classical_500k" => Ok(ExternalCanProfile::Classical500K),
-        "classical_1m" => Ok(ExternalCanProfile::Classical1M),
-        "fd_500k_2m" => Ok(ExternalCanProfile::Fd500K2M),
-        "fd_500k_500k" => Ok(ExternalCanProfile::Fd500K500K),
-        "fd_1m_2m" => Ok(ExternalCanProfile::Fd1M2M),
-        "fd_1m_5m" => Ok(ExternalCanProfile::Fd1M5M),
-        "fd_1m_8m" => Ok(ExternalCanProfile::Fd1M8M),
-        _ => Err("未知 CAN profile".into()),
-    }
+fn python_factory(channel: String, python: Option<String>) -> Arc<dyn CanChannelFactory> {
+    Arc::new(match python {
+        Some(python) => PythonCanOptions::with_python(channel, python),
+        None => PythonCanOptions::new(channel),
+    })
 }
 
 fn validate_nodes(nodes: &[u8]) -> Result<(), String> {

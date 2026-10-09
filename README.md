@@ -66,7 +66,7 @@ CAN 与 USB 合计只支持**一个调用方串行提交**，无需等待上一�
 
 | 取得的证据 | 可以说明什么 | 后续处理 |
 |---|---|---|
-| `LocalSubmission` | CAN 串口 `write/flush` 或 USB 最后一个 Bulk 包在本地完成 | 另观察新鲜状态；不证明 CAN ACK、固件接收、目标采用、驱动执行或运动 |
+| `LocalSubmission` | CAN 通道 `send` 或 USB 最后一个 Bulk 包在本地完成 | 另观察新鲜状态；不证明 CAN ACK、固件接收、目标采用、驱动执行或运动 |
 | `Reply` | 主机取得并解码回复 | 按回复内容解释；快照不等于当前状态 |
 | `NotStarted` | 本次维护副作用尚未开始 | 修正条件后以新维护键明确提出下一次操作 |
 | `ResultUnknown` | 已发操作的结果尚不明确 | 保留维护键，重连后 `identify`，查询原结果及实际状态；不自动重发 |
@@ -85,11 +85,11 @@ CAN 与 USB 合计只支持**一个调用方串行提交**，无需等待上一�
 | 通路 | 当前 SDK 能力与限制 |
 |---|---|
 | USB Type-C | `usb::discover` 只列出 `1209:0001` 候选；`UsbConnector::new(完整序列号)?.open()` 按实际描述符认领唯一 64 B Bulk IN/OUT 对。它不发 USB reset 或控制请求；打开后仍须 `identify`。 |
-| 外部 CAN | 仅支持原厂 SLCAN 的 CANable2：`can::discover_serial_candidates()` 只列候选，`CanConnector::new(CanOptions::canable2(...)).open()` 实际打开。支持 `classical_500k`、`classical_1m`、`fd_500k_2m`、`fd_1m_2m`、`fd_1m_5m`；不支持 SocketCAN、其他适配器/固件，以及 `fd_500k_500k`、`fd_1m_8m`。 |
+| 外部 CAN | `CanChannel` 是已配置通道上的原始帧 I/O，调用方以 `CanChannelFactory` 提供它；SDK 不发现、初始化或配置物理 CAN 设备。`CanOptions { node, mode }` 只描述 EHA 节点和 Classic／FD 帧形态。官方工具通过外部 `python-can` 上下文取得通道；平台、驱动和设备须实际支持所请求的帧形态。完整部署方法见 [CAN 接入指南](CAN接入指南.md#主机-can-通道)。 |
 
-打开适配器或认领 USB 接口只证明本地资源取得；首次业务操作必须在同一通路
+打开 CAN 通道或认领 USB 接口只证明本地资源取得；首次业务操作必须在同一通路
 `Client::identify`，必要时提供预期 UID。描述符、CAN 节点或同型设备都不能替代身份。
-USB 认领失败可能是占用、权限、系统或驱动问题；若确认旧会话存在，先在旧会话显式
+USB 认领失败或 CAN 通道不能打开，可能是占用、权限、系统或驱动问题；若确认旧会话存在，先在旧会话显式
 `stop_control` 并观察状态，再释放连接。
 
 ## 最小 Rust 调用
@@ -99,17 +99,18 @@ USB 认领失败可能是占用、权限、系统或驱动问题；若确认旧�
 操作，也不构成设备停止。
 
 ```rust,no_run
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use eha_sdk::{
-    can::{CanConnector, CanOptions},
-    config::ExternalCanProfile,
+    can::{CanChannelFactory, CanConnector, CanOptions},
     host::{Client, Wait},
+    transport::can::Mode,
 };
 
-fn main() -> Result<(), String> {
-    let mut connector = CanConnector::new(CanOptions::canable2(
-        "SERIAL_PORT", 1, ExternalCanProfile::Fd1M2M,
-    ));
+fn query(factory: Arc<dyn CanChannelFactory>) -> Result<(), String> {
+    let mut connector = CanConnector::new(CanOptions {
+        node: 1,
+        mode: Mode::Fd,
+    }, factory)?;
     let backend = connector.open()?;
     let mut client = Client::new(backend);
     let wait = Wait::new(Duration::from_secs(5));
@@ -120,13 +121,15 @@ fn main() -> Result<(), String> {
 }
 ```
 
+应用程序在 `CanChannelFactory::open()` 中接入自己的系统／驱动服务；SDK 只调用通道的 `send`／`receive`，
+不会解释厂商设备协议或指定比特率。官方工具已提供外部 `python-can` 接入实现，调用时以命名通道上下文选择。
 USB 仅替换为 `UsbConnector::new("完整 USB 序列号")?.open()`。控制前核对身份、配置、
 当前位置、限值和停止条件，调用 `start_heartbeat` 并从新鲜遥测确认联系；结束时显式
 `stop_control`，观察无目标和合格 Idle 后再 `stop_heartbeat`、关闭连接。
 
 关闭、`Drop`、`disconnect`、普通错误、取消和超时都不发送 Stop、Reset、Heartbeat，也不重放
 旧目标。`disconnect()` 的 `ClientState` 只用于同一 Connector 重开后的 `Client::resume`；
-新 Client 必须重新 `identify`，心跳不会自启。不要新建 Connector、重开进程或适配器来绕过
+新 Client 必须重新 `identify`，心跳不会自启。不要新建 Connector、重开进程或切换 CAN 设备来绕过
 `transfer_id` 保护期；重新打开成功仍只证明本地资源取得。
 
 ## 配置检查
