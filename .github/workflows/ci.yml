@@ -1,4 +1,4 @@
-name: SDK and tool
+name: SDK 与工具检查
 
 on:
   push:
@@ -9,17 +9,20 @@ permissions:
 
 jobs:
   check:
+    name: 检查公开库与工具
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: 检出源码
+        uses: actions/checkout@v4
+      - name: 准备 Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - name: Prepare Rust
+      - name: 准备 Rust 稳定版
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup component add clippy rustfmt
           rustup target add thumbv7em-none-eabihf
-      - name: Check SDK, tool, and public libraries
+      - name: 检查 SDK、工具与公共库
         run: python3 scripts/check.py

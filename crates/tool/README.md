@@ -297,6 +297,7 @@ eha-tool webui --odrive-python /path/to/python
 “诊断与维护”也可按需发现并读取 ODrive USB；它不
 依赖 H723 会话，不自动轮询，也不能证明 H723 与 ODrive 的内部 CAN 正常。H723 所见 ODrive 摘要与直接
 ODrive USB 快照是独立证据，分别查看其时间与错误状态。
+ODrive USB 读取由独立工作者串行执行，已有读取未完成时再次请求返回忙碌；它不阻塞 H723 会话或快照读取。
 
 ## 结果边界
 
