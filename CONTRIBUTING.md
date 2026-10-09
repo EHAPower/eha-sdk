@@ -47,6 +47,8 @@ python3 scripts/check.py
 检查和工具 release 构建，不访问设备。局部变更按实际影响选择相称命令。已有 vendor 资源可直接构建，
 不需要先安装 npm 依赖。
 
+阅读本地 API 文档使用 `cargo doc --workspace --no-deps --locked --open`；各 crate README 说明职责与使用流程，rustdoc 维护具体接口。
+
 修改 Web UI 图表依赖时，从仓库根执行：
 
 ```sh

@@ -37,7 +37,6 @@ fn emit_rerun_rules() -> Result<(), Box<dyn Error>> {
     }
 
     let out_dir = env::var("OUT_DIR")?;
-    // See this module's documentation: the path must remain absent.
     println!(
         "cargo:rerun-if-changed={}/eha-build-metadata-must-not-exist",
         out_dir

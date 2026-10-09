@@ -2,8 +2,8 @@
 //! CANable2 SLCAN 桌面接入。
 //!
 //! 此模块只支持经串口枚举、运行原厂 CANable2 SLCAN 固件的适配器。它在 macOS、
-//! Windows 和 Linux 上使用同一 `serialport` 实现；本轮不把 Linux SocketCAN 或其他
-//! 固件的枚举结果表述为已支持的接入。一个完整业务消息仍由 [`transport::can`] 编码、
+//! Windows 和 Linux 上使用同一 `serialport` 实现；不支持 Linux SocketCAN 或其他固件。
+//! 一个完整业务消息仍由 [`transport::can`] 编码、
 //! 分片和重组，本模块只在 SLCAN 文本与真实 CAN 帧之间转换。
 //!
 //! `fd_500k_500k` 与 `fd_1m_8m` 没有 CANable2 原厂 SLCAN 的可用配置命令，打开时会
@@ -648,8 +648,8 @@ fn run(
                 }
             }
         }
-        // Do not insert an artificial inter-frame delay here. In particular, a successful
-        // 400 µs paced diagnostic run is not a product-side cure for issue 11.
+        // Do not insert an artificial inter-frame delay: a paced diagnostic run cannot establish
+        // or repair product-side CAN reliability.
         std::thread::yield_now();
     }
     for request in active.into_iter().flatten() {
@@ -1058,8 +1058,8 @@ mod tests {
 
     #[test]
     fn truncated_fd_line_is_an_error_with_no_synthetic_frame() {
-        // Issue 10 preserved a 112-byte SLCAN record including CR: the `B` header is 10
-        // bytes and only 101 hexadecimal data characters follow, although DLC=F requires 128.
+        // This 112-byte record includes CR: the `B` header is 10 bytes and only 101 hexadecimal
+        // data characters follow, although DLC=F requires 128.
         let mut raw = b"B00700036F".to_vec();
         raw.extend(std::iter::repeat_n(b'0', 101));
         assert_eq!(raw.len() + 1, 112);
