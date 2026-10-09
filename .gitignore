@@ -1,3 +1,5 @@
+# Copyright The eha-sdk Contributors
+
 /target/
 /.venv/
 .DS_Store
@@ -8,3 +10,8 @@
 
 __pycache__/
 *.py[cod]
+
+/crates/tool/target/
+/crates/tool/.venv/
+/crates/tool/**/node_modules/
+/crates/tool/webui/**/.playwright-cli/

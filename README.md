@@ -109,6 +109,5 @@ cargo run -p eha-sdk --example reconnect_readonly -- usb <完整 USB 序列号>
 运动目标。USB 的实际调用形式为 `cargo run -p eha-sdk --example board_check -- usb SERIAL OUTDIR`；
 `decode` 模式只解码已有原始回复，示例不自动复位或重发。
 
-从仓库根运行 `python3 scripts/check.py` 执行格式、测试、Clippy、API 文档和 ARM `no_std`
-检查，不访问设备。局部改动按[贡献指南](CONTRIBUTING.md)选择相称的检查；构建与软件检查
-不能代替实板收发、读回或设备执行证据。
+构建与软件检查统一按[贡献指南](CONTRIBUTING.md#构建与检查)执行，并按改动影响选择范围。
+软件检查不访问设备，不能代替实板收发、读回或设备执行证据。
