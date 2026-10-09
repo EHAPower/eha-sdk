@@ -44,6 +44,8 @@ test("overflow and missing time intervals produce explicit breaks without invent
   const view = seriesWindow(points, 30, 100);
   assert.equal(view.gaps, 2);
   assert.deepEqual(view.series[0].data.map((item) => item[1]), [1, null, 2, null, 3]);
+  assert.deepEqual(view.focus.map((entry) => entry.dataIndex), [0, 2, 4]);
+  assert.deepEqual(view.focus.map((entry) => entry.point.cursor), [1, 2, 3]);
 });
 
 test("a new source and server reset discard old curves even if timestamps overlap", () => {

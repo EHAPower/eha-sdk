@@ -114,6 +114,7 @@ function dismissNotice() {
   window.clearTimeout(noticeTimer);
   const hadFocus = notice.contains(document.activeElement);
   notice.hidden = true;
+  document.documentElement.style.setProperty("--notice-space", "0px");
   if (hadFocus) (noticeReturnFocus?.isConnected && !noticeReturnFocus.disabled && noticeReturnFocus.getClientRects().length ? noticeReturnFocus : $("#main-content")).focus({ preventScroll:true });
 }
 function pauseNotice() {
@@ -147,6 +148,27 @@ notice.addEventListener("mouseleave", resumeNotice);
 notice.addEventListener("focusin", pauseNotice);
 notice.addEventListener("focusout", () => window.setTimeout(resumeNotice, 0));
 notice.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); dismissNotice(); } });
+// Leave scroll room for the notification and keep keyboard focus above it.
+function revealNoticeFocus() {
+  const focused = document.activeElement;
+  if (notice.hidden || !focused?.matches("input, select, textarea, button, a[href], [tabindex='0']") || notice.contains(focused)) return;
+  const bounds = focused.getBoundingClientRect();
+  const overlay = notice.getBoundingClientRect();
+  if (bounds.bottom > overlay.top - 12 && bounds.top < overlay.bottom && bounds.right > overlay.left && bounds.left < overlay.right) {
+    focused.scrollIntoView({ block:"center", behavior:"instant" });
+  }
+}
+new ResizeObserver(() => {
+  document.documentElement.style.setProperty("--notice-space", notice.hidden ? "0px" : `${notice.offsetHeight + 40}px`);
+  revealNoticeFocus();
+}).observe(notice);
+document.addEventListener("focusin", revealNoticeFocus);
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !event.defaultPrevented && !notice.hidden && !$("#sidebar").classList.contains("open")) {
+    event.preventDefault();
+    dismissNotice();
+  }
+});
 function setBusy(next) {
   busy = next;
   document.body.setAttribute("aria-busy", String(next));
@@ -214,7 +236,8 @@ function updateJourney() {
   const otherReady = sessionReady(sessions[otherTransport]);
   const otherHint = otherReady ? `${transportLabel(otherTransport)} 已连接，可在页首切换后观察、操作或停止控制。` : null;
   const guidance = selectedContactGuidance(activeTransport, snapshot?.identity, snapshot?.telemetry, snapshot?.heartbeat);
-  if (busy) [title.textContent, detail.textContent, link.hidden] = ["正在等待前一请求", "当前会话按顺序处理操作；完成前不会发送另一条设备指令。", true];
+  if (unavailableSince) [title.textContent, detail.textContent, link.hidden] = ["本机 WebUI 服务不可达", "请恢复服务或端口映射；页面会自动重新读取状态，不会重发设备请求。", true];
+  else if (busy) [title.textContent, detail.textContent, link.hidden] = ["正在等待前一请求", "当前会话按顺序处理操作；完成前不会发送另一条设备指令。", true];
   else if (current === "loading") [title.textContent, detail.textContent, link.hidden] = ["正在取得会话", "本地服务返回当前状态前，设备操作不会开放。", true];
   else if (current === "disconnected") [title.textContent, detail.textContent, link.href, link.textContent, link.hidden] = ["连接设备", otherHint || (snapshot?.connection ? "可重新连接已保存通路，或重新选择通路后连接并核对身份。" : "先选择通路并核对设备身份，再观察或提交目标。"), "#overview", "连接设备", false];
   else if (current === "recoverable") [title.textContent, detail.textContent, link.href, link.textContent, link.hidden] = ["连接已断开", otherHint || "可用保存的通路重新连接；旧遥测只作历史参考。", "#overview", "重新连接", false];
@@ -250,7 +273,8 @@ function updateActionAvailability() {
   setDisabled("#query-result, #release-result", locked || !active || !hasOperationKey || trialLocked);
   $("#config-record").disabled = busy || trialLocked;
   setDisabled("#config-import, #config-export", busy || trialLocked);
-  setDisabled("#config-fields input, #config-fields select, #save-config, #restore-factory, #reset-application, #enter-update, [data-action=\"config_read\"]", busy || trialLocked || !active);
+  setDisabled("#config-fields input, #config-fields select", busy || trialLocked);
+  setDisabled("#save-config, #restore-factory, #reset-application, #enter-update, [data-action=\"config_read\"]", busy || trialLocked || !active);
   setDisabled("#can-scan-start, #can-scan-end, #can-scan-nodes, #can-connect-nodes, #can-scan-results input", busy || trialLocked);
   const stopLabel = `停止 ${transportLabel(activeTransport)} 控制`;
   $$('[data-stop-label]').forEach((target) => { target.textContent = stopLabel; });
@@ -486,10 +510,10 @@ function renderH723Driver(telemetry, disconnected) {
     ? summary?.age_ms === undefined ? undefined : formatAge(summary.age_ms)
     : ageUsText(telemetry.driver_age_us);
   const state = summary?.state || (raw?.has_status ? raw.stale ? "stale" : raw.faulted ? "faulted" : raw.qualified ? "available" : "unqualified" : "unavailable");
-  const hostCacheExpired = Boolean(disconnected) || (telemetry?.received_age_ms ?? 0) > 1000;
+  const hostCacheExpired = Boolean(telemetry) && (Boolean(disconnected) || (telemetry.received_age_ms ?? 0) > 1000);
   const observedLabel = summary?.label || ({available:"ODrive 状态合格", stale:"ODrive 状态已过期", faulted:"ODrive 报告故障", unqualified:"ODrive 状态未获合格", unavailable:"未取得 ODrive 状态"})[state] || "未知";
   const label = hostCacheExpired ? "主机缓存已过期" : observedLabel;
-  const visual = hostCacheExpired ? (disconnected ? "error" : "warning") : state === "available" ? "success" : state === "faulted" ? "error" : "warning";
+  const visual = !telemetry ? "idle" : hostCacheExpired ? (disconnected ? "error" : "warning") : state === "available" ? "success" : state === "faulted" ? "error" : "warning";
   setPill($("#driver-age"), age === undefined ? label : `${label} · ${age}`, visual);
   setStatusFact("odrive-state", label, visual);
   if (!telemetry) return facts($("#h723-odrive"), [], "尚未取得 H723 状态。");
@@ -556,7 +580,7 @@ function update(nextSnapshot, cached = false, renderOdrive = true) {
   setStatusFact("connection-state", `${transportLabel(activeTransport)} · ${disconnected ? "本地连接已断开" : snapshot.connected ? "已连接" : "未连接"}`, disconnected ? "error" : snapshot.connected ? "success" : "idle");
   const telemetry = snapshot.telemetry;
   const age = telemetry?.received_age_ms;
-  setStatusFact("telemetry-age", connectionInactive ? age === undefined ? "已断连" : `旧数据 ${formatAge(age)}` : age === undefined ? snapshot.connected ? "无遥测" : "未连接" : formatAge(age), connectionInactive ? "idle" : age === undefined ? "idle" : age > 1000 ? "warning" : "success");
+  setStatusFact("telemetry-age", connectionInactive ? age === undefined ? disconnected ? "已断连" : "未连接" : `旧数据 ${formatAge(age)}` : age === undefined ? "无遥测" : formatAge(age), connectionInactive ? "idle" : age === undefined ? "idle" : age > 1000 ? "warning" : "success");
   const values = telemetry?.main_values || [];
   const position = observed(values[0]); const velocity = observed(values[1]); const force = observed(values[4]);
   const submittedRpm = observed(telemetry?.last_submitted_rpm, 2);
@@ -665,10 +689,15 @@ function updateCanNodeOptions() {
   const connectedNode = sessions.can?.connection?.node ?? snapshot?.connection?.node;
   if (Number.isInteger(connectedNode) && !nodes.has(connectedNode)) nodes.set(connectedNode, { node:connectedNode, snapshot:sessions.can || snapshot });
   if (activeCanNode === null && nodes.size) activeCanNode = [...nodes.keys()][0];
-  const previous = activeCanNode; select.replaceChildren();
-  if (!nodes.size) select.add(new Option("等待已连接节点", ""));
-  for (const [node, entry] of nodes) select.add(new Option(`节点 ${node}${entry.snapshot?.connected ? "" : "（未就绪）"}`, String(node)));
-  select.value = previous === null ? "" : String(previous);
+  const options = [...nodes].map(([node, entry]) => [String(node), `节点 ${node}${entry.snapshot?.connected ? "" : "（未就绪）"}`]);
+  if (!options.length) options.push(["", "等待已连接节点"]);
+  const signature = JSON.stringify(options);
+  if (select.dataset.options !== signature) {
+    select.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+    select.dataset.options = signature;
+  }
+  const selected = activeCanNode === null ? "" : String(activeCanNode);
+  if (select.value !== selected) select.value = selected;
 }
 function selectTransport(transport, { force = false, announce = true, node = activeCanNode } = {}) {
   if ((busy && !force) || (transport === activeTransport && !force)) return false;
