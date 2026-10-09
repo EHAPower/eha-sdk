@@ -54,7 +54,7 @@ export function createTrialUi({ run, activeTransport }) {
       const node = canNodes.find((entry) => entry.node === Number(input.value));
       input.disabled = state.live || !node?.snapshot?.connected || Boolean(node.snapshot.transport?.disconnected);
     });
-    $("#trial-start").disabled = !scopeConnected || state.live || !$("#trial-arm").checked;
+    $("#trial-start").disabled = !scopeConnected || state.live;
     $("#trial-stop").disabled = !state.stopAvailable;
     $("#group-heartbeat-start").disabled = state.live || !groupReady;
     $("#group-heartbeat-stop").disabled = state.live || !groupReady;
@@ -95,7 +95,6 @@ export function createTrialUi({ run, activeTransport }) {
       catch (error) { showLocalMessage(error.message, "is-error"); } return;
     }
     clearLocalMessage();
-    if (!$("#trial-arm").checked) return showLocalMessage("请先确认机械空间、外部断能和本次范围。", "is-warning");
     try {
       activeScope = scope();
       const payload = { action, trial:trial() };
@@ -111,7 +110,6 @@ export function createTrialUi({ run, activeTransport }) {
     if (nodes.length < 2) return showLocalMessage("群组心跳至少选择两台已连接 CAN EHA。", "is-warning");
     await run("/api/group", { nodes, action }, label);
   });
-  $("#trial-arm").addEventListener("change", () => updateButtons());
   $$("input[name=trial-scope]").forEach((input) => input.addEventListener("change", () => updateButtons()));
   $("#page-trial").addEventListener("input", clearLocalMessage, true);
   $$('input[name="trial-mode"]').forEach((input) => input.addEventListener("change", () => { const mode = $("input[name=trial-mode]:checked").value; document.querySelectorAll(".trial-command").forEach((form) => { form.hidden = form.dataset.trialCommand !== mode; }); }));
