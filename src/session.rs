@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 与传输无关的客户会话关联。
 //!

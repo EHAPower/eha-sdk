@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use crate::protocol::VERSION;
 use crate::validation::{

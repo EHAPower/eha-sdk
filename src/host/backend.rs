@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! 桌面运行装配的有界消息交接。平台后端负责独占 I/O 与传输绑定。
 use std::{
     collections::VecDeque,

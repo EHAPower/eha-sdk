@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use super::{Lane, MAX_RAW_BLOCK_LEN};
 

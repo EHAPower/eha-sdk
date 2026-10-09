@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 #![no_std]
 #![doc = include_str!("../README.md")]

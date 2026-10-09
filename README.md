@@ -1,18 +1,18 @@
-<!-- Copyright The eha_controller Contributors -->
+<!-- Copyright The eha-sdk Contributors -->
 
-# SDK 与客户接入
+# EHA SDK 与官方工具
 
-本仓交付客户直接 CAN 接入资料和 Rust `eha-sdk`。完整应用消息的字段、字节顺序、版本、
+本仓交付客户直接 CAN 接入资料、Rust `eha-sdk` 和官方工具 `eha-tool`。完整应用消息的字段、字节顺序、版本、
 长度与 CRC32C 由[公共应用通信协议](docs/通信协议/公共应用通信协议.md)唯一维护；CAN
 帧和 USB 字节流绑定分别由[CAN 通信绑定](docs/通信协议/CAN通信绑定.md)与
-[USB 通信绑定](docs/通信协议/USB通信绑定.md)维护。`eha-tool` 是 SDK 的官方调用方，
+[USB 通信绑定](docs/通信协议/USB通信绑定.md)维护。工作区中的 `eha-tool` 是 SDK 的官方调用方，
 客户程序不依赖它。
 
 | 使用方式 | 入口 |
 |---|---|
 | 直接 CAN 接入 | [CAN 接入指南](CAN接入指南.md)，自行实现公共消息、CAN 分片和结果处理。 |
 | Rust 程序 | 本文、crate rustdoc 和示例；CAN、USB 使用相同的 `host::Client` 业务 API。 |
-| 官方工具 | [`eha-tool`](https://github.com/EHAPower/eha-tool)，控制与停止见其[使用说明](https://github.com/EHAPower/eha-tool#控制与停止)。 |
+| 官方工具 | [`eha-tool`](crates/tool/README.md)，控制与停止见其[使用说明](crates/tool/README.md#控制与停止)。 |
 
 ## 公共交互与结果
 
@@ -31,8 +31,8 @@
 
 ## 依赖与连接能力
 
-`eha-sdk` 是独立 Cargo 工作区，包含根包、`protocol`、`transport` 和 `eha-config`。二次
-开发使用同一修订的完整仓库及 `Cargo.lock`，不拼接不同修订的路径依赖；版本来自
+`eha-sdk` 是独立 Cargo 工作区，包含根包、`protocol`、`transport`、`eha-config` 和官方
+`eha-tool`。二次开发使用同一修订的完整仓库及 `Cargo.lock`，不拼接不同修订的路径依赖；版本来自
 `workspace.package.version`。独立克隆、依赖和检查见[贡献指南](CONTRIBUTING.md)。
 
 | 通路 | 当前 SDK 能力与限制 |

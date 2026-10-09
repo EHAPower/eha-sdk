@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! USB Bulk 的 COBS 定界、分片和传输阶段处理。
 //!

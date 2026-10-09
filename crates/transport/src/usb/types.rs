@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use super::{LONG_GUARD_MS, SHORT_GUARD_MS};
 

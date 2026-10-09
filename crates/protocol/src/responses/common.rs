@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 /// 观测数值结果状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

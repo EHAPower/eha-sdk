@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 完整配置候选的离线校验，不访问设备或装配运行参数。
 

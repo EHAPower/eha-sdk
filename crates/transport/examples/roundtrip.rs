@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 仅在宿主内存中运行：同一公共字节经 Classic、FD、USB 恢复。
 //! 本例的“本地提交”由软件管道推进，不提供真实驱动或设备证据。

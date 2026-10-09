@@ -1,4 +1,4 @@
-<!-- Copyright The eha_controller Contributors -->
+<!-- Copyright The eha-sdk Contributors -->
 
 # USB 通信绑定
 

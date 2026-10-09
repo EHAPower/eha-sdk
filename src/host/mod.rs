@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! 桌面客户 API。`Client` 串行提交业务，独立 I/O 线程维持收发和显式心跳。
 //! 所有数据副本拥有自己的字节；本地提交绝不表示目标采用或设备执行。
 pub mod backend;

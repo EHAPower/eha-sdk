@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use super::common::ValueFields;
 use crate::{Error, MAX_PAYLOAD_LEN, SampleData};

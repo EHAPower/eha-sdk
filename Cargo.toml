@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/config", "crates/protocol", "crates/transport"]
+members = ["crates/config", "crates/protocol", "crates/tool", "crates/transport"]
 
 [package]
 name = "eha-sdk"

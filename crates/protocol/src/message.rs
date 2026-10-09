@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use crate::codec::payload_len;
 use crate::validation::payload_len_is_valid;

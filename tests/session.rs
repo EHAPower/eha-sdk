@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 #![allow(clippy::panic)]
 
 use eha_sdk::{

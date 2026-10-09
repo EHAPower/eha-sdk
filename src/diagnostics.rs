@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! 将线上诊断值转换为面向使用者的简短说明。
 //!
 //! 这里不裁决设备是否健康，也不把历史诊断当作当前故障。调用方必须同时保留原始

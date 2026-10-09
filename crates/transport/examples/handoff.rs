@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! CAN 与 USB 接收器向应用共同最新缓存交接的纯内存示例。
 //!

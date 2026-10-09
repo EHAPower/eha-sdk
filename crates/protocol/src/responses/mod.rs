@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 固件回复的具名字段与最终发送缓冲编码。
 //!

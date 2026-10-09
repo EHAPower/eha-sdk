@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 外部 CAN 的帧表示、分片、组装和本地提交边界。
 //!

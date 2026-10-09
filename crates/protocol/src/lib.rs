@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 完整公共应用消息的 `no_std` 编码、解码和格式校验。
 //!

@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! 通过公开 SDK 留存实板查询、心跳、停止和保存读回证据。
 //! 用法：board_check usb SERIAL OUTDIR [save-current|reconnect]
 //!       board_check can PORT NODE PROFILE OUTDIR [save-current|reconnect]

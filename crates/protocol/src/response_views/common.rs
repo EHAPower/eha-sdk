@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use crate::validation::{u32_at, u64_at};
 use crate::{Error, responses};

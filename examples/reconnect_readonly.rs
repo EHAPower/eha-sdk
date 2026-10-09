@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! 只读地演示同一 USB Connector 上的显式连接恢复。
 //! 用法：reconnect_readonly usb SERIAL
 use eha_sdk::{

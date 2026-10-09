@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use protocol::{
     Direction, Error, MAX_MESSAGE_LEN, Message, MessageKind, Prefix, Response, ValidatedMessage,

@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 /// 完整公共消息的最大字节数。
 pub const MAX_MESSAGE_LEN: usize = 16_440;

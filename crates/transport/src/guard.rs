@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 // Shared solely because both bindings use the same bounded transfer-number guard.
 #[derive(Debug)]

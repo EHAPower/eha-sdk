@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! EHA 客户端：公共会话核心与可选择的 CAN / USB 桌面接入。
 //! 控制提交只报告本地 I/O；关闭和异常不发送停止、复位或重放目标。
 #![cfg_attr(not(feature = "desktop"), no_std)]

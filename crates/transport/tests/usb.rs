@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 #[path = "usb/capacity.rs"]
 mod capacity;

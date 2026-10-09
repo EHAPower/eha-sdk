@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! 通过已安装的 ODrive 0.5.1 Python/Fibre 栈读取指定 USB 驱动器。
 //!
 //! 本模块只启动一次性只读子进程。它不会选择第一块设备、清错、喂狗、写入或后台轮询；

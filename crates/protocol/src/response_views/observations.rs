@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use super::common::{Sample, decoded_value_fields, sample_data};
 use crate::responses;

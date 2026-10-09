@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! Host API 的端到端边界：夹具只收取 SDK 实际编码的公共消息，并回送协议编码回复。
 #![cfg(feature = "desktop")]

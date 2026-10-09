@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 //! CANable2 SLCAN 桌面接入。
 //!
 //! 此模块只支持经串口枚举、运行原厂 CANable2 SLCAN 固件的适配器。它在 macOS、

@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 //! 宿主上的实际类型大小与最大记录处理成本；不访问设备，不代表 H723 时序。
 

@@ -1,4 +1,4 @@
-<!-- Copyright The eha_controller Contributors -->
+<!-- Copyright The eha-sdk Contributors -->
 
 # 客户 CAN 接入指南
 

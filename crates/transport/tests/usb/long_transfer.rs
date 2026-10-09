@@ -1,4 +1,4 @@
-// Copyright The eha_controller Contributors
+// Copyright The eha-sdk Contributors
 
 use protocol::{Direction, MAX_MESSAGE_LEN, crc32c};
 use transport::usb::*;

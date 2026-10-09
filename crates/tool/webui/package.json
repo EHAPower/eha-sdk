@@ -1,0 +1,12 @@
+{
+  "copyright": "Copyright The eha-sdk Contributors",
+  "name": "eha-tool-webui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "vendor": "node scripts/vendor-echarts.mjs"
+  },
+  "dependencies": {
+    "echarts": "6.1.0"
+  }
+}
