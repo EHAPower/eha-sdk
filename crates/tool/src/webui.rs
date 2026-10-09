@@ -1,11 +1,16 @@
 // Copyright The eha-sdk Contributors
 //! `eha-tool webui` 的仅本机 SDK 会话与静态资源服务。
 
+use self::{
+    http_body::{BodyReader, ReadyRequest},
+    workbench::{Transport as WebTransport, TrialAction, Workbench},
+};
 use crate::session::{Command, ConnectionRequest, ToolSession};
-use serde::{Deserialize, Serialize};
+use eha_sdk::can::CanNodeConnector;
 use serde_json::{Value, json};
 use std::{
-    io::{self, Read},
+    fs,
+    io::Read,
     path::PathBuf,
     sync::{
         Arc,
@@ -15,6 +20,36 @@ use std::{
     time::Duration,
 };
 use tiny_http::{Header, Method as HttpMethod, Response, Server, StatusCode};
+
+mod http_body;
+mod workbench;
+
+#[cfg(test)]
+struct Sessions(Workbench);
+
+#[cfg(test)]
+impl Sessions {
+    fn new() -> Self {
+        Self(Workbench::new(
+            std::env::temp_dir().join("eha-tool-webui-tests"),
+        ))
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Sessions {
+    type Target = Workbench;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for Sessions {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'";
 const MAX_JSON_BODY: u64 = 1024 * 1024;
@@ -30,73 +65,6 @@ enum Method {
 ///
 /// 这只决定本次请求投影或调用哪条已持有的通路；浏览器选择不会修改服务端的全局
 /// “当前设备”。USB 与 CAN 会话可同时连接，并各自保存身份、心跳、维护键和趋势。
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum WebTransport {
-    Usb,
-    Can,
-}
-
-impl WebTransport {
-    fn from_connection(connection: &ConnectionRequest) -> Self {
-        match connection {
-            ConnectionRequest::Usb { .. } => Self::Usb,
-            ConnectionRequest::Can { .. } => Self::Can,
-        }
-    }
-}
-
-/// WebUI 固定持有两条互不替换的本地 SDK 会话。
-struct Sessions {
-    usb: ToolSession,
-    can: ToolSession,
-}
-
-impl Sessions {
-    fn new() -> Self {
-        Self {
-            usb: ToolSession::new().with_telemetry_trend(4_096),
-            can: ToolSession::new().with_telemetry_trend(4_096),
-        }
-    }
-
-    fn selected(&mut self, transport: WebTransport) -> &mut ToolSession {
-        match transport {
-            WebTransport::Usb => &mut self.usb,
-            WebTransport::Can => &mut self.can,
-        }
-    }
-
-    /// 一次轮询同时驱动两条会话的被动接收，并只把趋势投影给浏览器选中的通路。
-    fn snapshot_json(
-        &mut self,
-        selected: WebTransport,
-        trend_after: Option<Option<u64>>,
-        odrive: Option<&Value>,
-    ) -> Result<Value, String> {
-        // `snapshot` 负责 drain SDK 遥测队列。两条会话都恰好调用一次，避免选中通路
-        // 的重复 drain，也避免未选中通路因页面停留在另一页而积压。
-        let usb = serde_json::to_value(self.usb.snapshot()).map_err(|error| error.to_string())?;
-        let can = serde_json::to_value(self.can.snapshot()).map_err(|error| error.to_string())?;
-        let mut snapshot = match selected {
-            WebTransport::Usb => usb.clone(),
-            WebTransport::Can => can.clone(),
-        };
-        if let Some(after) = trend_after {
-            let trend = match selected {
-                WebTransport::Usb => self.usb.telemetry_trend_json(after),
-                WebTransport::Can => self.can.telemetry_trend_json(after),
-            };
-            snapshot["trend"] = trend;
-        }
-        snapshot["odrive_usb"] = odrive.cloned().unwrap_or(Value::Null);
-        Ok(json!({
-            "snapshot": snapshot,
-            "sessions": {"usb": usb, "can": can},
-            "transport": selected,
-        }))
-    }
-}
 struct StaticResponse {
     status: u16,
     content_type: &'static str,
@@ -133,6 +101,26 @@ const ASSETS: &[Asset] = &[
         route: "/telemetry.js",
         content_type: "application/javascript; charset=utf-8",
         bytes: include_bytes!("../webui/static/telemetry.js"),
+    },
+    Asset {
+        route: "/config-editor.js",
+        content_type: "application/javascript; charset=utf-8",
+        bytes: include_bytes!("../webui/static/config-editor.js"),
+    },
+    Asset {
+        route: "/trial-ui.js",
+        content_type: "application/javascript; charset=utf-8",
+        bytes: include_bytes!("../webui/static/trial-ui.js"),
+    },
+    Asset {
+        route: "/trial-state.js",
+        content_type: "application/javascript; charset=utf-8",
+        bytes: include_bytes!("../webui/static/trial-state.js"),
+    },
+    Asset {
+        route: "/recording-ui.js",
+        content_type: "application/javascript; charset=utf-8",
+        bytes: include_bytes!("../webui/static/recording-ui.js"),
     },
     Asset {
         route: "/favicon.svg",
@@ -364,31 +352,199 @@ enum OdriveStartError {
     Unavailable(Box<tiny_http::Request>),
 }
 
-pub(crate) fn serve(port: u16, odrive_python: Option<PathBuf>) -> Result<(), String> {
+struct CanScanView {
+    jobs: SyncSender<CanScanJob>,
+    busy: bool,
+    completed: Receiver<()>,
+}
+struct CanScanJob {
+    request: tiny_http::Request,
+    port: String,
+    profile: String,
+    connectors: Vec<(u8, CanNodeConnector)>,
+}
+impl CanScanView {
+    fn new() -> Self {
+        let (jobs, receiver) = mpsc::sync_channel::<CanScanJob>(1);
+        let (done, completed) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(job) = receiver.recv() {
+                let mut nodes = Vec::new();
+                let mut errors = Vec::new();
+                for (node, connector) in job.connectors {
+                    let request = ConnectionRequest::Can {
+                        port: job.port.clone(),
+                        node,
+                        profile: job.profile.clone(),
+                    };
+                    let mut session = ToolSession::new().with_timeout(Duration::from_millis(250));
+                    match session.connect_shared_can(request, connector) {
+                    Ok(snapshot) => nodes.push(json!({"node":node,"identity":snapshot.identity})),
+                    Err(error) => errors.push(json!({"node":node,"message":error.message,"unknown":error.unknown,"error":error})),
+                }
+                }
+                let _ = respond_json(job.request, 200, scan_response(nodes, errors));
+                let _ = done.send(());
+            }
+        });
+        Self {
+            jobs,
+            busy: false,
+            completed,
+        }
+    }
+    fn reap(&mut self) {
+        while self.completed.try_recv().is_ok() {
+            self.busy = false;
+        }
+    }
+    #[allow(clippy::result_large_err)] // Caller must retain the request to report a busy scan.
+    fn start(&mut self, job: CanScanJob) -> Result<(), CanScanJob> {
+        self.reap();
+        if self.busy {
+            return Err(job);
+        }
+        match self.jobs.try_send(job) {
+            Ok(()) => {
+                self.busy = true;
+                Ok(())
+            }
+            Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => Err(job),
+        }
+    }
+}
+fn scan_response(nodes: Vec<Value>, errors: Vec<Value>) -> Value {
+    // A scan is complete even when individual nodes do not reply.  `ok:false` would make the
+    // browser discard successful discoveries before it can present the per-node errors.
+    json!({"ok":true,"nodes":nodes,"errors":errors})
+}
+
+pub(crate) fn serve(
+    port: u16,
+    odrive_python: Option<PathBuf>,
+    runs_dir: Option<PathBuf>,
+) -> Result<(), String> {
     let server = Server::http(("127.0.0.1", port)).map_err(|error| error.to_string())?;
     println!("WebUI 本地入口：http://127.0.0.1:{port}/");
-    let mut sessions = Sessions::new();
+    let mut workbench = Workbench::new(runs_dir.unwrap_or_else(Workbench::default_runs_dir));
     let mut odrive = OdriveView::new(odrive_python);
-    for request in server.incoming_requests() {
-        if let Err(error) = handle_request(request, port, &mut sessions, &mut odrive) {
+    let mut scan = CanScanView::new();
+    let body_reader = BodyReader::new();
+    loop {
+        workbench.tick();
+        odrive.reap();
+        scan.reap();
+        while let Ok(ReadyRequest { request, body }) = body_reader.try_recv() {
+            if let Err(error) = handle_request_with_scan_body(
+                request,
+                port,
+                &mut workbench,
+                &mut odrive,
+                &mut scan,
+                Some(body),
+            ) {
+                eprintln!("warning: WebUI response failed: {error}");
+            }
+        }
+        let Some(request) = server
+            .recv_timeout(Duration::from_millis(10))
+            .map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        if let Err(error) = handle_received_request(
+            request,
+            port,
+            &mut workbench,
+            &mut odrive,
+            &mut scan,
+            &body_reader,
+        ) {
             eprintln!("warning: WebUI response failed: {error}");
         }
     }
-    Ok(())
 }
-fn handle_request(
+
+fn handle_received_request(
     mut request: tiny_http::Request,
     port: u16,
-    sessions: &mut Sessions,
+    workbench: &mut Workbench,
     odrive: &mut OdriveView,
+    scan: &mut CanScanView,
+    body_reader: &BodyReader,
+) -> Result<(), String> {
+    let is_json_write =
+        request_path(&request).starts_with("/api/") && request_method(&request) == Method::Post;
+    if !is_json_write {
+        return handle_request_with_scan_body(request, port, workbench, odrive, scan, None);
+    }
+    if let Err(message) = validate_write_request(&request, port) {
+        return respond_json(request, 403, json!({"ok":false,"message":message}));
+    }
+    if json_body_is_prebuffered(&request) {
+        // tiny-http 0.12's `request::new_request` has already copied this exact shape into a
+        // Cursor.  Keeping it on this fast path means a stalled large upload cannot queue an
+        // explicit Stop behind the single bounded body reader.
+        let body = parse_json_body(&mut request);
+        return handle_request_with_scan_body(request, port, workbench, odrive, scan, Some(body));
+    }
+    match body_reader.submit(request) {
+        Ok(()) => Ok(()),
+        Err(request) => respond_json(
+            request,
+            503,
+            json!({"ok":false,"message":"WebUI 请求队列已满；请稍后重试。"}),
+        ),
+    }
+}
+
+/// True only for the body form tiny-http 0.12 has synchronously copied while creating the
+/// request.  Do not relax these checks: transfer encoding and upgrade bypass its small-body
+/// buffer, while `Expect` changes the receive handshake.
+fn json_body_is_prebuffered(request: &tiny_http::Request) -> bool {
+    header(request, "Content-Length")
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length <= 1024)
+        && header(request, "Transfer-Encoding").is_none()
+        && header(request, "Expect").is_none()
+        && !header(request, "Connection")
+            .is_some_and(|value| value.to_ascii_lowercase().contains("upgrade"))
+}
+
+#[cfg(test)]
+fn handle_request_with_scan(
+    request: tiny_http::Request,
+    port: u16,
+    workbench: &mut Workbench,
+    odrive: &mut OdriveView,
+    scan: &mut CanScanView,
+) -> Result<(), String> {
+    handle_request_with_scan_body(request, port, workbench, odrive, scan, None)
+}
+
+fn handle_request_with_scan_body(
+    mut request: tiny_http::Request,
+    port: u16,
+    workbench: &mut Workbench,
+    odrive: &mut OdriveView,
+    scan: &mut CanScanView,
+    parsed_body: Option<Result<Value, String>>,
 ) -> Result<(), String> {
     odrive.reap();
+    scan.reap();
     let method = request_method(&request);
     let path = request_path(&request).to_owned();
     if path == "/api/snapshot" && method == Method::Get {
-        let after = snapshot_after(request.url());
-        let transport = match query_transport(request.url()) {
+        let url = request.url().to_owned();
+        let after = snapshot_after(&url);
+        let transport = match query_transport(&url) {
             Ok(transport) => transport,
+            Err(message) => {
+                return respond_json(request, 400, json!({"ok":false,"message":message}));
+            }
+        };
+        let node = match query_node(&url) {
+            Ok(node) => node,
             Err(message) => {
                 return respond_json(request, 400, json!({"ok":false,"message":message}));
             }
@@ -396,12 +552,54 @@ fn handle_request(
         return session_response(
             request,
             200,
-            sessions,
+            workbench,
             transport,
+            node,
             Some(after),
             odrive.last_read.as_ref(),
             json!({"ok":true}),
         );
+    }
+    if path == "/api/config/schema" && method == Method::Get {
+        return serde_json::from_str(eha_sdk::config::SCHEMA_JSON)
+            .map_err(|error| error.to_string())
+            .and_then(|schema| respond_json(request, 200, schema));
+    }
+    if path == "/api/recordings" && method == Method::Get {
+        if workbench.has_active_trial() {
+            return respond_json(
+                request,
+                409,
+                json!({"ok":false,"message":"试验进行中；记录目录查询已延后，避免阻塞后台 tick。"}),
+            );
+        }
+        return match workbench.list_runs() {
+            Ok(value) => respond_json(request, 200, value),
+            Err(message) => respond_json(request, 503, json!({"ok":false,"message":message})),
+        };
+    }
+    if let Some((id, file)) = recording_route(&path) {
+        if method != Method::Get {
+            return respond_json(
+                request,
+                405,
+                json!({"ok":false,"message":"记录下载只接受 GET"}),
+            );
+        }
+        if workbench.has_active_trial() {
+            return respond_json(
+                request,
+                409,
+                json!({"ok":false,"message":"试验进行中；记录下载已延后，避免阻塞后台 tick。"}),
+            );
+        }
+        return match workbench
+            .recording_file(id, file)
+            .and_then(|path| fs::read(path).map_err(|error| error.to_string()))
+        {
+            Ok(bytes) => respond_bytes(request, 200, recording_content_type(file), bytes),
+            Err(message) => respond_json(request, 404, json!({"ok":false,"message":message})),
+        };
     }
     if path == "/api/odrive/devices" && method == Method::Get {
         return start_odrive_operation(request, odrive, OdriveOperation::Discover);
@@ -434,15 +632,36 @@ fn handle_request(
                 json!({"ok":false,"message":"API 只接受 POST"}),
             );
         }
-        if let Err(message) = validate_write_request(&request, port) {
-            return respond_json(request, 403, json!({"ok":false,"message":message}));
-        }
-        let body = match parse_json_body(&mut request) {
+        let body = match parsed_body {
+            Some(body) => body,
+            None => {
+                if let Err(message) = validate_write_request(&request, port) {
+                    return respond_json(request, 403, json!({"ok":false,"message":message}));
+                }
+                parse_json_body(&mut request)
+            }
+        };
+        let body = match body {
             Ok(body) => body,
             Err(message) => {
                 return respond_json(request, 400, json!({"ok":false,"message":message}));
             }
         };
+        if let Err(message) = validate_body_node(&body) {
+            return respond_json(request, 400, json!({"ok":false,"message":message}));
+        }
+        if scan.busy
+            && !matches!(
+                path.as_str(),
+                "/api/action" | "/api/recording" | "/api/trial" | "/api/group"
+            )
+        {
+            return respond_json(
+                request,
+                409,
+                json!({"ok":false,"message":"CAN 扫描进行中；该操作已拒绝。"}),
+            );
+        }
         return match path.as_str() {
             "/api/odrive/read" => {
                 let Some(serial) = body.get("serial").and_then(Value::as_str) else {
@@ -462,21 +681,31 @@ fn handle_request(
             }
             "/api/connect" => match serde_json::from_value::<ConnectionRequest>(body) {
                 Ok(connection) => {
-                    let transport = WebTransport::from_connection(&connection);
-                    match sessions.selected(transport).connect(connection) {
+                    let transport = transport_from_connection(&connection);
+                    if workbench.has_active_trial() {
+                        return respond_json(
+                            request,
+                            409,
+                            json!({"ok":false,"message":"试验进行中；连接操作已拒绝，避免跨通路查询覆盖 Stop。"}),
+                        );
+                    }
+                    let node = connection_node(&connection);
+                    match workbench.connect(connection) {
                         Ok(_) => session_response(
                             request,
                             200,
-                            sessions,
+                            workbench,
                             transport,
+                            node,
                             None,
                             odrive.last_read.as_ref(),
                             json!({"ok":true,"message":"连接并已核对身份。"}),
                         ),
                         Err(error) => session_structured_error(
                             request,
-                            sessions,
+                            workbench,
                             transport,
+                            node,
                             odrive.last_read.as_ref(),
                             error,
                         ),
@@ -495,20 +724,30 @@ fn handle_request(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match sessions.selected(transport).disconnect() {
+                let node = body_node(&body);
+                if workbench.has_active_trial() {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"试验进行中；普通断连已拒绝。"}),
+                    );
+                }
+                match workbench.disconnect(transport, node) {
                     Ok(_) => session_response(
                         request,
                         200,
-                        sessions,
+                        workbench,
                         transport,
+                        node,
                         None,
                         odrive.last_read.as_ref(),
                         json!({"ok":true,"message":"本地连接已关闭；没有发送 Stop。"}),
                     ),
                     Err(error) => session_structured_error(
                         request,
-                        sessions,
+                        workbench,
                         transport,
+                        node,
                         odrive.last_read.as_ref(),
                         error,
                     ),
@@ -521,20 +760,30 @@ fn handle_request(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match sessions.selected(transport).reconnect() {
+                let node = body_node(&body);
+                if workbench.has_active_trial() {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"试验进行中；恢复连接已拒绝。"}),
+                    );
+                }
+                match workbench.reconnect(transport, node) {
                     Ok(_) => session_response(
                         request,
                         200,
-                        sessions,
+                        workbench,
                         transport,
+                        node,
                         None,
                         odrive.last_read.as_ref(),
                         json!({"ok":true,"message":"已重新连接并核对身份。"}),
                     ),
                     Err(error) => session_structured_error(
                         request,
-                        sessions,
+                        workbench,
                         transport,
+                        node,
                         odrive.last_read.as_ref(),
                         error,
                     ),
@@ -547,33 +796,46 @@ fn handle_request(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match serde_json::from_value::<Command>(body) {
+                match serde_json::from_value::<Command>(body.clone()) {
                     Ok(command) => {
+                        let node = body_node(&body);
+                        if (workbench.has_active_trial() || scan.busy)
+                            && !matches!(command, Command::Stop)
+                        {
+                            return respond_json(
+                                request,
+                                409,
+                                json!({"ok":false,"message":"试验进行中；只允许被动快照、记录、显式 Stop 或合并位置目标。"}),
+                            );
+                        }
                         if command_needs_identity_refresh(&command)
-                            && let Err(error) = sessions.selected(transport).refresh_identity()
+                            && let Err(error) = workbench.refresh_identity(transport, node)
                         {
                             return session_structured_error(
                                 request,
-                                sessions,
+                                workbench,
                                 transport,
+                                node,
                                 odrive.last_read.as_ref(),
                                 error,
                             );
                         }
-                        match sessions.selected(transport).execute(command) {
+                        match workbench.execute(transport, node, command) {
                             Ok(result) => session_response(
                                 request,
                                 200,
-                                sessions,
+                                workbench,
                                 transport,
+                                node,
                                 None,
                                 odrive.last_read.as_ref(),
                                 json!({"ok":true,"message":if result.local_submission.is_some() { "请求已本地提交；设备采用与执行请查看状态。" } else { "已取得操作结果；设备状态单独展示。" },"result":result}),
                             ),
                             Err(error) => session_structured_error(
                                 request,
-                                sessions,
+                                workbench,
                                 transport,
+                                node,
                                 odrive.last_read.as_ref(),
                                 error,
                             ),
@@ -582,18 +844,250 @@ fn handle_request(
                     Err(error) => session_response(
                         request,
                         400,
-                        sessions,
+                        workbench,
                         transport,
+                        body_node(&body),
                         None,
                         odrive.last_read.as_ref(),
                         json!({"ok":false,"message":format!("动作参数无效：{error}")}),
                     ),
                 }
             }
+            "/api/can/connect" => {
+                if workbench.has_active_trial() {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"试验进行中；CAN 连接已拒绝。"}),
+                    );
+                }
+                let Some(port) = body.get("port").and_then(Value::as_str) else {
+                    return respond_json(
+                        request,
+                        400,
+                        json!({"ok":false,"message":"必须明确 CAN port"}),
+                    );
+                };
+                let Some(profile) = body.get("profile").and_then(Value::as_str) else {
+                    return respond_json(
+                        request,
+                        400,
+                        json!({"ok":false,"message":"必须明确 CAN profile"}),
+                    );
+                };
+                let nodes = match body_nodes(&body) {
+                    Ok(nodes) => nodes,
+                    Err(message) => {
+                        return respond_json(request, 400, json!({"ok":false,"message":message}));
+                    }
+                };
+                match workbench.connect_can(port.into(), profile.into(), &nodes, false) {
+                    Ok(value) => respond_json(request, 200, value),
+                    Err(message) => {
+                        respond_json(request, 409, json!({"ok":false,"message":message}))
+                    }
+                }
+            }
+            "/api/can/scan" => {
+                if workbench.has_active_trial() || scan.busy {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"试验或另一轮 CAN 扫描正在进行；已拒绝扫描。"}),
+                    );
+                }
+                if let Err(message) = workbench.can_scan_guard() {
+                    return respond_json(request, 409, json!({"ok":false,"message":message}));
+                }
+                let Some(port) = body.get("port").and_then(Value::as_str) else {
+                    return respond_json(
+                        request,
+                        400,
+                        json!({"ok":false,"message":"必须明确 CAN port"}),
+                    );
+                };
+                let Some(profile) = body.get("profile").and_then(Value::as_str) else {
+                    return respond_json(
+                        request,
+                        400,
+                        json!({"ok":false,"message":"必须明确 CAN profile"}),
+                    );
+                };
+                let nodes = match scan_nodes(&body) {
+                    Ok(nodes) => nodes,
+                    Err(message) => {
+                        return respond_json(request, 400, json!({"ok":false,"message":message}));
+                    }
+                };
+                if let Err(message) = workbench.ensure_network(port.into(), profile.into()) {
+                    return respond_json(request, 409, json!({"ok":false,"message":message}));
+                }
+                let mut connectors = Vec::with_capacity(nodes.len());
+                for node in nodes {
+                    match workbench.network_connector(node) {
+                        Ok(connector) => connectors.push((node, connector)),
+                        Err(message) => {
+                            return respond_json(
+                                request,
+                                409,
+                                json!({"ok":false,"message":message}),
+                            );
+                        }
+                    }
+                }
+                let job = CanScanJob {
+                    request,
+                    port: port.into(),
+                    profile: profile.into(),
+                    connectors,
+                };
+                match scan.start(job) {
+                    Ok(()) => Ok(()),
+                    Err(job) => respond_json(
+                        job.request,
+                        409,
+                        json!({"ok":false,"message":"CAN 扫描工作线程不可用。"}),
+                    ),
+                }
+            }
+            "/api/recording" => {
+                let transport = match body_transport(&body) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return respond_json(request, 400, json!({"ok":false,"message":message}));
+                    }
+                };
+                let action = body.get("action").and_then(Value::as_str);
+                let Some(start) = (action == Some("start"))
+                    .then_some(true)
+                    .or_else(|| (action == Some("stop")).then_some(false))
+                else {
+                    return respond_json(
+                        request,
+                        400,
+                        json!({"ok":false,"message":"recording action 必须为 start 或 stop"}),
+                    );
+                };
+                if start && scan.busy {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"CAN 扫描进行中；不能启动记录。"}),
+                    );
+                }
+                match workbench.recording(transport, body_node(&body), start) {
+                    Ok(recording) => session_response(
+                        request,
+                        200,
+                        workbench,
+                        transport,
+                        body_node(&body),
+                        None,
+                        odrive.last_read.as_ref(),
+                        json!({"ok":true,"recording":recording}),
+                    ),
+                    Err(error) => session_structured_error(
+                        request,
+                        workbench,
+                        transport,
+                        body_node(&body),
+                        odrive.last_read.as_ref(),
+                        error,
+                    ),
+                }
+            }
+            "/api/trial" => {
+                let transport = match body_transport(&body) {
+                    Ok(value) => value,
+                    Err(message) => {
+                        return respond_json(request, 400, json!({"ok":false,"message":message}));
+                    }
+                };
+                let action = match trial_action(&body) {
+                    Ok(action) => action,
+                    Err(message) => {
+                        return respond_json(request, 400, json!({"ok":false,"message":message}));
+                    }
+                };
+                if scan.busy && matches!(action, TrialAction::Start(_)) {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"CAN 扫描进行中；不能启动试验。"}),
+                    );
+                }
+                match workbench.trial(transport, body_node(&body), action) {
+                    Ok(trial) => session_response(
+                        request,
+                        200,
+                        workbench,
+                        transport,
+                        body_node(&body),
+                        None,
+                        odrive.last_read.as_ref(),
+                        json!({"ok":true,"trial":trial}),
+                    ),
+                    Err(error) => session_structured_error(
+                        request,
+                        workbench,
+                        transport,
+                        body_node(&body),
+                        odrive.last_read.as_ref(),
+                        error,
+                    ),
+                }
+            }
+            "/api/group" => {
+                let action = body.get("action").and_then(Value::as_str);
+                let nodes = if action == Some("stop") && body.get("nodes").is_none() {
+                    Ok(Vec::new())
+                } else {
+                    body_nodes(&body)
+                };
+                let nodes = match nodes {
+                    Ok(nodes) => nodes,
+                    Err(message) => {
+                        return respond_json(request, 400, json!({"ok":false,"message":message}));
+                    }
+                };
+                let result = match action {
+                    Some("trial_start") if !workbench.has_active_trial() && !scan.busy => {
+                        serde_json::from_value(body.get("trial").cloned().unwrap_or(Value::Null))
+                            .map_err(|error| format!("trial 参数无效：{error}"))
+                            .and_then(|trial| workbench.group_trial_start(&nodes, trial))
+                    }
+                    Some("stop") => workbench.group_stop(&nodes),
+                    Some("heartbeat_start") if !workbench.has_active_trial() && !scan.busy => {
+                        workbench.group_heartbeat(&nodes, true)
+                    }
+                    Some("heartbeat_stop") if !workbench.has_active_trial() => {
+                        workbench.group_heartbeat(&nodes, false)
+                    }
+                    Some(_) => Err("当前试验运行中；该群组操作已拒绝".into()),
+                    None => Err("必须明确 group action".into()),
+                };
+                match result {
+                    Ok(value) => respond_json(request, 200, value),
+                    Err(message) => {
+                        respond_json(request, 409, json!({"ok":false,"message":message}))
+                    }
+                }
+            }
             _ => respond_json(request, 404, json!({"ok":false,"message":"未知 API 路径"})),
         };
     }
     respond_static(request, static_response(method, &path))
+}
+
+#[cfg(test)]
+fn handle_request(
+    request: tiny_http::Request,
+    port: u16,
+    workbench: &mut Workbench,
+    odrive: &mut OdriveView,
+) -> Result<(), String> {
+    let mut scan = CanScanView::new();
+    handle_request_with_scan(request, port, workbench, odrive, &mut scan)
 }
 
 fn start_odrive_operation(
@@ -631,6 +1125,103 @@ fn query_transport(url: &str) -> Result<WebTransport, &'static str> {
     };
     parse_transport_value(value)
 }
+fn query_node(url: &str) -> Result<Option<u8>, &'static str> {
+    query_field(url, "node")
+        .map(|node| {
+            node.parse::<u8>()
+                .ok()
+                .filter(|node| *node <= 127)
+                .ok_or("node 必须为 0..=127 的整数")
+        })
+        .transpose()
+}
+fn body_node(body: &Value) -> Option<u8> {
+    body.get("node")
+        .and_then(Value::as_u64)
+        .and_then(|node| u8::try_from(node).ok())
+}
+fn validate_body_node(body: &Value) -> Result<(), &'static str> {
+    match body.get("node") {
+        None => Ok(()),
+        Some(value) => value
+            .as_u64()
+            .and_then(|node| u8::try_from(node).ok())
+            .filter(|node| *node <= 127)
+            .map(|_| ())
+            .ok_or("node 必须为 0..=127 的整数"),
+    }
+}
+fn body_nodes(body: &Value) -> Result<Vec<u8>, &'static str> {
+    let nodes = body
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or("必须提供 nodes 数组")?;
+    nodes
+        .iter()
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|node| u8::try_from(node).ok())
+                .filter(|node| *node <= 127)
+                .ok_or("node 必须为 0..=127 的整数")
+        })
+        .collect()
+}
+fn scan_nodes(body: &Value) -> Result<Vec<u8>, &'static str> {
+    let start = body
+        .get("start_node")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or("start_node 必须为 0..=127 的整数")?;
+    let end = body
+        .get("end_node")
+        .and_then(Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .ok_or("end_node 必须为 0..=127 的整数")?;
+    if start > 127 || end > 127 || start > end {
+        return Err("扫描范围必须为 0..=127 且 start_node 不大于 end_node");
+    }
+    Ok((start..=end).collect())
+}
+fn transport_from_connection(connection: &ConnectionRequest) -> WebTransport {
+    match connection {
+        ConnectionRequest::Usb { .. } => WebTransport::Usb,
+        ConnectionRequest::Can { .. } => WebTransport::Can,
+    }
+}
+fn connection_node(connection: &ConnectionRequest) -> Option<u8> {
+    match connection {
+        ConnectionRequest::Usb { .. } => None,
+        ConnectionRequest::Can { node, .. } => Some(*node),
+    }
+}
+fn trial_action(body: &Value) -> Result<TrialAction, String> {
+    match body.get("action").and_then(Value::as_str) {
+        Some("start") => serde_json::from_value(body.get("trial").cloned().unwrap_or(Value::Null))
+            .map(TrialAction::Start)
+            .map_err(|error| format!("trial 参数无效：{error}")),
+        Some("stop") => Ok(TrialAction::Stop),
+        Some("target") => body
+            .get("mm")
+            .and_then(Value::as_f64)
+            .filter(|mm| mm.is_finite())
+            .map(|mm| TrialAction::Target(mm as f32))
+            .ok_or_else(|| "target 必须提供有限 mm".into()),
+        _ => Err("trial action 必须为 start、stop 或 target".into()),
+    }
+}
+fn recording_route(path: &str) -> Option<(&str, &str)> {
+    let tail = path.strip_prefix("/api/recordings/")?;
+    let (id, file) = tail.split_once('/')?;
+    (!id.is_empty() && !file.contains('/')).then_some((id, file))
+}
+fn recording_content_type(file: &str) -> &'static str {
+    match file {
+        "metadata.json" | "events.jsonl" => "application/json; charset=utf-8",
+        "telemetry.csv" => "text/csv; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
 fn body_transport(body: &Value) -> Result<WebTransport, &'static str> {
     let Some(value) = body.get("transport").and_then(Value::as_str) else {
         return Err("请求必须明确指定 transport=usb 或 transport=can");
@@ -653,28 +1244,33 @@ fn command_needs_identity_refresh(command: &Command) -> bool {
             | Command::EnterUpdate
     )
 }
+#[allow(clippy::too_many_arguments)] // transport/node/trend/ODrive are one snapshot projection.
 fn session_response(
     request: tiny_http::Request,
     status: u16,
-    sessions: &mut Sessions,
+    workbench: &mut Workbench,
     transport: WebTransport,
+    node: Option<u8>,
     trend_after: Option<Option<u64>>,
     odrive: Option<&Value>,
     mut value: Value,
 ) -> Result<(), String> {
-    let state = sessions.snapshot_json(transport, trend_after, odrive)?;
+    let state = workbench.snapshot_json(transport, node, trend_after, odrive)?;
     let object = value
         .as_object_mut()
         .ok_or("WebUI session response must be a JSON object")?;
     object.insert("snapshot".into(), state["snapshot"].clone());
     object.insert("sessions".into(), state["sessions"].clone());
     object.insert("transport".into(), state["transport"].clone());
+    object.insert("can_nodes".into(), state["can_nodes"].clone());
+    object.insert("group_nodes".into(), state["group_nodes"].clone());
     respond_json(request, status, value)
 }
 fn session_structured_error(
     request: tiny_http::Request,
-    sessions: &mut Sessions,
+    workbench: &mut Workbench,
     transport: WebTransport,
+    node: Option<u8>,
     odrive: Option<&Value>,
     error: crate::session::SessionError,
 ) -> Result<(), String> {
@@ -684,8 +1280,9 @@ fn session_structured_error(
     session_response(
         request,
         409,
-        sessions,
+        workbench,
         transport,
+        node,
         None,
         odrive,
         json!({"ok":false,"message":message,"unknown":unknown,"operation_key":operation_key,"error":error}),
@@ -717,7 +1314,7 @@ fn validate_write_request(request: &tiny_http::Request, port: u16) -> Result<(),
     }
     Ok(())
 }
-fn parse_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
+pub(super) fn parse_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
     let mut body = String::new();
     request
         .as_reader()
@@ -758,11 +1355,13 @@ fn respond_static(request: tiny_http::Request, response: StaticResponse) -> Resu
         response.content_length,
         (response.status == 405).then_some("GET, HEAD"),
     )?;
-    request
-        .respond(http_response)
-        .map_err(|error: io::Error| error.to_string())
+    respond_async(request, http_response)
 }
-fn respond_json(request: tiny_http::Request, status: u16, value: Value) -> Result<(), String> {
+pub(super) fn respond_json(
+    request: tiny_http::Request,
+    status: u16,
+    value: Value,
+) -> Result<(), String> {
     let body = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
     let length = body.len();
     let mut response = Response::from_data(body).with_status_code(StatusCode(status));
@@ -772,9 +1371,30 @@ fn respond_json(request: tiny_http::Request, status: u16, value: Value) -> Resul
         length,
         (status == 405).then_some("GET, POST"),
     )?;
-    request
-        .respond(response)
-        .map_err(|error: io::Error| error.to_string())
+    respond_async(request, response)
+}
+fn respond_bytes(
+    request: tiny_http::Request,
+    status: u16,
+    content_type: &str,
+    body: Vec<u8>,
+) -> Result<(), String> {
+    let length = body.len();
+    let mut response = Response::from_data(body).with_status_code(StatusCode(status));
+    common_headers(&mut response, content_type, length, None)?;
+    respond_async(request, response)
+}
+fn respond_async(
+    request: tiny_http::Request,
+    response: Response<std::io::Cursor<Vec<u8>>>,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("eha-tool-webui-response".into())
+        .spawn(move || {
+            let _ = request.respond(response);
+        })
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -829,11 +1449,33 @@ mod tests {
         })?;
         assert!(head.starts_with("HTTP/1.1 200"));
         assert!(head.ends_with("\r\n\r\n"));
+        for module in [
+            "/config-editor.js",
+            "/trial-ui.js",
+            "/trial-state.js",
+            "/recording-ui.js",
+        ] {
+            let response = send_request(|_| {
+                format!("GET {module} HTTP/1.1\r\nHost: 127.0.0.1:1\r\nConnection: close\r\n\r\n")
+            })?;
+            assert!(response.starts_with("HTTP/1.1 200"), "missing {module}");
+        }
         let bad_post = send_request(|_| {
             "POST /api/action HTTP/1.1\r\nHost: evil.test\r\nOrigin: http://evil.test\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"action\":\"stop\"}".into()
         })?;
         assert!(bad_post.starts_with("HTTP/1.1 403"));
         Ok(())
+    }
+
+    #[test]
+    fn scan_keeps_found_nodes_when_other_nodes_do_not_reply() {
+        let response = super::scan_response(
+            vec![json!({"node":1,"identity":{"uid":"known"}})],
+            vec![json!({"node":2,"message":"timeout"})],
+        );
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["nodes"][0]["node"], 1);
+        assert_eq!(response["errors"][0]["node"], 2);
     }
 
     fn session_request(
@@ -931,6 +1573,28 @@ mod tests {
         )?;
         assert!(rejected.starts_with("HTTP/1.1 409"));
         assert!(response_json(&rejected)?["snapshot"].get("trend").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_invalid_can_node_is_rejected_before_default_selection()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        for node in ["-1", "1.5", "256", "\"x\""] {
+            let response = session_request(
+                "POST",
+                "/api/action",
+                Some(&format!(
+                    r#"{{"transport":"can","node":{node},"action":"stop"}}"#
+                )),
+            )?;
+            assert!(
+                response.starts_with("HTTP/1.1 400"),
+                "node={node}: {response}"
+            );
+            assert!(response.contains("node 必须为 0..=127 的整数"));
+        }
+        let snapshot = session_request("GET", "/api/snapshot?transport=can&node=256", None)?;
+        assert!(snapshot.starts_with("HTTP/1.1 400"));
         Ok(())
     }
 

@@ -838,6 +838,21 @@ fieldset input { width: auto; min-height: auto; margin: 0; accent-color: var(--p
 .stop-button { width: 100%; min-height: 48px; letter-spacing: .04em; }
 
 .textarea-field textarea { min-height: 260px; margin-top: 0; }
+.schema-editor { margin: 0; }
+.schema-editor > summary { padding: 10px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
+.schema-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin-top: 14px; }
+.schema-field { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
+.schema-field small { color: var(--text-3); font-weight: 400; line-height: 1.45; }
+.config-diff { margin-top: 12px; color: var(--text-3); font-size: 11px; }
+.config-diff p { margin: 6px 0; overflow-wrap: anywhere; font-family: var(--mono); }
+.trial-grid { display: grid; gap: 16px; }
+.trial-card .candidate-list label { display: flex; align-items: center; gap: 8px; min-height: 32px; }
+.trial-arm { padding: 12px; border: 1px solid color-mix(in srgb, var(--warning) 45%, var(--border)); border-radius: 7px; background: var(--surface-2); }
+.trial-envelope input, .trial-command input { min-width: 0; }
+.trial-command { display: grid; gap: 12px; }
+.recording-list { display: grid; gap: 10px; }
+.recording-item { display: grid; gap: 6px; padding: 14px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
+.recording-item small { color: var(--text-3); overflow-wrap: anywhere; }
 .maintenance-card, .danger-card { margin-top: 14px; }
 .maintenance-grid .form-actions { align-self: end; }
 

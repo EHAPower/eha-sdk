@@ -28,6 +28,17 @@ test("invalid, stale and unqualified values break their own curve instead of bec
   assert.deepEqual(series[2].data.map((item) => item[1]), [10, null, null]);
 });
 
+test("accepted target history is rendered separately from feedback and does not fill another mode", () => {
+  const { targets } = seriesWindow([
+    point(1, 1_000_000, { target_mode:1, target_values:[12, 0, 0] }),
+    point(2, 1_010_000, { target_mode:2, target_values:[3, 0, 0] }),
+    point(3, 1_020_000, { target_mode:4, target_values:[20, 4, 1] }),
+  ], 30, 100);
+  assert.deepEqual(targets[0].data.map((item) => item[1]), [12, null, 20]);
+  assert.deepEqual(targets[1].data.map((item) => item[1]), [null, 3, null]);
+  assert.deepEqual(targets[2].data.map((item) => item[1]), [null, null, null]);
+});
+
 test("overflow and missing time intervals produce explicit breaks without inventing samples", () => {
   const points = [point(1, 1_000_000), point(2, 1_010_000, { gap: true }), point(3, 2_000_000)];
   const view = seriesWindow(points, 30, 100);

@@ -318,6 +318,31 @@ pub struct Backend {
     pub(crate) boundary: &'static str,
 }
 impl Backend {
+    /// 建立由另一条 I/O worker 驱动的逻辑 endpoint。
+    ///
+    /// 该 endpoint 不取得物理 I/O 所有权；调用方必须把返回的命令接收端和事件 sink
+    /// 交给唯一的物理 I/O worker。`join` 可随后由该 worker 附加，使释放 endpoint 时
+    /// 先结束其逻辑调度再返回。
+    pub(crate) fn endpoint() -> (Self, Receiver<Command>, EventSink) {
+        let (tx, rx) = mpsc::sync_channel(8);
+        let sink = EventSink(Arc::new((Mutex::new(Inbox::default()), Condvar::new())));
+        (
+            Self {
+                tx,
+                sink: sink.clone(),
+                join: None,
+                boundary: "共享 CAN 串口 write/flush；不证明适配器或总线接收",
+            },
+            rx,
+            sink,
+        )
+    }
+
+    pub(crate) fn attach_join(&mut self, join: JoinHandle<()>) {
+        debug_assert!(self.join.is_none());
+        self.join = Some(join);
+    }
+
     pub fn with_boundary(mut self, boundary: &'static str) -> Self {
         self.boundary = boundary;
         self

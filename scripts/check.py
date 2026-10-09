@@ -13,7 +13,10 @@ def main():
     commands = [
         ["cargo", "fmt", "--all", "--", "--check"],
         ["cargo", "test", "--workspace", "--all-targets", "--locked"],
-        ["node", "--test", "crates/tool/webui/tests/telemetry.test.js"],
+        ["node", "--test", *[
+            str(path.relative_to(root))
+            for path in sorted((root / "crates/tool/webui/tests").glob("*.test.js"))
+        ]],
         ["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"],
         ["cargo", "doc", "--workspace", "--no-deps", "--locked"],
         ["cargo", "check", "-p", "eha-sdk", "--no-default-features", "--target",

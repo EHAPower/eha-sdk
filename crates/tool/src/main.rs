@@ -67,6 +67,9 @@ enum Command {
         /// 带 odrive==0.5.1.post0 的 Python；省略时使用 EHA_ODRIVE_PYTHON 或 python3
         #[arg(long)]
         odrive_python: Option<PathBuf>,
+        /// 记录试验原始数据的目录；省略时使用系统本地数据目录。
+        #[arg(long)]
+        runs_dir: Option<PathBuf>,
     },
 }
 
@@ -118,7 +121,8 @@ fn main() -> ExitCode {
         Some(Command::Webui {
             port,
             odrive_python,
-        }) => webui::serve(port.get(), odrive_python),
+            runs_dir,
+        }) => webui::serve(port.get(), odrive_python, runs_dir),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

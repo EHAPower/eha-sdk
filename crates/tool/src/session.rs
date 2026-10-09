@@ -8,11 +8,12 @@
 
 use std::{
     collections::VecDeque,
+    path::Path,
     time::{Duration, Instant},
 };
 
 use eha_sdk::{
-    can::{CanConnector, CanOptions},
+    can::{CanConnector, CanNodeConnector, CanOptions},
     config::ExternalCanProfile,
     host::{
         Client, ClientState, Error as SdkError, Failure, LocalSubmission, OperationSubmission,
@@ -27,6 +28,16 @@ use eha_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[path = "recording.rs"]
+mod recording;
+#[path = "trial.rs"]
+mod trial;
+
+use recording::Recording;
+use trial::{ActiveTrial, PreparedTrial, TrialState};
+#[allow(unused_imports)]
+pub use trial::{ReachCondition, TrialEnvelope, TrialRequest};
 
 /// Web、Shell 和单次 CLI 共用的明确连接选择。
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -161,12 +172,13 @@ struct TelemetryTrendPoint {
     position: Value,
     velocity: Value,
     force: Value,
+    target_mode: u8,
+    target_values: [f32; 3],
     gap: bool,
 }
 
 /// WebUI 的当前会话趋势窗口；它不进入 SDK 的通用 latest-only 默认路径。
 struct TelemetryTrend {
-    queue_capacity: usize,
     source: Option<Value>,
     generation_start_cursor: u64,
     next_cursor: u64,
@@ -177,9 +189,8 @@ struct TelemetryTrend {
 }
 
 impl TelemetryTrend {
-    fn new(queue_capacity: usize) -> Self {
+    fn new(_queue_capacity: usize) -> Self {
         Self {
-            queue_capacity,
             source: None,
             generation_start_cursor: 1,
             next_cursor: 0,
@@ -234,9 +245,11 @@ impl TelemetryTrend {
                 cursor: self.next_cursor,
                 time_us,
                 sequence: fields.sample.snapshot_sequence,
-                position: value_json(fields.main_values[0]),
-                velocity: value_json(fields.main_values[1]),
-                force: value_json(fields.main_values[4]),
+                position: trend_value_json(fields.main_values[0]),
+                velocity: trend_value_json(fields.main_values[1]),
+                force: trend_value_json(fields.main_values[4]),
+                target_mode: fields.target_mode as u8,
+                target_values: fields.target_values,
                 gap: std::mem::take(&mut self.pending_gap),
             });
             let earliest_time = self
@@ -294,6 +307,7 @@ impl TelemetryTrend {
 enum Connector {
     Usb(UsbConnector),
     Can(CanConnector),
+    SharedCan(CanNodeConnector),
 }
 
 impl Connector {
@@ -301,6 +315,7 @@ impl Connector {
         match self {
             Self::Usb(connector) => connector.open(),
             Self::Can(connector) => connector.open(),
+            Self::SharedCan(connector) => connector.open(),
         }
     }
 }
@@ -321,6 +336,10 @@ pub struct ToolSession {
     disconnected_reason: Option<String>,
     disconnected_pending_operation: Option<String>,
     telemetry_trend: Option<TelemetryTrend>,
+    telemetry_queue_capacity: Option<usize>,
+    recording: Option<Recording>,
+    recording_error: Option<String>,
+    trial: TrialState,
 }
 
 impl Default for ToolSession {
@@ -346,6 +365,10 @@ impl ToolSession {
             disconnected_reason: None,
             disconnected_pending_operation: None,
             telemetry_trend: None,
+            telemetry_queue_capacity: None,
+            recording: None,
+            recording_error: None,
+            trial: TrialState::default(),
         }
     }
 
@@ -354,6 +377,7 @@ impl ToolSession {
     pub fn with_telemetry_trend(mut self, queue_capacity: usize) -> Self {
         if queue_capacity != 0 {
             self.telemetry_trend = Some(TelemetryTrend::new(queue_capacity));
+            self.telemetry_queue_capacity = Some(queue_capacity);
         }
         self
     }
@@ -365,6 +389,9 @@ impl ToolSession {
 
     /// 打开、核对 Identity 并保留同一 Client，期间不启动心跳或发送控制。
     pub fn connect(&mut self, request: ConnectionRequest) -> Result<Snapshot, SessionError> {
+        if self.trial.active.is_some() {
+            return Err(invalid("试验进行中；拒绝切换连接"));
+        }
         if self.client.is_some() {
             return Err(invalid("已有活跃会话；先显式 disconnect"));
         }
@@ -376,10 +403,8 @@ impl ToolSession {
         let mut connector = connector_for(&request)?;
         let backend = connector.open().map_err(open_error)?;
         let mut client = Client::new(backend);
-        if let Some(trend) = self.telemetry_trend.as_ref() {
-            client
-                .enable_telemetry_queue(trend.queue_capacity)
-                .map_err(sdk_error)?;
+        if let Some(capacity) = self.telemetry_queue_capacity {
+            client.enable_telemetry_queue(capacity).map_err(sdk_error)?;
         }
         let identity = match client.identify(None, &self.wait()) {
             Ok(identity) => identity,
@@ -402,8 +427,57 @@ impl ToolSession {
         Ok(self.snapshot())
     }
 
+    /// 绑定到已建立的共享 CAN 网络中的一个节点；网络本身由调用方唯一拥有。
+    pub fn connect_shared_can(
+        &mut self,
+        request: ConnectionRequest,
+        connector: CanNodeConnector,
+    ) -> Result<Snapshot, SessionError> {
+        if self.trial.active.is_some() {
+            return Err(invalid("试验进行中；拒绝切换连接"));
+        }
+        if !matches!(request, ConnectionRequest::Can { .. }) {
+            return Err(invalid("共享 CAN 节点必须使用 CAN 连接请求"));
+        }
+        if self.client.is_some() {
+            return Err(invalid("已有活跃会话；先显式 disconnect"));
+        }
+        self.clear_observations();
+        self.last_operation = None;
+        let mut shared = Connector::SharedCan(connector);
+        let backend = shared.open().map_err(open_error)?;
+        let mut client = Client::new(backend);
+        if let Some(capacity) = self.telemetry_queue_capacity {
+            client.enable_telemetry_queue(capacity).map_err(sdk_error)?;
+        }
+        let identity = match client.identify(None, &self.wait()) {
+            Ok(identity) => identity,
+            Err(error) => {
+                self.disconnected_reason = client.connection_status().disconnected;
+                self.disconnected_pending_operation = client.pending_operation().map(key_hex);
+                self.request = Some(request);
+                self.connector = Some(shared);
+                self.disconnected = Some(client.disconnect());
+                return Err(sdk_error(error));
+            }
+        };
+        self.identity = Some(identity);
+        self.request = Some(request);
+        self.connector = Some(shared);
+        self.client = Some(client);
+        self.disconnected = None;
+        self.disconnected_reason = None;
+        self.disconnected_pending_operation = None;
+        Ok(self.snapshot())
+    }
+
     /// 只关闭本地 I/O 并保存 ClientState；不发送 Stop、Reset 或重放目标。
     pub fn disconnect(&mut self) -> Result<Snapshot, SessionError> {
+        if self.trial.active.is_some() {
+            return Err(invalid("试验进行中；普通 disconnect 不停止也不切换设备"));
+        }
+        self.finish_recording_boundary("disconnect");
+        self.trial.prepared = None;
         let client = self
             .client
             .take()
@@ -424,12 +498,16 @@ impl ToolSession {
         {
             return Err(invalid("会话仍处于连接状态；无需 reconnect"));
         }
+        if self.trial.active.is_some() {
+            self.interrupt_trial_unknown("reconnect_during_active_trial");
+        }
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
             self.disconnected_reason = client.connection_status().disconnected;
             self.disconnected_pending_operation = client.pending_operation().map(key_hex);
             self.disconnected = Some(client.disconnect());
         }
+        let previous = self.identity.as_ref().and_then(identity_facts);
         let state = self
             .disconnected
             .take()
@@ -446,10 +524,8 @@ impl ToolSession {
             }
         };
         let mut client = Client::resume(backend, state);
-        if let Some(trend) = self.telemetry_trend.as_ref() {
-            client
-                .enable_telemetry_queue(trend.queue_capacity)
-                .map_err(sdk_error)?;
+        if let Some(capacity) = self.telemetry_queue_capacity {
+            client.enable_telemetry_queue(capacity).map_err(sdk_error)?;
         }
         let identity = match client.identify(None, &self.wait()) {
             Ok(identity) => identity,
@@ -458,6 +534,13 @@ impl ToolSession {
                 return Err(sdk_error(error));
             }
         };
+        if previous.is_some_and(|previous| {
+            identity_facts(&identity).is_some_and(|current| {
+                previous.uid != current.uid || previous.run_nonce != current.run_nonce
+            })
+        }) {
+            self.finish_recording_boundary("reconnect_identity_changed");
+        }
         self.clear_observations();
         self.identity = Some(identity);
         self.client = Some(client);
@@ -492,6 +575,8 @@ impl ToolSession {
         if previous.is_some_and(|previous| {
             previous.uid != current.uid || previous.run_nonce != current.run_nonce
         }) {
+            self.interrupt_trial_unknown("identity_changed");
+            self.finish_recording_boundary("identity_changed");
             self.clear_observations();
         }
         self.identity = Some(identity);
@@ -595,7 +680,39 @@ impl ToolSession {
         }
     }
 
+    /// 执行普通 SDK 动作。试验活跃时，控制及阻塞查询必须通过试验入口协调。
     pub fn execute(&mut self, command: Command) -> Result<CommandResult, SessionError> {
+        if self.trial.active.is_some() {
+            return Err(invalid(
+                "试验进行中；仅允许读取快照、显式 stop_trial 或 update_trial_position",
+            ));
+        }
+        self.record_event("command_input", json!({"command": &command}));
+        let result = self.execute_inner(command);
+        match &result {
+            Ok(value) => {
+                if matches!(
+                    value.action.as_str(),
+                    "config_save" | "restore_factory" | "reset_application" | "enter_update"
+                ) {
+                    self.trial.prepared = None;
+                }
+                self.record_event(
+                    "command_completed",
+                    json!({
+                        "action": value.action,
+                        "local_submission": value.local_submission,
+                        "operation_key": value.operation_key,
+                        "data": value.data,
+                    }),
+                );
+            }
+            Err(error) => self.record_event("command_error", json!({"error": error})),
+        }
+        result
+    }
+
+    fn execute_inner(&mut self, command: Command) -> Result<CommandResult, SessionError> {
         if let Command::ConfigValidate { record } = &command {
             eha_sdk::configuration::validate_json(record.as_bytes())
                 .map_err(|error| invalid(error.to_string()))?;
@@ -746,6 +863,502 @@ impl ToolSession {
         })
     }
 
+    /// 开始一个独立目录的原始会话记录。记录启动不发送控制、心跳或维护动作。
+    pub fn start_recording(&mut self, root: &Path) -> Result<Value, SessionError> {
+        if self.recording.is_some() {
+            return Err(invalid("已有进行中的记录"));
+        }
+        if self.client.is_none() || self.identity.is_none() {
+            return Err(invalid("记录需要已核对 Identity 的活跃会话"));
+        }
+        if self.trial.active.is_some() {
+            return Err(invalid("试验进行中不读取配置启动记录；请在试验前开始记录"));
+        }
+        let capacity = self.telemetry_queue_capacity.unwrap_or(1_024);
+        self.telemetry_queue_capacity = Some(capacity);
+        self.client
+            .as_mut()
+            .expect("checked connected client")
+            .enable_telemetry_queue(capacity)
+            .map_err(sdk_error)?;
+        let wait = self.wait();
+        let startup = self
+            .client
+            .as_mut()
+            .expect("checked connected client")
+            .read_config(ConfigView::Startup, &wait)
+            .map_err(sdk_error)
+            .and_then(|reply| reply_json(&reply))?;
+        let snapshot = self.snapshot();
+        let identity = snapshot.identity.clone().unwrap_or(Value::Null);
+        let metadata = json!({
+            "format": "eha-tool-recording-v1",
+            "tool_version": crate::build_metadata::TOOL_VERSION,
+            "connection": snapshot.connection.clone(),
+            "identity": identity.clone(),
+            "device_uid": identity["uid"].clone(),
+            "run_nonce": identity["sample"]["run_nonce"].clone(),
+            "startup_config_source": identity["config_source"].clone(),
+            "startup_config_source_label": identity["config_source_label"].clone(),
+            "startup_config": startup,
+        });
+        let mut recording = Recording::start(root, metadata).map_err(recording_error)?;
+        recording
+            .event(
+                "session_snapshot",
+                serde_json::to_value(&snapshot)
+                    .map_err(|error| recording_error(error.to_string()))?,
+            )
+            .map_err(recording_error)?;
+        let value = recording.snapshot();
+        self.recording = Some(recording);
+        self.recording_error = None;
+        Ok(value)
+    }
+
+    /// 结束并刷新当前记录；它不改变 SDK 连接或控制状态。
+    pub fn stop_recording(&mut self) -> Result<Value, SessionError> {
+        let recording = self
+            .recording
+            .take()
+            .ok_or_else(|| invalid("当前没有进行中的记录"))?;
+        recording.finish().map_err(recording_error)
+    }
+
+    pub fn recording_snapshot(&self) -> Value {
+        match (&self.recording, &self.recording_error) {
+            (Some(recording), Some(error)) => {
+                json!({"active": false, "failed": true, "error": error, "partial": recording.snapshot()})
+            }
+            (Some(recording), None) => recording.snapshot(),
+            (None, error) => json!({"active": false, "error": error}),
+        }
+    }
+
+    /// 用本次读到的实际 Startup 配置和 Status 建立试验准入，不提交控制需求。
+    pub fn prepare_trial(&mut self, request: &TrialRequest) -> Result<(), SessionError> {
+        if self.trial.active.is_some() {
+            return Err(invalid("已有进行中的试验"));
+        }
+        validate_trial_request(request)?;
+        let wait = self.wait();
+        let (startup_reply, status_reply) = {
+            let client = self
+                .client
+                .as_mut()
+                .ok_or_else(|| invalid("请先 connect 并核对 Identity"))?;
+            let startup = client
+                .read_config(ConfigView::Startup, &wait)
+                .map_err(sdk_error)?;
+            let status = client.status(&wait).map_err(sdk_error)?;
+            (startup, status)
+        };
+        let startup = reply_json(&startup_reply)?;
+        let status = reply_json(&status_reply)?;
+        self.last_status = Some(status_reply);
+        validate_trial_facts(request, &startup, &status, self.request.as_ref())?;
+        self.record_event(
+            "trial_prepared",
+            json!({"request": request, "startup": startup, "status": status}),
+        );
+        self.trial.completed = None;
+        self.trial.prepared = Some(PreparedTrial {
+            request: request.clone(),
+            status,
+            startup,
+            identity: self
+                .identity
+                .as_ref()
+                .and_then(|reply| reply_json(reply).ok())
+                .ok_or_else(|| invalid("Identity 不可读"))?,
+            connection: self.request.clone(),
+        });
+        Ok(())
+    }
+
+    /// 对已预检且完全相同的单次请求提交一次持续需求。
+    pub fn start_prepared_trial(&mut self, request: TrialRequest) -> Result<Value, SessionError> {
+        if self.trial.active.is_some() {
+            return Err(invalid("已有进行中的试验"));
+        }
+        let prepared = self
+            .trial
+            .prepared
+            .take()
+            .ok_or_else(|| invalid("请先 prepare_trial"))?;
+        if serde_json::to_value(&prepared.request).ok() != serde_json::to_value(&request).ok() {
+            self.trial.prepared = Some(prepared);
+            return Err(invalid("试验请求与已预检范围不一致；请重新预检"));
+        }
+        let current_identity = self
+            .identity
+            .as_ref()
+            .and_then(|reply| reply_json(reply).ok())
+            .ok_or_else(|| invalid("请先 connect 并核对 Identity"))?;
+        if current_identity["uid"] != prepared.identity["uid"]
+            || current_identity["sample"]["run_nonce"] != prepared.identity["sample"]["run_nonce"]
+            || self.request != prepared.connection
+        {
+            return Err(invalid("预检所属设备、运行实例或通路已经变化；请重新预检"));
+        }
+        let fresh = self
+            .client
+            .as_ref()
+            .and_then(Client::telemetry)
+            .ok_or_else(|| invalid("开始试验前需要同一运行实例的新鲜被动遥测"))?;
+        let fresh_value = reply_json(&fresh)?;
+        validate_trial_facts(
+            &request,
+            &prepared.startup,
+            &fresh_value,
+            self.request.as_ref(),
+        )?;
+        self.last_telemetry = Some(fresh);
+        self.record_event("trial_command_input", json!({"request": &request}));
+        let started_sample_time_us = prepared.status["sample"]["snapshot_time_us"]
+            .as_u64()
+            .unwrap_or(0);
+        let initial_position = matches!(request.command, Command::Position { .. });
+        self.trial.active = Some(ActiveTrial {
+            request: request.clone(),
+            started_at: Instant::now(),
+            pending_position_mm: None,
+            last_position_submit: initial_position.then(Instant::now),
+            settled_since: None,
+            stop_submission: None,
+            stop_reason: None,
+            stop_observed: false,
+            started_sample_time_us,
+            stop_after_sample_time_us: None,
+            stop_attempt_finished_at: None,
+            settled_sample_time_us: None,
+        });
+        let result = match self.execute_trial_command(request.command.clone()) {
+            Ok(result) => result,
+            Err(error) => {
+                self.record_event("trial_command_error", json!({"error": &error}));
+                if error.local_stage.as_deref() == Some("not_submitted") {
+                    self.trial.active = None;
+                } else {
+                    let _ = self.submit_trial_stop("initial_submission_unknown");
+                }
+                return Err(error);
+            }
+        };
+        self.record_event(
+            "trial_command_submitted",
+            json!({
+                "local_submission": result.local_submission,
+                "data": result.data,
+            }),
+        );
+        Ok(json!({"submitted": result, "trial": self.trial_snapshot()}))
+    }
+
+    pub fn start_trial(&mut self, request: TrialRequest) -> Result<Value, SessionError> {
+        self.prepare_trial(&request)?;
+        self.start_prepared_trial(request)
+    }
+
+    /// 只合并位置试验的最新目标；实际发送由 `tick` 限为最多 20 Hz。
+    pub fn update_trial_position(&mut self, mm: f32) -> Result<Value, SessionError> {
+        let active = self
+            .trial
+            .active
+            .as_mut()
+            .ok_or_else(|| invalid("当前没有进行中的试验"))?;
+        if !matches!(active.request.command, Command::Position { .. }) {
+            return Err(invalid("当前试验不是位置试验"));
+        }
+        if active.stop_submission.is_some() {
+            return Err(invalid("试验已开始停止；不再提交位置目标"));
+        }
+        if !mm.is_finite()
+            || mm < active.request.envelope.position_min_mm
+            || mm > active.request.envelope.position_max_mm
+        {
+            return Err(invalid("位置目标超出本次试验范围"));
+        }
+        active.pending_position_mm = Some(mm);
+        self.record_event("trial_position_merged", json!({"mm": mm}));
+        Ok(self.trial_snapshot())
+    }
+
+    /// 显式发送一次 Stop，并仅以其后的新遥测确认目标清除；任何失败均不重放。
+    pub fn stop_trial(&mut self) -> Result<Value, SessionError> {
+        self.submit_trial_stop("explicit")?;
+        Ok(self.trial_snapshot())
+    }
+
+    pub fn trial_snapshot(&self) -> Value {
+        self.trial.snapshot()
+    }
+
+    /// 服务后台每约 10 ms 调用。它只消费 SDK 的被动遥测队列和推进已授权试验。
+    pub fn tick(&mut self) {
+        if let Some(client) = self.client.take() {
+            self.capture_telemetry(&client);
+            let disconnected = client.connection_status().disconnected;
+            self.client = Some(client);
+            if let Some(reason) = disconnected {
+                self.interrupt_trial_unknown(&format!("transport_disconnected:{reason}"));
+                self.finish_recording_boundary("transport_disconnected");
+            }
+        }
+        let stop_reason = self.trial_stop_reason();
+        if let Some(reason) = stop_reason {
+            let _ = self.submit_trial_stop(&reason);
+        }
+        self.flush_trial_position();
+        self.observe_trial_stop();
+        self.flush_recording();
+    }
+
+    fn trial_stop_reason(&mut self) -> Option<String> {
+        let active = self.trial.active.as_mut()?;
+        if active.stop_submission.is_some() {
+            return None;
+        }
+        let deadline = active
+            .request
+            .duration_s
+            .unwrap_or(active.request.envelope.duration_max_s);
+        if active.started_at.elapsed().as_secs_f64() >= deadline {
+            return Some("duration_elapsed".into());
+        }
+        let telemetry = match self
+            .last_telemetry
+            .as_ref()
+            .and_then(|reply| reply_json(reply).ok())
+        {
+            Some(telemetry) => telemetry,
+            None if active.started_at.elapsed() > Duration::from_millis(500) => {
+                return Some("telemetry_missing".into());
+            }
+            None => return None,
+        };
+        if telemetry["received_age_ms"]
+            .as_u64()
+            .is_none_or(|age| age > 250)
+        {
+            return Some("telemetry_stale".into());
+        }
+        let time_us = match telemetry["sample"]["snapshot_time_us"].as_u64() {
+            Some(time) if time > active.started_sample_time_us => time,
+            _ => return None,
+        };
+        if telemetry["facts"]["retained_result"].as_bool() != Some(false)
+            || telemetry["facts"]["unknown_effect"].as_bool() != Some(false)
+            || telemetry["driver_state"]["qualified"].as_bool() != Some(true)
+            || telemetry["driver_state"]["stale"].as_bool() != Some(false)
+            || telemetry["driver_state"]["faulted"].as_bool() != Some(false)
+            || !trial_contact_active(&telemetry, self.request.as_ref())
+            || telemetry["main_values"]
+                .as_array()
+                .is_none_or(|values| values.len() < 5 || !values.iter().take(5).all(fresh_value))
+        {
+            return Some("runtime_facts_invalid".into());
+        }
+        let values = telemetry["main_values"].as_array().expect("checked length");
+        if values[0]["value"].as_f64().is_none_or(|value| {
+            value < f64::from(active.request.envelope.position_min_mm)
+                || value > f64::from(active.request.envelope.position_max_mm)
+        }) || values[1]["value"].as_f64().is_none_or(|value| {
+            value.abs() > f64::from(active.request.envelope.velocity_abs_max_mm_s)
+        }) || values[4]["value"]
+            .as_f64()
+            .is_none_or(|value| value.abs() > f64::from(active.request.envelope.force_abs_max_n))
+        {
+            return Some("runtime_envelope_exceeded".into());
+        }
+        let reach = active.request.reach.as_ref()?;
+        let Command::Position { mm } = active.request.command else {
+            return None;
+        };
+        if !trial_target_matches(&telemetry, &active.request.command) {
+            active.settled_since = None;
+            return None;
+        }
+        if active.settled_sample_time_us == Some(time_us) {
+            return None;
+        }
+        active.settled_sample_time_us = Some(time_us);
+        if !fresh_value(&telemetry["main_values"][0]) {
+            active.settled_since = None;
+            return None;
+        }
+        let position = telemetry["main_values"][0]["value"].as_f64()? as f32;
+        if (position - mm).abs() > reach.tolerance_mm {
+            active.settled_since = None;
+            return None;
+        }
+        let now = Instant::now();
+        let settled_since = active.settled_since.get_or_insert(now);
+        (now.duration_since(*settled_since).as_millis() >= u128::from(reach.settle_ms))
+            .then(|| "position_reached".into())
+    }
+
+    fn flush_trial_position(&mut self) {
+        let position = {
+            let Some(active) = self.trial.active.as_ref() else {
+                return;
+            };
+            if active.stop_submission.is_some()
+                || active
+                    .last_position_submit
+                    .is_some_and(|last| last.elapsed() < Duration::from_millis(50))
+            {
+                return;
+            }
+            active.pending_position_mm
+        };
+        let Some(mm) = position else {
+            return;
+        };
+        self.record_event("trial_position_submit", json!({"mm": mm}));
+        let result = self.execute_trial_command(Command::Position { mm });
+        match result {
+            Ok(result) => {
+                if let Some(active) = self.trial.active.as_mut() {
+                    active.pending_position_mm = None;
+                    active.last_position_submit = Some(Instant::now());
+                    active.request.command = Command::Position { mm };
+                    active.settled_since = None;
+                    active.settled_sample_time_us = None;
+                }
+                self.record_event(
+                    "trial_position_submitted",
+                    json!({"mm": mm, "local_submission": result.local_submission}),
+                );
+            }
+            Err(error) => {
+                self.record_event("trial_position_error", json!({"mm": mm, "error": error}));
+                if let Some(active) = self.trial.active.as_mut() {
+                    active.pending_position_mm = None;
+                    active.stop_reason = Some("position_submit_failed".into());
+                }
+                let _ = self.submit_trial_stop("position_submit_failed");
+            }
+        }
+    }
+
+    fn submit_trial_stop(&mut self, reason: &str) -> Result<(), SessionError> {
+        let baseline = self
+            .last_telemetry
+            .as_ref()
+            .and_then(|reply| reply_json(reply).ok())
+            .and_then(|value| value["sample"]["snapshot_time_us"].as_u64())
+            .unwrap_or(0);
+        {
+            let active = self
+                .trial
+                .active
+                .as_mut()
+                .ok_or_else(|| invalid("当前没有进行中的试验"))?;
+            if active.stop_submission.is_some() {
+                return Ok(());
+            }
+            active.pending_position_mm = None;
+            active.stop_reason = Some(reason.into());
+            active.stop_after_sample_time_us = Some(baseline);
+        }
+        self.record_event("trial_stop_input", json!({"reason": reason}));
+        match self.execute_trial_command(Command::Stop) {
+            Ok(result) => {
+                let submission = json!({
+                    "local_submission": result.local_submission,
+                    "data": result.data,
+                    "device_execution": "awaiting_new_telemetry",
+                });
+                if let Some(active) = self.trial.active.as_mut() {
+                    active.stop_submission = Some(submission.clone());
+                    active.stop_attempt_finished_at = Some(Instant::now());
+                }
+                self.record_event("trial_stop_submitted", submission);
+                Ok(())
+            }
+            Err(error) => {
+                let failure = json!({"error": &error, "device_execution": "unknown_no_retry"});
+                if let Some(active) = self.trial.active.as_mut() {
+                    active.stop_submission = Some(failure.clone());
+                    active.stop_attempt_finished_at = Some(Instant::now());
+                }
+                self.record_event("trial_stop_error", failure);
+                Err(error)
+            }
+        }
+    }
+
+    fn observe_trial_stop(&mut self) {
+        let received_at = self.last_telemetry.as_ref().map(|reply| reply.received_at);
+        let telemetry = self
+            .last_telemetry
+            .as_ref()
+            .and_then(|reply| reply_json(reply).ok());
+        let Some(telemetry) = telemetry else {
+            return;
+        };
+        let sample_time_us = telemetry["sample"]["snapshot_time_us"].as_u64();
+        let no_target = telemetry["target_mode"].as_u64() == Some(0);
+        let idle = telemetry["desired_axis"].as_u64() == Some(1);
+        let driver_idle = telemetry["axis_state_raw"].as_u64() == Some(1)
+            && telemetry["driver_state"]["has_status"].as_bool() == Some(true)
+            && telemetry["driver_state"]["qualified"].as_bool() == Some(true)
+            && telemetry["driver_state"]["stale"].as_bool() == Some(false)
+            && telemetry["driver_state"]["faulted"].as_bool() == Some(false);
+        let clear_facts = telemetry["facts"]["device_operation_pending"].as_bool() == Some(false)
+            && telemetry["facts"]["retained_result"].as_bool() == Some(false)
+            && telemetry["facts"]["unknown_effect"].as_bool() == Some(false);
+        let same_identity = self
+            .identity
+            .as_ref()
+            .and_then(|reply| reply_json(reply).ok())
+            .is_some_and(|identity| {
+                telemetry["sample"]["run_nonce"] == identity["sample"]["run_nonce"]
+            });
+        let fresh = telemetry["received_age_ms"]
+            .as_u64()
+            .is_some_and(|age| age <= 250);
+        let Some(active) = self.trial.active.as_ref() else {
+            return;
+        };
+        let confirmed = active.stop_submission.is_some()
+            && sample_time_us
+                .is_some_and(|time| time > active.stop_after_sample_time_us.unwrap_or(0))
+            && no_target
+            && idle
+            && driver_idle
+            && clear_facts
+            && same_identity
+            && fresh
+            && received_at.is_some_and(|received| {
+                active
+                    .stop_attempt_finished_at
+                    .is_some_and(|submitted| received > submitted)
+            });
+        if confirmed {
+            let completed = json!({
+                "state": "completed",
+                "request": active.request.clone(),
+                "stop_reason": active.stop_reason.clone(),
+                "stop_submission": active.stop_submission.clone(),
+                "stop_observed": true,
+                "evidence": &telemetry,
+            });
+            self.record_event("trial_stop_confirmed", json!({"telemetry": &telemetry}));
+            self.trial.completed = Some(completed);
+            self.trial.active = None;
+        }
+    }
+
+    fn execute_trial_command(&mut self, command: Command) -> Result<CommandResult, SessionError> {
+        let original = self.timeout;
+        self.timeout = original.min(Duration::from_millis(100));
+        let result = self.execute_inner(command);
+        self.timeout = original;
+        result
+    }
+
     fn wait(&self) -> Wait {
         Wait::new(self.timeout)
     }
@@ -756,6 +1369,7 @@ impl ToolSession {
         self.last_status = None;
         self.last_measurements = None;
         self.last_diagnostics = None;
+        self.trial.prepared = None;
         if let Some(trend) = self.telemetry_trend.as_mut() {
             trend.reset();
         }
@@ -763,10 +1377,26 @@ impl ToolSession {
 
     fn capture_telemetry(&mut self, client: &Client) {
         let trend_source = self.trend_source();
-        if let Some(trend) = self.telemetry_trend.as_mut() {
+        let drained = self
+            .telemetry_queue_capacity
+            .map(|_| client.drain_telemetry());
+        if let (Some(trend), Some(drained)) = (self.telemetry_trend.as_mut(), drained.as_ref()) {
             trend.set_source(trend_source);
-            let drained = client.drain_telemetry();
-            trend.record(drained.replies, drained.dropped);
+            trend.record(drained.replies.clone(), drained.dropped);
+        }
+        if let Some(drained) = drained {
+            if drained.dropped != 0 {
+                self.record_telemetry_dropped(drained.dropped);
+            }
+            let mut gap = drained.dropped != 0;
+            for reply in drained.replies {
+                match reply_json(&reply) {
+                    Ok(value) => self.record_telemetry(&value, std::mem::take(&mut gap)),
+                    Err(error) => {
+                        self.record_event("telemetry_decode_error", json!({"error": error}))
+                    }
+                }
+            }
         }
         if let Some(reply) = client.telemetry()
             && reply_json(&reply).is_ok()
@@ -793,6 +1423,298 @@ impl ToolSession {
             .as_ref()
             .map_or(Value::Null, |trend| trend.json(after))
     }
+
+    fn record_event(&mut self, event: &str, data: Value) {
+        if self.recording_error.is_some() {
+            return;
+        }
+        let error = self
+            .recording
+            .as_mut()
+            .and_then(|recording| recording.event(event, data).err());
+        if let Some(error) = error {
+            self.recording_error = Some(error);
+        }
+    }
+
+    fn record_telemetry(&mut self, telemetry: &Value, gap: bool) {
+        if self.recording_error.is_some() {
+            return;
+        }
+        let error = self
+            .recording
+            .as_mut()
+            .and_then(|recording| recording.telemetry(telemetry, gap).err());
+        if let Some(error) = error {
+            self.recording_error = Some(error);
+        }
+    }
+
+    fn record_telemetry_dropped(&mut self, count: u64) {
+        if self.recording_error.is_some() {
+            return;
+        }
+        let error = self
+            .recording
+            .as_mut()
+            .and_then(|recording| recording.dropped(count).err());
+        if let Some(error) = error {
+            self.recording_error = Some(error);
+        }
+    }
+
+    fn flush_recording(&mut self) {
+        if self.recording_error.is_some() {
+            return;
+        }
+        let error = self
+            .recording
+            .as_mut()
+            .and_then(|recording| recording.flush().err());
+        if let Some(error) = error {
+            self.recording_error = Some(error);
+        }
+    }
+
+    fn finish_recording_boundary(&mut self, reason: &str) {
+        let Some(mut recording) = self.recording.take() else {
+            return;
+        };
+        let result = recording.event("recording_boundary", json!({"reason": reason}));
+        if let Err(error) = result.and_then(|_| recording.finish()) {
+            self.recording_error = Some(error);
+        }
+    }
+
+    fn interrupt_trial_unknown(&mut self, reason: &str) {
+        let Some(active) = self.trial.active.take() else {
+            return;
+        };
+        let evidence = self
+            .last_telemetry
+            .as_ref()
+            .and_then(|reply| reply_json(reply).ok());
+        self.trial.completed = Some(json!({
+            "state": "interrupted_unknown",
+            "request": active.request,
+            "reason": reason,
+            "stop_submission": active.stop_submission,
+            "last_telemetry": evidence,
+        }));
+        self.record_event(
+            "trial_interrupted_unknown",
+            self.trial.completed.clone().unwrap_or(Value::Null),
+        );
+    }
+}
+
+fn recording_error(message: impl Into<String>) -> SessionError {
+    SessionError {
+        kind: "recording".into(),
+        message: message.into().into_boxed_str(),
+        local_stage: None,
+        operation_key: None,
+        unknown: false,
+        failure: None,
+        last_result: None,
+        observed_transport: None,
+        transport_raw_hex: None,
+    }
+}
+
+fn fresh_value(value: &Value) -> bool {
+    value["result"].as_u64() == Some(1)
+        && value["quality"].as_u64() == Some(1)
+        && value["stale"].as_bool() == Some(false)
+}
+
+fn trial_contact_active(telemetry: &Value, connection: Option<&ConnectionRequest>) -> bool {
+    match connection {
+        Some(ConnectionRequest::Usb { .. }) => telemetry["usb_contact"].as_u64() == Some(1),
+        Some(ConnectionRequest::Can { .. }) => telemetry["can_contact"].as_u64() == Some(1),
+        None => false,
+    }
+}
+
+fn trial_target_matches(telemetry: &Value, command: &Command) -> bool {
+    let values = telemetry["target_values"].as_array();
+    let expected = match command {
+        Command::Position { mm } => Some((1_u64, [*mm, 0.0, 0.0])),
+        Command::Velocity { mm_s } => Some((2, [*mm_s, 0.0, 0.0])),
+        Command::Force { n } => Some((3, [*n, 0.0, 0.0])),
+        Command::Impedance {
+            equilibrium_mm,
+            stiffness_n_per_mm,
+            damping_ns_per_mm,
+        } => Some((
+            4,
+            [*equilibrium_mm, *stiffness_n_per_mm, *damping_ns_per_mm],
+        )),
+        _ => None,
+    };
+    let Some((mode, expected)) = expected else {
+        return false;
+    };
+    telemetry["target_mode"].as_u64() == Some(mode)
+        && values.is_some_and(|values| {
+            values.len() == 3
+                && values.iter().zip(expected).all(|(actual, expected)| {
+                    actual
+                        .as_f64()
+                        .is_some_and(|value| (value as f32 - expected).abs() <= 1e-4)
+                })
+        })
+}
+
+fn validate_trial_request(request: &TrialRequest) -> Result<(), SessionError> {
+    let envelope = &request.envelope;
+    if !matches!(
+        request.command,
+        Command::Position { .. }
+            | Command::Velocity { .. }
+            | Command::Force { .. }
+            | Command::Impedance { .. }
+    ) {
+        return Err(invalid(
+            "试验仅允许 Position、Velocity、Force 或 Impedance 持续需求",
+        ));
+    }
+    if !envelope.position_min_mm.is_finite()
+        || !envelope.position_max_mm.is_finite()
+        || envelope.position_min_mm > envelope.position_max_mm
+        || !envelope.velocity_abs_max_mm_s.is_finite()
+        || !envelope.force_abs_max_n.is_finite()
+        || !envelope.stiffness_max_n_per_mm.is_finite()
+        || !envelope.damping_max_ns_per_mm.is_finite()
+        || !envelope.duration_max_s.is_finite()
+        || envelope.velocity_abs_max_mm_s < 0.0
+        || envelope.force_abs_max_n < 0.0
+        || envelope.stiffness_max_n_per_mm < 0.0
+        || envelope.damping_max_ns_per_mm < 0.0
+        || envelope.duration_max_s <= 0.0
+    {
+        return Err(invalid("试验范围必须为有限且有效的上限/位置区间"));
+    }
+    if request.duration_s.is_some_and(|duration| {
+        !duration.is_finite() || duration <= 0.0 || duration > envelope.duration_max_s
+    }) {
+        return Err(invalid("试验时长必须为正且不超过本次 duration_max_s"));
+    }
+    if let Some(reach) = &request.reach
+        && (!reach.tolerance_mm.is_finite() || reach.tolerance_mm < 0.0)
+    {
+        return Err(invalid("到位容差必须为有限非负值"));
+    }
+    match request.command {
+        Command::Position { mm }
+            if mm.is_finite()
+                && mm >= envelope.position_min_mm
+                && mm <= envelope.position_max_mm => {}
+        Command::Velocity { mm_s }
+            if mm_s.is_finite() && mm_s.abs() <= envelope.velocity_abs_max_mm_s => {}
+        Command::Force { n } if n.is_finite() && n.abs() <= envelope.force_abs_max_n => {}
+        Command::Impedance {
+            equilibrium_mm,
+            stiffness_n_per_mm,
+            damping_ns_per_mm,
+        } if equilibrium_mm.is_finite()
+            && equilibrium_mm >= envelope.position_min_mm
+            && equilibrium_mm <= envelope.position_max_mm
+            && stiffness_n_per_mm.is_finite()
+            && stiffness_n_per_mm >= 0.0
+            && stiffness_n_per_mm <= envelope.stiffness_max_n_per_mm
+            && damping_ns_per_mm.is_finite()
+            && damping_ns_per_mm >= 0.0
+            && damping_ns_per_mm <= envelope.damping_max_ns_per_mm => {}
+        _ => return Err(invalid("控制请求超出本次试验范围")),
+    }
+    Ok(())
+}
+
+fn validate_trial_facts(
+    request: &TrialRequest,
+    startup: &Value,
+    status: &Value,
+    connection: Option<&ConnectionRequest>,
+) -> Result<(), SessionError> {
+    if status["received_age_ms"]
+        .as_u64()
+        .is_none_or(|age| age > 250)
+    {
+        return Err(invalid("试验预检需要新鲜 Status"));
+    }
+    let facts = &status["facts"];
+    let driver = &status["driver_state"];
+    if facts["device_operation_pending"].as_bool() != Some(false)
+        || facts["retained_result"].as_bool() != Some(false)
+        || facts["unknown_effect"].as_bool() != Some(false)
+        || driver["has_status"].as_bool() != Some(true)
+        || driver["qualified"].as_bool() != Some(true)
+        || driver["stale"].as_bool() != Some(false)
+        || driver["faulted"].as_bool() != Some(false)
+    {
+        return Err(invalid("当前维护、驱动或未知副作用事实不允许开始试验"));
+    }
+    if status["target_mode"].as_u64() != Some(0)
+        || status["desired_axis"].as_u64() != Some(1)
+        || status["axis_state_raw"].as_u64() != Some(1)
+    {
+        return Err(invalid(
+            "当前仍有目标或驱动未处于 Idle；不会覆盖其它通路的持续控制",
+        ));
+    }
+    let contact_active = match connection {
+        Some(ConnectionRequest::Usb { .. }) => status["usb_contact"].as_u64() == Some(1),
+        Some(ConnectionRequest::Can { .. }) => status["can_contact"].as_u64() == Some(1),
+        None => false,
+    };
+    if !contact_active {
+        return Err(invalid(
+            "当前通路联系未激活；不会以旧 Ready 或已提交目标代替",
+        ));
+    }
+    let values = status["main_values"]
+        .as_array()
+        .ok_or_else(|| invalid("Status 缺少测量事实"))?;
+    if values.len() < 5 || !values.iter().take(5).all(fresh_value) {
+        return Err(invalid("位置、速度、压力或力测量不新鲜/不合格"));
+    }
+    if values[0]["value"].as_f64().is_none_or(|value| {
+        value < f64::from(request.envelope.position_min_mm)
+            || value > f64::from(request.envelope.position_max_mm)
+    }) || values[1]["value"]
+        .as_f64()
+        .is_none_or(|value| value.abs() > f64::from(request.envelope.velocity_abs_max_mm_s))
+        || values[4]["value"]
+            .as_f64()
+            .is_none_or(|value| value.abs() > f64::from(request.envelope.force_abs_max_n))
+    {
+        return Err(invalid("当前位置、速度或力超出本次试验范围"));
+    }
+    let config = startup["data_utf8"]
+        .as_str()
+        .ok_or_else(|| invalid("实际 Startup 配置不可读"))?;
+    let config: Value =
+        serde_json::from_str(config).map_err(|_| invalid("实际 Startup 配置不是有效 JSON"))?;
+    let protection = &config["config"]["protection"];
+    let number = |name: &str| protection[name].as_f64().map(|value| value as f32);
+    let (Some(position_min), Some(position_max), Some(velocity_max), Some(force_max)) = (
+        number("hard_position_min_mm"),
+        number("hard_position_max_mm"),
+        number("hard_velocity_max_mm_s"),
+        number("hard_force_max_n"),
+    ) else {
+        return Err(invalid("实际 Startup 配置缺少硬保护范围"));
+    };
+    let envelope = &request.envelope;
+    if envelope.position_min_mm < position_min
+        || envelope.position_max_mm > position_max
+        || envelope.velocity_abs_max_mm_s > velocity_max
+        || envelope.force_abs_max_n > force_max
+    {
+        return Err(invalid("试验范围超过实际 Startup 硬保护范围"));
+    }
+    Ok(())
 }
 
 fn connector_for(request: &ConnectionRequest) -> Result<Connector, SessionError> {
@@ -1047,6 +1969,16 @@ fn sample_json(sample: eha_sdk::protocol::SampleData) -> Value {
 fn sample_view_json(sample: eha_sdk::protocol::Sample<'_>) -> Value {
     json!({"query_id": sample.query_id(), "run_nonce": hex(sample.run_nonce()), "snapshot_sequence": sample.snapshot_sequence(), "snapshot_time_us": sample.snapshot_time_us()})
 }
+// 趋势只传绘图需要的数值和质量；完整遥测及压力由运行记录保留。
+fn trend_value_json(value: ValueFields) -> Value {
+    json!({
+        "value": value.value,
+        "result": value.state.result() as u8,
+        "quality": value.state.quality() as u8,
+        "stale": value.state.is_stale(),
+    })
+}
+
 fn value_json(value: ValueFields) -> Value {
     let result = value.state.result();
     let quality = value.state.quality();
@@ -1428,6 +2360,8 @@ mod tests {
             position: json!({"value": cursor}),
             velocity: json!({"value": cursor}),
             force: json!({"value": cursor}),
+            target_mode: 1,
+            target_values: [cursor as f32, 0.0, 0.0],
             gap: false,
         }
     }
@@ -1638,6 +2572,22 @@ mod tests {
     }
 
     #[test]
+    fn full_trend_keeps_all_samples_with_bounded_payload() {
+        let mut trend = TelemetryTrend::new(4096);
+        for cursor in 1..=3000 {
+            let mut point = trend_point(cursor, 7_000_000_000 + cursor * 10_000);
+            point.position = super::trend_value_json(value());
+            point.velocity = super::trend_value_json(value());
+            point.force = super::trend_value_json(value());
+            trend.points.push_back(point);
+        }
+        let response = trend.json(None);
+        assert_eq!(response["points"].as_array().map(Vec::len), Some(3000));
+        assert_eq!(response["points"][0]["velocity"]["quality"], 1);
+        assert!(serde_json::to_vec(&response).expect("trend JSON").len() < 1_100_000);
+    }
+
+    #[test]
     fn trend_cursor_is_non_destructive_for_two_browsers_and_source_reset() {
         let mut trend = TelemetryTrend::new(4);
         trend.set_source(Some(
@@ -1786,3 +2736,7 @@ mod tests {
         assert!(stale["axis_state_label"].is_null());
     }
 }
+
+#[cfg(test)]
+#[path = "trial_tests.rs"]
+pub(crate) mod trial_tests;

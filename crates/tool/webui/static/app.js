@@ -1,6 +1,10 @@
 // Copyright The eha-sdk Contributors
 
 import { createTelemetryChart, selectedContactGuidance } from "./telemetry.js";
+import { createConfigEditor } from "./config-editor.js";
+import { createTrialUi } from "./trial-ui.js";
+import { createRecordingUi } from "./recording-ui.js";
+import { trialState } from "./trial-state.js";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -19,12 +23,16 @@ let snapshotReady = false;
 let unavailableSince = false;
 let sessionRevision = 0;
 let activeTransport = "usb";
+let activeCanNode = null;
 let sessions = { usb:null, can:null };
+let canNodes = [];
+let canScanNodes = [];
+let groupNodes = [];
 const viewStates = { usb:null, can:null };
 const connectionFormSources = { usb:null, can:null };
 const discovering = new Set();
 let localControlSubmission = null;
-let configDraft = { dirty:false, source:null };
+let configDraft = { dirty:false, source:null, baseline:"" };
 let operationKeySource = null;
 let operationKeyManual = false;
 let renderedDiagnostics;
@@ -33,10 +41,18 @@ const chartController = createTelemetryChart({
   container: $("#telemetry-chart"), summary: $("#chart-summary"), empty: $("#chart-empty"),
   pauseButton: $("#chart-pause"), clearButton: $("#chart-clear"), windowSelect: $("#chart-window"),
 });
+const configEditor = createConfigEditor({
+  get,
+  sourceKey: () => sourceKey(),
+  onChange: (raw, source, baseline) => { configDraft = { ...configDraft, dirty:true, source:source === undefined ? configDraft.source : source, warning:null, raw, ...(baseline !== undefined ? { baseline } : {}) }; updateDraftState(); },
+});
+const trialUi = createTrialUi({ run, activeTransport: () => activeTransport });
+const recordingUi = createRecordingUi({ get, run, activeTransport: () => activeTransport });
 
 const text = (value, fallback = "—") => value === undefined || value === null || value === "" ? fallback : String(value);
 const json = (value) => JSON.stringify(value, null, 2);
 const transportLabel = (transport) => transport === "can" ? "CAN" : "USB";
+const viewKey = (transport = activeTransport, node = activeCanNode) => transport === "can" ? `can:${node ?? "none"}` : "usb";
 const UNKNOWN_AGE_US = 0xffff_ffff;
 const SATURATED_AGE_US = 0xffff_fffe;
 const NO_CURRENT_TARGET_BLOCKER = 1 << 25;
@@ -164,9 +180,12 @@ function syncConnectionForm(transport, connection) {
   }
   connectionFormSources[transport] = source;
 }
+function sessionForTransport(transport) {
+  return transport === "can" ? canNodes.find((entry) => entry.node === activeCanNode)?.snapshot || sessions.can : sessions[transport];
+}
 function updateConnections() {
   for (const transport of ["usb", "can"]) {
-    const session = sessions[transport];
+    const session = sessionForTransport(transport);
     const disconnected = session?.transport?.disconnected;
     const connected = session?.connected && !disconnected;
     setPill($(`#${transport}-connection-state`), unavailableSince ? "服务不可达" : disconnected ? "连接已断开" : connected ? "已连接" : "未连接", unavailableSince || disconnected ? "error" : connected ? "success" : "idle");
@@ -178,7 +197,13 @@ function updateConnections() {
 function applyResponse(body, odriveEpoch = odriveRequestEpoch) {
   if (!body) return;
   if (body.sessions) sessions = body.sessions;
-  const selected = body.transport === activeTransport ? body.snapshot : body.sessions?.[activeTransport];
+  if (Array.isArray(body.can_nodes)) canNodes = body.can_nodes;
+  if (Array.isArray(body.group_nodes)) groupNodes = body.group_nodes;
+  if (Array.isArray(body.nodes) && body.nodes.some((entry) => entry.snapshot)) canNodes = body.nodes.filter((entry) => Number.isInteger(entry.node)).map((entry) => ({ node:entry.node, snapshot:entry.snapshot, trial:entry.trial, recording:entry.recording, identity:entry.identity }));
+  const responseNode = body.snapshot?.connection?.node ?? body.snapshot?.identity?.active_can_node;
+  if (body.transport === "can" && Number.isInteger(responseNode)) activeCanNode = responseNode;
+  updateCanNodeOptions();
+  const selected = body.transport === activeTransport ? body.snapshot || sessionForTransport(activeTransport) : sessionForTransport(activeTransport);
   update(selected, false, !odriveBusy && odriveEpoch === odriveRequestEpoch);
   updateConnections();
 }
@@ -201,27 +226,32 @@ function updateJourney() {
 }
 function updateActionAvailability() {
   const active = deviceReady(); const locked = busy || !snapshotReady;
+  const trialLocked = trialState(snapshot, canNodes, groupNodes, sessions).live;
   $("#active-transport").disabled = busy;
+  $("#active-can-node").disabled = busy;
   for (const transport of ["usb", "can"]) {
-    const session = sessions[transport];
+    const session = sessionForTransport(transport);
     const held = Boolean(session?.connected);
     const pending = discovering.has(transport);
-    setDisabled(`#${transport}-connection-form input, #${transport}-connection-form select`, busy || held || pending);
-    setDisabled(`#discover-${transport}`, busy || held || pending);
-    setDisabled(`#connect-${transport}`, locked || held || pending);
-    setDisabled(`#reconnect-${transport}`, locked || !session?.connection || (held && !session.transport?.disconnected));
-    setDisabled(`#disconnect-${transport}`, locked || !held);
+    setDisabled(`#${transport}-connection-form input, #${transport}-connection-form select`, busy || held || pending || trialLocked);
+    setDisabled(`#discover-${transport}`, busy || held || pending || trialLocked);
+    setDisabled(`#connect-${transport}`, locked || held || pending || trialLocked);
+    setDisabled(`#reconnect-${transport}`, locked || !session?.connection || (held && !session.transport?.disconnected) || trialLocked);
+    setDisabled(`#disconnect-${transport}`, locked || !held || trialLocked);
   }
   setDisabled("button[data-action], .command-form button, [data-stop-control], #save-config, #restore-factory, #reset-application, #enter-update", locked || !active);
   const heartbeat = snapshot?.heartbeat || {};
   setDisabled('[data-action="heartbeat_start"]', locked || !active || heartbeat.enabled);
   setDisabled('[data-action="heartbeat_stop"]', locked || !active || !heartbeat.enabled);
-  setDisabled("#validate-config", busy);
+  setDisabled("#validate-config", busy || trialLocked);
   setDisabled("#discover-odrive, #read-odrive, #odrive-serial", busy || odriveBusy || discovering.has("odrive"));
   $("#operation-key").disabled = busy || !active;
   const hasOperationKey = Boolean($("#operation-key").value.trim());
-  setDisabled("#query-result, #release-result", locked || !active || !hasOperationKey);
-  $("#config-record").disabled = busy;
+  setDisabled("#query-result, #release-result", locked || !active || !hasOperationKey || trialLocked);
+  $("#config-record").disabled = busy || trialLocked;
+  setDisabled("#config-import, #config-export", busy || trialLocked);
+  setDisabled("#config-fields input, #config-fields select, #save-config, #restore-factory, #reset-application, #enter-update, [data-action=\"config_read\"]", busy || trialLocked || !active);
+  setDisabled("#can-scan-start, #can-scan-end, #can-scan-nodes, #can-connect-nodes, #can-scan-results input", busy || trialLocked);
   const stopLabel = `停止 ${transportLabel(activeTransport)} 控制`;
   $$('[data-stop-label]').forEach((target) => { target.textContent = stopLabel; });
   $$('[data-stop-control]').forEach((target) => { target.setAttribute("aria-label", stopLabel); });
@@ -298,7 +328,7 @@ function actionLabel(action) {
 }
 function renderOperationSummary(body, fallback, state = "success") {
   const data = body.error || body.result || body.data;
-  if (!data && !body.message) return;
+  if (!data && !body.message && body.ok === undefined) return;
   const resultBody = body.result || body;
   const action = resultBody.action || fallback.replace(/^(USB|CAN) · /, "");
   const unknown = Boolean(body.unknown || body.error?.unknown);
@@ -340,6 +370,7 @@ function showResult(body, label, state = "success") {
   if (body.error) result.textContent = json(body.error);
   else if (body.result) result.textContent = json(body.result);
   else if (body.data) result.textContent = json(body.data);
+  else if (body.results || body.nodes || body.trial || body.recording) result.textContent = json(body.results || body.nodes || body.trial || body.recording);
   const key = body.operation_key || body.result?.operation_key;
   if (key) setOperationKey(key, body.snapshot || snapshot, body.transport || activeTransport);
   const action = body.result?.action;
@@ -348,9 +379,9 @@ function showResult(body, label, state = "success") {
     const record = $("#config-record");
     const overwrite = action !== "config_read" || !configDraft.dirty || !record.value || window.confirm("当前草稿已有未保存修改。读取的配置将覆盖它，是否继续？");
     if (overwrite) {
-      const formatted = formattedRecord(config.data_utf8);
-      record.value = formatted.text;
-      configDraft = { dirty:false, source:sourceKey(body.snapshot || snapshot), view:config.view, viewLabel:action === "restore_factory" ? "已恢复出厂并读回用户配置" : config.view_label, warning:formatted.warning };
+      record.value = config.data_utf8;
+      configDraft = { dirty:false, source:sourceKey(body.snapshot || snapshot), view:config.view, viewLabel:action === "restore_factory" ? "已恢复出厂并读回用户配置" : config.view_label, warning:null, baseline:config.data_utf8 };
+      configEditor.setDocument(config.data_utf8, configDraft.source, configDraft.baseline);
       updateDraftState();
     }
   }
@@ -360,8 +391,8 @@ function sessionReady(session) {
   return Boolean(session?.connected && !session.transport?.disconnected);
 }
 function selectConnectedTransport(path, transport, body) {
-  if (!body?.ok || transport === activeTransport || !["/api/connect", "/api/reconnect"].includes(path) || !sessionReady(sessions[transport])) return null;
-  if (sessionReady(sessions[activeTransport])) {
+  if (!body?.ok || transport === activeTransport || !["/api/connect", "/api/reconnect"].includes(path) || !sessionReady(sessionForTransport(transport))) return null;
+  if (sessionReady(sessionForTransport(activeTransport))) {
     return `${transportLabel(transport)} 已连接并核对身份；当前操作通路仍为 ${transportLabel(activeTransport)}，如需经 ${transportLabel(transport)} 操作，请在页首选择该通路。`;
   }
   selectTransport(transport, { force:true, announce:false });
@@ -372,13 +403,16 @@ async function run(path, payload, label) {
   const transport = payload.transport || activeTransport;
   const odriveEpoch = odriveRequestEpoch;
   payload = { ...payload, transport };
+  if (transport === "can" && payload.node === undefined && !["/api/group", "/api/can/scan", "/api/can/connect"].includes(path) && Number.isInteger(activeCanNode)) payload.node = activeCanNode;
   label = `${transportLabel(transport)} · ${label}`;
   sessionRevision++;
   setBusy(true);
   setNotice(`${label}…`, "is-working");
-  renderOperationSummary({ transport, data:{}, result:{ action:payload.action || label.split(" · ")[1] } }, label, "working");
+  renderOperationSummary({ transport, data:{}, result:{ action:path === "/api/action" ? payload.action : label.split(" · ")[1] } }, label, "working");
   try {
     const body = await post(path, payload);
+    body.transport ??= transport;
+    if (transport === "can" && Number.isInteger(payload.node)) activeCanNode = payload.node;
     applyResponse(body, odriveEpoch);
     const connectionNotice = selectConnectedTransport(path, transport, body);
     if (["position", "velocity", "force", "impedance", "stop"].includes(payload.action) && body.result?.local_submission) {
@@ -391,6 +425,7 @@ async function run(path, payload, label) {
     }
     showResult(body, label);
     setNotice(connectionNotice || `${label}：${body.message || "已完成。"}`, body.unknown ? "is-warning" : "");
+    return body;
   } catch (error) {
     const detail = error.detail;
     if (["position", "velocity", "force", "impedance", "stop"].includes(payload.action)) localControlSubmission = null;
@@ -403,6 +438,7 @@ async function run(path, payload, label) {
     if (detail?.operation_key) setOperationKey(detail.operation_key, detail.snapshot || snapshot, transport);
     const network = !detail;
     setNotice(network ? `${label}未得到服务响应；未判断是否提交或执行，请先恢复服务后查看事实。` : detail.unknown ? `${label}结果未知：${error.message}；保留操作键后只读查询。` : `${label}失败：${error.message}`, network || detail?.unknown ? "is-warning" : "is-error");
+    return null;
   } finally {
     setBusy(false);
   }
@@ -507,6 +543,7 @@ function renderOdriveResponse(response) {
 function update(nextSnapshot, cached = false, renderOdrive = true) {
   if (!nextSnapshot) return;
   snapshot = nextSnapshot;
+  if (snapshot.connection?.transport === "usb" && snapshot.trial) sessions.usb = { ...sessions.usb, trial:snapshot.trial };
   if (!cached) {
     snapshotReady = true;
     const recovered = unavailableSince;
@@ -547,6 +584,9 @@ function update(nextSnapshot, cached = false, renderOdrive = true) {
   }
   renderH723Driver(telemetry, connectionInactive);
   chartController.update(snapshot);
+  configEditor.sourceChanged();
+  trialUi.update(snapshot, canNodes, groupNodes, sessions);
+  recordingUi.update(snapshot, trialState(snapshot, canNodes, groupNodes, sessions).live);
   facts($("#control-submission"), localControlSubmission ? [["模式", actionLabel(localControlSubmission.action)], ["参数", localControlSubmission.parameters], ["本地提交", localControlSubmission.boundary]] : [], "尚未对当前运行实例提交控制目标。");
   facts($("#control-adoption"), [["数据状态", cacheExpired ? "最后缓存，已过期" : undefined], ["目标模式", telemetry?.target_mode_label ?? telemetry?.target_mode], ["目标参数", targetValues(telemetry?.target_mode, telemetry?.target_values)], ["控制来源", telemetry?.target_ingress_label ?? telemetry?.target_ingress], ["采用阻塞项", telemetry?.[`${snapshot.connection?.transport}_adoption_blocker_labels`] ?? (snapshot.connection?.transport === "usb" ? telemetry?.usb_adoption_blocker_labels : telemetry?.can_adoption_blocker_labels)], ["输出允许", outputAllowed], ["输出阻塞项", telemetry?.output_blocker_labels ?? telemetry?.output_blockers], ["驱动状态", telemetry?.driver_summary?.axis_state_label], ["最后本地提交转速（rpm）", telemetry?.last_submitted_rpm ? [submittedRpm.label, submittedRpmAge && `距今 ${submittedRpmAge}`, "不是实际测得转速"].filter(Boolean).join("；") : undefined]], "等待当前运行实例的遥测。");
   const heartbeat = snapshot.heartbeat || {};
@@ -618,20 +658,36 @@ async function discoverDevices(transport, announce = true) {
     updateActionAvailability();
   }
 }
-function selectTransport(transport, { force = false, announce = true } = {}) {
-  if ((busy && !force) || transport === activeTransport) return false;
-  viewStates[activeTransport] = {
+function updateCanNodeOptions() {
+  const select = $("#active-can-node"); const control = $("#active-can-node-control"); control.hidden = activeTransport !== "can";
+  const nodes = new Map();
+  for (const entry of canNodes) if (Number.isInteger(entry.node)) nodes.set(entry.node, entry);
+  const connectedNode = sessions.can?.connection?.node ?? snapshot?.connection?.node;
+  if (Number.isInteger(connectedNode) && !nodes.has(connectedNode)) nodes.set(connectedNode, { node:connectedNode, snapshot:sessions.can || snapshot });
+  if (activeCanNode === null && nodes.size) activeCanNode = [...nodes.keys()][0];
+  const previous = activeCanNode; select.replaceChildren();
+  if (!nodes.size) select.add(new Option("等待已连接节点", ""));
+  for (const [node, entry] of nodes) select.add(new Option(`节点 ${node}${entry.snapshot?.connected ? "" : "（未就绪）"}`, String(node)));
+  select.value = previous === null ? "" : String(previous);
+}
+function selectTransport(transport, { force = false, announce = true, node = activeCanNode } = {}) {
+  if ((busy && !force) || (transport === activeTransport && !force)) return false;
+  const priorKey = viewKey();
+  viewStates[priorKey] = {
     record:$("#config-record").value, configDraft, operationKey:$("#operation-key").value,
     operationKeySource, operationKeyManual, keyState:$("#operation-key-state").textContent, localControlSubmission,
     controlMode:$("input[name=control-mode]:checked").value,
     controlValues:$$(".command-form input").map((input) => input.value),
   };
   activeTransport = transport;
+  if (transport === "can") activeCanNode = Number.isInteger(node) ? node : null;
   $("#active-transport").value = transport;
   sessionRevision++;
-  const view = viewStates[transport];
+  updateCanNodeOptions();
+  const view = viewStates[viewKey()];
   $("#config-record").value = view?.record || "";
-  configDraft = view?.configDraft || { dirty:false, source:null };
+  configDraft = view?.configDraft || { dirty:false, source:null, baseline:"" };
+  configEditor.setDocument($("#config-record").value, configDraft.source, configDraft.baseline || "");
   $("#operation-key").value = view?.operationKey || "";
   operationKeySource = view?.operationKeySource || null;
   operationKeyManual = view?.operationKeyManual || false;
@@ -641,14 +697,42 @@ function selectTransport(transport, { force = false, announce = true } = {}) {
   $('input[name=control-mode][value="' + mode + '"]').checked = true;
   $$(".command-form input").forEach((input, index) => { input.value = view?.controlValues?.[index] || ""; });
   selectControlMode();
-  chartController.selectTransport(transport);
-  update(sessions[transport] || { connected:false }, true, false);
+  chartController.selectTransport(viewKey());
+  const selectedSession = sessionForTransport(transport);
+  update(selectedSession || { connected:false }, true, false);
   if (!snapshotReady) chartController.unavailable();
   updateActionAvailability();
-  if (announce) setNotice("当前操作通路：" + transportLabel(transport) + "。连接与心跳分别保留；后续请求发送到此通路。");
+  if (announce) setNotice(`当前操作通路：${transportLabel(transport)}${transport === "can" && activeCanNode !== null ? ` 节点 ${activeCanNode}` : ""}。连接与心跳分别保留；后续请求发送到此通路。`);
   return true;
 }
+function selectedCanScanNodes() { return $$("#can-scan-results input:checked").map((input) => Number(input.value)); }
+function renderCanScanResults(errors = []) {
+  const root = $("#can-scan-results"); root.replaceChildren();
+  if (!canScanNodes.length && !errors.length) { root.textContent = "未发现可识别的节点。"; return; }
+  for (const entry of canScanNodes) {
+    const label = document.createElement("label"); const input = document.createElement("input"); input.type = "checkbox"; input.value = entry.node; input.checked = true;
+    label.append(input, document.createTextNode(`节点 ${entry.node} · ${entry.identity?.uid || entry.identity?.serial || "已读取 Identity"}`)); root.append(label);
+  }
+  for (const entry of errors) { const line = document.createElement("p"); line.className = "helper is-warning"; line.textContent = `节点 ${entry.node}：${entry.message}`; root.append(line); }
+}
+async function scanCanNodes() {
+  const port = $("#can-port").value; const profile = $("#can-connection-form select[name=profile]").value;
+  const start_node = Number($("#can-scan-start").value); const end_node = Number($("#can-scan-end").value);
+  if (!port) return setNotice("请先选择 CAN 适配器路径。", "is-error");
+  if (!Number.isInteger(start_node) || !Number.isInteger(end_node) || start_node < 0 || end_node > 127 || start_node > end_node) return setNotice("扫描范围必须是 0 至 127 的递增整数。", "is-error");
+  const body = await run("/api/can/scan", { transport:"can", port, profile, start_node, end_node }, "扫描 CAN 节点");
+  if (!body) return;
+  canScanNodes = (body.nodes || []).filter((entry) => Number.isInteger(entry.node)); renderCanScanResults(body.errors || []);
+}
+async function connectCanNodes() {
+  const port = $("#can-port").value; const profile = $("#can-connection-form select[name=profile]").value; const nodes = selectedCanScanNodes();
+  if (!port) return setNotice("请先选择 CAN 适配器路径。", "is-error");
+  if (!nodes.length) return setNotice("至少选择一个已扫描节点。", "is-error");
+  const body = await run("/api/can/connect", { transport:"can", port, profile, nodes }, "连接所选 CAN 节点");
+  if (body?.errors?.length) renderCanScanResults(body.errors);
+}
 $("#active-transport").addEventListener("change", (event) => selectTransport(event.target.value));
+$("#active-can-node").addEventListener("change", (event) => { const node = Number(event.target.value); if (Number.isInteger(node)) selectTransport("can", { force:true, node }); });
 for (const transport of ["usb", "can"]) {
   $("#" + transport + "-connection-form").addEventListener("submit", (event) => {
     event.preventDefault();
@@ -662,13 +746,15 @@ for (const transport of ["usb", "can"]) {
     if (!port) return setNotice("请先从列表选择 CAN 适配器路径。", "is-error");
     const rawNode = String(values.get("node") ?? "").trim();
     const node = Number(rawNode);
-    if (!rawNode || !Number.isInteger(node) || node < 0 || node > 255) return setNotice("Customer CAN 节点号必须为 0 至 255 的整数。", "is-error");
+    if (!rawNode || !Number.isInteger(node) || node < 0 || node > 127) return setNotice("Customer CAN 节点号必须为 0 至 127 的整数。", "is-error");
     run("/api/connect", { transport, port, node, profile:values.get("profile") }, "连接并核对身份");
   });
   $("#disconnect-" + transport).addEventListener("click", () => run("/api/disconnect", { transport }, "关闭本地连接"));
   $("#reconnect-" + transport).addEventListener("click", () => run("/api/reconnect", { transport }, "重新连接"));
   $("#discover-" + transport).addEventListener("click", () => discoverDevices(transport));
 }
+$("#can-scan-nodes").addEventListener("click", scanCanNodes);
+$("#can-connect-nodes").addEventListener("click", connectCanNodes);
 $$("button[data-action]").forEach((button) => button.addEventListener("click", () => command(button.dataset.action, button.dataset.view ? { view:button.dataset.view } : {})));
 $$(".command-form").forEach((form) => form.addEventListener("submit", (event) => { event.preventDefault(); try { const action = form.dataset.command; const fields = action === "position" ? { mm:number(form, "mm") } : action === "velocity" ? { mm_s:number(form, "mm_s") } : action === "force" ? { n:number(form, "n") } : { equilibrium_mm:number(form, "equilibrium_mm"), stiffness_n_per_mm:number(form, "stiffness_n_per_mm"), damping_ns_per_mm:number(form, "damping_ns_per_mm") }; localControlSubmission = null; facts($("#control-submission"), [], "正在等待本地提交结果。"); command(action, fields); } catch (error) { setNotice(error.message, "is-error"); } }));
 $$("[data-stop-control]").forEach((button) => button.addEventListener("click", () => command("stop")));
@@ -810,7 +896,8 @@ async function refresh() {
   if (busy) return;
   const revision = sessionRevision;
   const odriveEpoch = odriveRequestEpoch;
-  const query = `?transport=${activeTransport}${chartController.cursor === null ? "" : `&after=${encodeURIComponent(chartController.cursor)}`}`;
+  const node = activeTransport === "can" && Number.isInteger(activeCanNode) ? `&node=${encodeURIComponent(activeCanNode)}` : "";
+  const query = `?transport=${activeTransport}${node}${chartController.cursor === null ? "" : `&after=${encodeURIComponent(chartController.cursor)}`}`;
   try {
     const body = await get(`/api/snapshot${query}`, { timeout:5000 });
     if (revision === sessionRevision) applyResponse(body, odriveEpoch);
@@ -821,6 +908,8 @@ async function poll() {
   window.setTimeout(poll, 250);
 }
 updateActionAvailability();
+void configEditor.loadSchema();
+void recordingUi.refresh();
 poll();
 void discoverDevices("usb", false);
 void discoverDevices("can", false);

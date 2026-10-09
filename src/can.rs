@@ -29,6 +29,10 @@ use transport::can::{
 
 use crate::host::backend::{Backend, Event, EventSink, Pump, SendRequest};
 
+mod network;
+
+pub use network::{CanNetwork, CanNetworkStatus, CanNodeConnector};
+
 const SERIAL_TIMEOUT: Duration = Duration::from_millis(2);
 const ADAPTER_QUERY_TIMEOUT: Duration = Duration::from_millis(500);
 const MAX_SLCAN_LINE: usize = 256;
@@ -1323,5 +1327,238 @@ mod tests {
             "backend close must not append SLCAN C command: {}",
             escaped(tail)
         );
+    }
+
+    #[test]
+    fn network_routes_interleaved_frames_to_their_own_nodes() {
+        let mut routes = super::network::Routes::new();
+        routes.attach(3).expect("first node attaches");
+        routes.attach(91).expect("second node attaches");
+
+        assert_eq!(routes.recipient(0x00c0_0000), Some(3));
+        assert_eq!(routes.recipient(0x16c0_0000), Some(91));
+        assert_eq!(routes.recipient(0x00c0_0001), Some(3));
+        assert_eq!(routes.recipient(0x0040_0000), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn network_shares_one_serial_owner_and_reopens_a_retired_node() {
+        use std::{
+            io::{ErrorKind, Read},
+            sync::{Arc, Mutex, mpsc},
+            time::Instant,
+        };
+
+        use serialport::{SerialPort, TTYPort};
+
+        let (mut master, slave) = TTYPort::pair().expect("pseudo serial pair opens");
+        master
+            .set_timeout(Duration::from_millis(10))
+            .expect("master timeout configures");
+        let port = slave.name().expect("pseudo serial path exists");
+        let lines = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let seen = Arc::clone(&lines);
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let responder = std::thread::spawn(move || {
+            let mut line = Vec::new();
+            let mut byte = [0_u8; 1];
+            loop {
+                match master.read(&mut byte) {
+                    Ok(0) => continue,
+                    Ok(_) if byte[0] == b'\r' => {
+                        if line == b"V" {
+                            master
+                                .write_all(b"b158aa7 github.com/normaldotcom/canable2.git\r")
+                                .expect("adapter identifies itself");
+                            master.flush().expect("identity flushes");
+                        } else if line.first() == Some(&b'B') {
+                            seen.lock().expect("lines lock").push(line.clone());
+                        }
+                        line.clear();
+                    }
+                    Ok(_) => line.push(byte[0]),
+                    Err(error)
+                        if matches!(error.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+                    {
+                        if stop_rx.try_recv().is_ok() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+
+        let network =
+            CanNetwork::new(port, ExternalCanProfile::Fd1M5M).expect("one SLCAN owner opens");
+        drop(slave);
+        let node_three = network.node(3).expect("valid first node");
+        let node_ninety_one = network.node(91).expect("valid second node");
+        let first = node_three.open().expect("first endpoint opens");
+        let second = node_ninety_one.open().expect("second endpoint opens");
+        let position = protocol::Message::Position(1.25);
+        let mut bytes = vec![0; position.encoded_len().expect("position length")];
+        protocol::encode(position, &mut bytes).expect("position encodes");
+        first
+            .tx
+            .send(crate::host::backend::Command::Send(SendRequest {
+                id: 11,
+                bytes: bytes.clone(),
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }))
+            .expect("first request reaches node worker");
+        second
+            .tx
+            .send(crate::host::backend::Command::Send(SendRequest {
+                id: 12,
+                bytes,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }))
+            .expect("second request reaches node worker");
+
+        wait_for_submission(&first, 11);
+        wait_for_submission(&second, 12);
+        drop(first);
+        let reopened = node_three.open().expect("retired node immediately reopens");
+        let position = protocol::Message::Position(2.5);
+        let mut bytes = vec![0; position.encoded_len().expect("position length")];
+        protocol::encode(position, &mut bytes).expect("position encodes");
+        reopened
+            .tx
+            .send(crate::host::backend::Command::Send(SendRequest {
+                id: 13,
+                bytes,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }))
+            .expect("reopened request reaches node worker");
+        wait_for_submission(&reopened, 13);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lines.lock().expect("lines lock").len() < 3 {
+            assert!(Instant::now() < deadline, "three CAN frames are written");
+            std::thread::yield_now();
+        }
+        let identifiers = lines
+            .lock()
+            .expect("lines lock")
+            .iter()
+            .map(|line| parse_hex(&line[1..9]).expect("encoded identifier") as u32)
+            .collect::<Vec<_>>();
+        assert!(identifiers.iter().any(|id| (id >> 22) == 3));
+        assert!(identifiers.iter().any(|id| (id >> 22) == 91));
+        let reopened_id = identifiers
+            .iter()
+            .rev()
+            .find(|id| (**id >> 22) == 3)
+            .copied()
+            .expect("reopened node sends a frame");
+        assert_eq!(
+            (reopened_id >> 12) & 0x7f,
+            1,
+            "node keeps transfer-id guard state"
+        );
+
+        network
+            .inject_transport_fault_for_test()
+            .expect("pseudo adapter fault isolates the network");
+        wait_for_network_status(&network, |status| {
+            matches!(status, CanNetworkStatus::Terminated { .. })
+        });
+        network
+            .recover()
+            .expect("explicit recover reopens the pseudo adapter");
+        assert_eq!(network.status(), CanNetworkStatus::Active);
+        let recovered = node_three
+            .open()
+            .expect("only the user-selected node reattaches after recover");
+        let position = protocol::Message::Position(3.75);
+        let mut bytes = vec![0; position.encoded_len().expect("position length")];
+        protocol::encode(position, &mut bytes).expect("position encodes");
+        recovered
+            .tx
+            .send(crate::host::backend::Command::Send(SendRequest {
+                id: 14,
+                bytes,
+                deadline: Instant::now() + Duration::from_secs(1),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }))
+            .expect("recovered request reaches node worker");
+        wait_for_submission(&recovered, 14);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while lines.lock().expect("lines lock").len() < 4 {
+            assert!(Instant::now() < deadline, "recovered CAN frame is written");
+            std::thread::yield_now();
+        }
+        let identifiers = lines
+            .lock()
+            .expect("lines lock")
+            .iter()
+            .map(|line| parse_hex(&line[1..9]).expect("encoded identifier") as u32)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identifiers.iter().filter(|id| (**id >> 22) == 91).count(),
+            1,
+            "unselected node stays disconnected after explicit recover"
+        );
+        let recovered_id = identifiers
+            .last()
+            .copied()
+            .expect("recovered node sends a frame");
+        assert_eq!(recovered_id >> 22, 3);
+        assert_eq!(
+            (recovered_id >> 12) & 0x7f,
+            2,
+            "explicit recover preserves the selected node transfer-id guard"
+        );
+
+        drop(reopened);
+        drop(second);
+        drop(recovered);
+        drop(network);
+        let _ = stop_tx.send(());
+        responder.join().expect("pseudo adapter exits");
+    }
+
+    #[cfg(unix)]
+    fn wait_for_submission(backend: &Backend, id: u64) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let (lock, cv) = &*backend.sink.0;
+            let inbox = lock.lock().expect("event inbox available");
+            if inbox
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Submitted(found) if *found == id))
+            {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!remaining.is_zero(), "request {id} is locally submitted");
+            drop(
+                cv.wait_timeout(inbox, remaining.min(Duration::from_millis(10)))
+                    .expect("event wait available")
+                    .0,
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_for_network_status(network: &CanNetwork, expected: impl Fn(&CanNetworkStatus) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = network.status();
+            if expected(&status) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "network reaches expected status, got {status:?}"
+            );
+            std::thread::yield_now();
+        }
     }
 }

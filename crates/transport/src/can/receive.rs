@@ -70,6 +70,12 @@ struct RxLaneReconnectState {
 }
 
 impl<'a> Receiver<'a> {
+    /// 返回此接收器当前接受的通信世代。
+    #[must_use]
+    pub const fn generation(&self) -> u32 {
+        self.generation
+    }
+
     /// 以调用方提供的固定缓冲构造接收器。
     pub fn new(
         node: u8,

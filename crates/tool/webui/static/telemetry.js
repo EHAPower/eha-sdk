@@ -97,27 +97,32 @@ export function seriesWindow(points, seconds, hz) {
   const gapUs = Number.isFinite(hz) && hz > 0 ? 2.5e6 / hz : 1_000_000;
   let gaps = 0;
   const series = CHANNELS.map(({ id }) => ({ id, data: [] }));
+  const targets = CHANNELS.map(({ id }) => ({ id:`${id}-target`, data: [] }));
   let previous;
   for (const point of visible) {
     const x = point.time_us / 1e6;
     if (previous && (point.gap || point.time_us - previous.time_us > gapUs)) {
       // 仅插入缺失标记，不插值、不伪造量测。使用间隙中点避免吞掉其两端实测值。
       const gapX = (point.time_us + previous.time_us) / 2e6;
-      for (const entry of series) entry.data.push([gapX, null]);
+      for (const entry of [...series, ...targets]) entry.data.push([gapX, null]);
       gaps++;
     }
     for (const [index, channel] of CHANNELS.entries()) series[index].data.push([x, plotValue(point[channel.id])]);
+    const target = Array.isArray(point.target_values) ? point.target_values : [];
+    targets[0].data.push([x, point.target_mode === 1 || point.target_mode === 4 ? plotValue({ value:target[0], result:1, quality:1, stale:false }) : null]);
+    targets[1].data.push([x, point.target_mode === 2 ? plotValue({ value:target[0], result:1, quality:1, stale:false }) : null]);
+    targets[2].data.push([x, point.target_mode === 3 ? plotValue({ value:target[0], result:1, quality:1, stale:false }) : null]);
     previous = point;
   }
-  return { series, min, max: Math.max(max, min + 0.1), count: visible.length, gaps };
+  return { series, targets, min, max: Math.max(max, min + 0.1), count: visible.length, gaps };
 }
 
 const formatNumber = (value) => Number(value).toLocaleString("zh-CN", { maximumFractionDigits: 3 });
 
 export function createTelemetryChart({ container, summary, empty, pauseButton, clearButton, windowSelect }) {
-  const views = { usb:{ history:new TelemetryHistory(), paused:null }, can:{ history:new TelemetryHistory(), paused:null } };
+  const views = new Map([["usb", { history:new TelemetryHistory(), paused:null }]]);
   let transport = "usb";
-  let history = views.usb.history;
+  let history = views.get("usb").history;
   let chart;
   let paused = null;
   let snapshot;
@@ -152,8 +157,9 @@ export function createTelemetryChart({ container, summary, empty, pauseButton, c
           if (!params.length) return "";
           const lines = [`运行后 ${formatNumber(params[0].value[0])} s`];
           for (const item of params) {
-            const channel = CHANNELS.find((entry) => entry.id === item.seriesId);
-            lines.push(`${channel.name}：${item.value[1] === null ? "无有效量测" : `${formatNumber(item.value[1])} ${channel.unit}`}`);
+            const channel = CHANNELS.find((entry) => item.seriesId === entry.id || item.seriesId === `${entry.id}-target`);
+            const label = item.seriesId === "position-target" ? "固件目标 / 平衡位置" : item.seriesId?.endsWith("-target") ? `${channel?.name || item.seriesName}固件目标` : channel?.name || item.seriesName;
+            lines.push(`${label}：${item.value[1] === null ? "无有效量测" : `${formatNumber(item.value[1])} ${channel?.unit || ""}`}`);
           }
           return lines.join("\n");
         },
@@ -171,12 +177,16 @@ export function createTelemetryChart({ container, summary, empty, pauseButton, c
         axisLabel: { color: text, hideOverlap: true, formatter: formatNumber },
         splitLine: { lineStyle: { color: border } },
       })),
-      series: CHANNELS.map((channel, index) => ({
+      series: CHANNELS.flatMap((channel, index) => [{
         id: channel.id, name: channel.name, type: "line", xAxisIndex: index, yAxisIndex: index,
         showSymbol: true, symbol: "circle", symbolSize: 3, connectNulls: false, smooth: false,
         itemStyle: { color: style.getPropertyValue(channel.color).trim() }, lineStyle: { width: 1.5 },
         emphasis: { disabled: true },
-      })),
+      }, {
+        id: `${channel.id}-target`, name: channel.id === "position" ? "固件目标 / 平衡位置" : `${channel.name}固件目标`, type: "line", xAxisIndex: index, yAxisIndex: index,
+        showSymbol: false, connectNulls: false, smooth: false, lineStyle: { width: 1.2, type:"dashed", opacity:.85 },
+        itemStyle: { color: style.getPropertyValue(channel.color).trim() }, emphasis: { disabled:true },
+      }]),
     };
   }
 
@@ -207,7 +217,7 @@ export function createTelemetryChart({ container, summary, empty, pauseButton, c
     if (renderedRevision !== displayRevision) {
       chart.setOption({
         xAxis: CHANNELS.map(({ id }) => ({ id, min: view.min, max: view.max })),
-        series: view.series,
+        series: CHANNELS.flatMap((channel, index) => [view.series[index], view.targets[index]]),
       }, { lazyUpdate: true });
       renderedRevision = displayRevision;
     }
@@ -233,10 +243,11 @@ export function createTelemetryChart({ container, summary, empty, pauseButton, c
     get cursor() { return history.cursor; },
     selectTransport(next) {
       if (next === transport) return;
-      views[transport].paused = paused;
+      views.get(transport).paused = paused;
       transport = next;
-      history = views[next].history;
-      paused = views[next].paused;
+      if (!views.has(next)) views.set(next, { history:new TelemetryHistory(), paused:null });
+      history = views.get(next).history;
+      paused = views.get(next).paused;
       snapshot = undefined;
       serviceAvailable = null;
       displayRevision++;
