@@ -1,6 +1,6 @@
 // Copyright The eha-sdk Contributors
 
-import { createTelemetryChart, selectedContactGuidance } from "./telemetry.js";
+import { createTelemetryChart, selectedContactGuidance, telemetryReception } from "./telemetry.js";
 import { createConfigEditor } from "./config-editor.js";
 import { createTrialUi } from "./trial-ui.js";
 import { createRecordingUi } from "./recording-ui.js";
@@ -114,7 +114,6 @@ function dismissNotice() {
   window.clearTimeout(noticeTimer);
   const hadFocus = notice.contains(document.activeElement);
   notice.hidden = true;
-  document.documentElement.style.setProperty("--notice-space", "0px");
   if (hadFocus) (noticeReturnFocus?.isConnected && !noticeReturnFocus.disabled && noticeReturnFocus.getClientRects().length ? noticeReturnFocus : $("#main-content")).focus({ preventScroll:true });
 }
 function pauseNotice() {
@@ -148,7 +147,7 @@ notice.addEventListener("mouseleave", resumeNotice);
 notice.addEventListener("focusin", pauseNotice);
 notice.addEventListener("focusout", () => window.setTimeout(resumeNotice, 0));
 notice.addEventListener("keydown", (event) => { if (event.key === "Escape") { event.preventDefault(); dismissNotice(); } });
-// Leave scroll room for the notification and keep keyboard focus above it.
+// Keep a newly focused control above the notification without moving the page when it appears.
 function revealNoticeFocus() {
   const focused = document.activeElement;
   if (notice.hidden || !focused?.matches("input, select, textarea, button, a[href], [tabindex='0']") || notice.contains(focused)) return;
@@ -158,10 +157,6 @@ function revealNoticeFocus() {
     focused.scrollIntoView({ block:"center", behavior:"instant" });
   }
 }
-new ResizeObserver(() => {
-  document.documentElement.style.setProperty("--notice-space", notice.hidden ? "0px" : `${notice.offsetHeight + 40}px`);
-  revealNoticeFocus();
-}).observe(notice);
 document.addEventListener("focusin", revealNoticeFocus);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !event.defaultPrevented && !notice.hidden && !$("#sidebar").classList.contains("open")) {
@@ -580,7 +575,8 @@ function update(nextSnapshot, cached = false, renderOdrive = true) {
   setStatusFact("connection-state", `${transportLabel(activeTransport)} · ${disconnected ? "本地连接已断开" : snapshot.connected ? "已连接" : "未连接"}`, disconnected ? "error" : snapshot.connected ? "success" : "idle");
   const telemetry = snapshot.telemetry;
   const age = telemetry?.received_age_ms;
-  setStatusFact("telemetry-age", connectionInactive ? age === undefined ? disconnected ? "已断连" : "未连接" : `旧数据 ${formatAge(age)}` : age === undefined ? "无遥测" : formatAge(age), connectionInactive ? "idle" : age === undefined ? "idle" : age > 1000 ? "warning" : "success");
+  const reception = telemetryReception(snapshot);
+  setStatusFact("telemetry-age", reception.label, reception.state);
   const values = telemetry?.main_values || [];
   const position = observed(values[0]); const velocity = observed(values[1]); const force = observed(values[4]);
   const submittedRpm = observed(telemetry?.last_submitted_rpm, 2);
@@ -597,7 +593,7 @@ function update(nextSnapshot, cached = false, renderOdrive = true) {
           : targetIdle ? ["无当前目标；另有输出阻塞", "warning"]
             : outputAllowed ? ["允许输出", "success"] : ["输出被禁止", "warning"];
   setStatusFact("firmware-state", firmwareState[0], firmwareState[1]);
-  facts($("#telemetry-values"), [["数据状态", cacheExpired ? "最后缓存，已过期" : undefined], ["接收年龄", age === undefined ? undefined : formatAge(age)], ["位置（mm）", telemetry ? position.label : undefined], ["速度（mm/s）", telemetry ? velocity.label : undefined], ["主要力（N）", telemetry ? force.label : undefined], ["输出允许", outputAllowed], ["输出阻塞项", telemetry?.output_blocker_labels ?? telemetry?.output_blockers], ["最后结束原因", telemetry?.last_end_reason_label ?? telemetry?.last_end_reason], ["未知影响", telemetry?.facts?.unknown_effect], ["Customer CAN 联系", telemetry?.can_contact_label], ["Customer CAN 心跳年龄", ageUsText(telemetry?.can_heartbeat_age_us)], ["USB 联系", telemetry?.usb_contact_label], ["USB 心跳年龄", ageUsText(telemetry?.usb_heartbeat_age_us)]], snapshot.connected && !disconnected ? "尚未收到当前运行实例的新遥测。" : "未连接设备。");
+  facts($("#telemetry-values"), [["数据状态", cacheExpired ? "最后缓存，已过期" : undefined], [connectionInactive ? "缓存距今" : "距最后一帧", age === undefined ? undefined : formatAge(age)], ["位置（mm）", telemetry ? position.label : undefined], ["速度（mm/s）", telemetry ? velocity.label : undefined], ["主要力（N）", telemetry ? force.label : undefined], ["输出允许", outputAllowed], ["输出阻塞项", telemetry?.output_blocker_labels ?? telemetry?.output_blockers], ["最后结束原因", telemetry?.last_end_reason_label ?? telemetry?.last_end_reason], ["未知影响", telemetry?.facts?.unknown_effect], ["Customer CAN 联系", telemetry?.can_contact_label], ["Customer CAN 心跳年龄", ageUsText(telemetry?.can_heartbeat_age_us)], ["USB 联系", telemetry?.usb_contact_label], ["USB 心跳年龄", ageUsText(telemetry?.usb_heartbeat_age_us)]], snapshot.connected && !disconnected ? "尚未收到当前运行实例的新遥测。" : "未连接设备。");
   for (const [name, observation, value] of [["position", position, values[0]], ["velocity", velocity, values[1]], ["force", force, values[4]]]) {
     for (const prefix of ["metric", "live"]) {
       $(`#${prefix}-${name}`).textContent = observation.number === null ? "—" : roundedNumber(observation.number);

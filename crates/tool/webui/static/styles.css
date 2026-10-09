@@ -59,7 +59,6 @@
 
 html {
   scroll-padding-top: calc(var(--topbar) + 72px);
-  scroll-padding-bottom: var(--notice-space, 0px);
   background: var(--bg);
 }
 
@@ -67,7 +66,6 @@ body {
   min-width: 320px;
   min-height: 100vh;
   margin: 0;
-  padding-bottom: var(--notice-space, 0px);
   background: var(--bg);
   color: var(--text);
   font: 14px/1.45 var(--sans);

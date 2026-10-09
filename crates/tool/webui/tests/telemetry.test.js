@@ -1,13 +1,29 @@
 // Copyright The eha-sdk Contributors
 import test from "node:test";
 import assert from "node:assert/strict";
-import { TelemetryHistory, selectedContactGuidance, seriesWindow } from "../static/telemetry.js";
+import { TelemetryHistory, selectedContactGuidance, seriesWindow, telemetryReception } from "../static/telemetry.js";
 
 const good = (value) => ({ value, result: 1, quality: 1, stale: false });
 const point = (cursor, time_us, overrides = {}) => ({ cursor, time_us, sequence: cursor, position: good(cursor), velocity: good(-cursor), force: good(cursor * 10), ...overrides });
 const source = (run_nonce = "a") => ({ connection: { transport: "usb", serial: "fixture" }, uid: "fixture", run_nonce });
 const batch = (points, overrides = {}) => ({ source: source(), points, cursor: points.at(-1)?.cursor ?? 0, reset: false, dropped: 0, ...overrides });
 const identity = { host_contact_max_age_ms: 100 };
+
+test("closed sessions show reception stopped rather than an increasing live age", () => {
+  for (const age of [5, 5000, 60000]) {
+    assert.deepEqual(telemetryReception({ connected:false, telemetry:{ received_age_ms:age } }), { label:"已停止接收", state:"idle" });
+    assert.deepEqual(telemetryReception({ connected:true, transport:{ disconnected:"USB removed" }, telemetry:{ received_age_ms:age } }), { label:"已停止接收", state:"error" });
+  }
+  assert.deepEqual(telemetryReception({ connected:false }), { label:"未连接", state:"idle" });
+});
+
+test("stopping control preserves live telemetry age and warns if new frames stop", () => {
+  const snapshot = (age) => ({ connected:true, telemetry:{ target_mode:0, received_age_ms:age } });
+  assert.deepEqual(telemetryReception(snapshot(5)), { label:"5 ms", state:"success" });
+  assert.deepEqual(telemetryReception(snapshot(2001)), { label:"遥测未更新 · 2001 ms", state:"warning" });
+  assert.deepEqual(telemetryReception(snapshot(3001)), { label:"遥测未更新 · 3001 ms", state:"warning" });
+  assert.deepEqual(telemetryReception({ connected:true }), { label:"等待遥测", state:"idle" });
+});
 
 test("incremental batches preserve every received sample and use actual firmware time", () => {
   const history = new TelemetryHistory();

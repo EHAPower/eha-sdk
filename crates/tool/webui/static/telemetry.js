@@ -8,6 +8,18 @@ const CHANNELS = [
 const MAX_POINTS = 3000;
 const RETAIN_US = 30_000_000;
 
+export function telemetryReception(snapshot = {}) {
+  const disconnected = Boolean(snapshot.transport?.disconnected);
+  if (!snapshot.connected || disconnected) {
+    return { label:snapshot.telemetry ? "已停止接收" : disconnected ? "已断连" : "未连接", state:disconnected ? "error" : "idle" };
+  }
+  const age = snapshot.telemetry?.received_age_ms;
+  if (!Number.isFinite(age) || age < 0) return { label:"等待遥测", state:"idle" };
+  return age > 1000
+    ? { label:`遥测未更新 · ${age} ms`, state:"warning" }
+    : { label:`${age} ms`, state:"success" };
+}
+
 // 只根据当前新鲜遥测提示入口联系，不把本地心跳调度当作固件已经确认联系有效。
 export function selectedContactGuidance(transport, identity, telemetry, heartbeat = {}) {
   const label = transport === "can" ? "CAN" : "USB";
