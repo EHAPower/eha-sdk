@@ -11,28 +11,32 @@ const RETAIN_US = 30_000_000;
 // 只根据当前新鲜遥测提示入口联系，不把本地心跳调度当作固件已经确认联系有效。
 export function selectedContactGuidance(transport, identity, telemetry, heartbeat = {}) {
   const label = transport === "can" ? "CAN" : "USB";
-  if (heartbeat.error) {
+  const maximumAgeMs = identity?.host_contact_max_age_ms;
+  const age = telemetry?.received_age_ms;
+  const heartbeatAgeUs = telemetry?.[`${transport}_heartbeat_age_us`];
+  const hasCurrentContact = Number.isFinite(maximumAgeMs) && maximumAgeMs > 0
+    && Number.isFinite(age) && age >= 0 && age <= maximumAgeMs
+    && telemetry?.[`${transport}_contact`] === 1
+    && Number.isFinite(heartbeatAgeUs) && heartbeatAgeUs >= 0
+    && age + heartbeatAgeUs / 1000 <= maximumAgeMs;
+  if (hasCurrentContact) return null;
+  // `error` is the last scheduler failure, not a live fault. A current firmware contact
+  // above takes precedence; otherwise it remains actionable only while scheduling is enabled.
+  if (heartbeat.enabled && heartbeat.error) {
     return { title:"心跳调度错误", detail:"心跳调度报告错误，查看原始错误和入口新遥测。", link:"查看心跳与控制" };
   }
-  const maximumAgeMs = identity?.host_contact_max_age_ms;
   if (!Number.isFinite(maximumAgeMs) || maximumAgeMs <= 0) {
     return { title:"等待联系条件", detail:`等待当前运行实例的 Identity 与新遥测，再确认 ${label} 联系有效后提交目标。`, link:"查看遥测与控制" };
   }
-  const age = telemetry?.received_age_ms;
   if (!Number.isFinite(age) || age < 0 || age > maximumAgeMs) {
     return heartbeat.enabled
       ? { title:"等待入口联系", detail:`心跳已调度；等待当前运行实例的新遥测，再确认 ${label} 联系有效后提交目标。`, link:"查看遥测与控制" }
       : { title:"等待当前遥测", detail:`等待当前运行实例的新遥测，再判断 ${label} 入口联系与控制条件。`, link:"查看遥测与控制" };
   }
-  if (telemetry[`${transport}_contact`] === 1) {
-    const heartbeatAgeUs = telemetry[`${transport}_heartbeat_age_us`];
-    if (!Number.isFinite(heartbeatAgeUs) || heartbeatAgeUs < 0) {
-      return { title:"等待入口联系", detail:`当前 ${label} 联系曾报告有效，但缺少可用的心跳年龄；等待新遥测后再提交目标。`, link:"查看遥测与控制" };
-    }
-    if (age + heartbeatAgeUs / 1000 > maximumAgeMs) {
-      return { title:"等待入口联系", detail:`上次反馈已不足确认当前 ${label} 联系；等待新遥测后再提交目标。`, link:"查看遥测与控制" };
-    }
-    return null;
+  if (telemetry?.[`${transport}_contact`] === 1) {
+    return !Number.isFinite(heartbeatAgeUs) || heartbeatAgeUs < 0
+      ? { title:"等待入口联系", detail:`当前 ${label} 联系曾报告有效，但缺少可用的心跳年龄；等待新遥测后再提交目标。`, link:"查看遥测与控制" }
+      : { title:"等待入口联系", detail:`上次反馈已不足确认当前 ${label} 联系；等待新遥测后再提交目标。`, link:"查看遥测与控制" };
   }
   return heartbeat.enabled
     ? { title:"等待入口联系", detail:`心跳已调度；等待固件报告 ${label} 联系有效后再提交目标。`, link:"查看心跳与控制" }

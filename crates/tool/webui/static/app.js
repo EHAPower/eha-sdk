@@ -614,8 +614,9 @@ function update(nextSnapshot, cached = false, renderOdrive = true) {
   facts($("#control-submission"), localControlSubmission ? [["模式", actionLabel(localControlSubmission.action)], ["参数", localControlSubmission.parameters], ["本地提交", localControlSubmission.boundary]] : [], "尚未对当前运行实例提交控制目标。");
   facts($("#control-adoption"), [["数据状态", cacheExpired ? "最后缓存，已过期" : undefined], ["目标模式", telemetry?.target_mode_label ?? telemetry?.target_mode], ["目标参数", targetValues(telemetry?.target_mode, telemetry?.target_values)], ["控制来源", telemetry?.target_ingress_label ?? telemetry?.target_ingress], ["采用阻塞项", telemetry?.[`${snapshot.connection?.transport}_adoption_blocker_labels`] ?? (snapshot.connection?.transport === "usb" ? telemetry?.usb_adoption_blocker_labels : telemetry?.can_adoption_blocker_labels)], ["输出允许", outputAllowed], ["输出阻塞项", telemetry?.output_blocker_labels ?? telemetry?.output_blockers], ["驱动状态", telemetry?.driver_summary?.axis_state_label], ["最后本地提交转速（rpm）", telemetry?.last_submitted_rpm ? [submittedRpm.label, submittedRpmAge && `距今 ${submittedRpmAge}`, "不是实际测得转速"].filter(Boolean).join("；") : undefined]], "等待当前运行实例的遥测。");
   const heartbeat = snapshot.heartbeat || {};
-  setPill($("#heartbeat-state"), heartbeat.error ? "心跳调度错误" : heartbeat.enabled ? "心跳已启用" : "心跳未启用", heartbeat.error ? "error" : heartbeat.enabled ? "success" : "idle");
-  facts($("#heartbeat"), [["已启用", heartbeat.enabled], ["本地提交数", heartbeat.submitted], ["未送达数", heartbeat.missed], ["最后错误", heartbeat.error]], "尚未取得心跳状态。");
+  const heartbeatHadDeliveryIssue = Boolean(heartbeat.missed || heartbeat.error);
+  setPill($("#heartbeat-state"), heartbeat.enabled ? heartbeatHadDeliveryIssue ? "心跳已启用；曾有调度遗漏" : "心跳已启用" : "心跳未启用", heartbeat.enabled ? heartbeatHadDeliveryIssue ? "warning" : "success" : "idle");
+  facts($("#heartbeat"), [["已启用", heartbeat.enabled], ["本地提交数", heartbeat.submitted], ["调度遗漏数", heartbeat.missed], ["最后错误", heartbeat.error]], "尚未取得心跳状态。");
   $("#observations").textContent = json({ status:snapshot.last_status, measurements:snapshot.last_measurements, diagnostics:snapshot.last_diagnostics, transport:snapshot.transport });
   renderDiagnostics(snapshot.last_diagnostics);
   if (snapshot.pending_operation_key && !operationKeyManual && document.activeElement !== $("#operation-key")) setOperationKey(snapshot.pending_operation_key, snapshot);
@@ -937,6 +938,7 @@ async function poll() {
   window.setTimeout(poll, 250);
 }
 updateActionAvailability();
+$(".app-shell").inert = false;
 void configEditor.loadSchema();
 void recordingUi.refresh();
 poll();

@@ -58,7 +58,7 @@ export function createTrialUi({ run, activeTransport }) {
     $("#trial-stop").disabled = !state.stopAvailable;
     $("#group-heartbeat-start").disabled = state.live || !groupReady;
     $("#group-heartbeat-stop").disabled = state.live || !groupReady;
-    $("#trial-state").textContent = state.terminalUnknown ? "结果未知（已中断）" : state.stopping ? "停止中" : state.live ? "运行中" : "未运行";
+    $("#trial-state").textContent = state.label;
     $("#trial-state").className = `status-label ${state.terminalUnknown ? "is-warning" : state.live ? "is-success" : "is-idle"}`;
     if (localMessage) message(localMessage.text, localMessage.state);
     else message(groupMode && !groupReady && !state.live ? "已选 CAN 群组至少需要两台已连接 EHA。" : trialStatusText(snapshot?.trial), groupMode && !groupReady && !state.live ? "is-warning" : state.terminalUnknown ? "is-warning" : "");

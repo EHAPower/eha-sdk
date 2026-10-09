@@ -13,6 +13,7 @@ test("completed selected member still exposes group Stop while another member is
   assert.equal(view.live, true);
   assert.equal(view.groupScope, true);
   assert.equal(view.stopAvailable, true);
+  assert.equal(view.label, "停止中");
 });
 
 test("terminal unknown warns without holding the recovery lock", () => {
@@ -40,6 +41,7 @@ test("a live session on the other transport retains the global write lock", () =
 });
 
 test("completed status exposes its stop reason and observed confirmation", () => {
+  assert.equal(trialState({ trial:{ state:"completed" } }).label, "已完成");
   assert.match(trialStatusText({ state:"completed", stop_reason:"position_reached", stop_observed:true }), /位置到位.*无目标且驱动 Idle/);
   assert.match(trialStatusText({ state:"completed", stop_reason:"explicit", stop_observed:true, stop_submission:{ unknown_no_retry:true } }), /Stop 提交结果未确认.*无目标且驱动 Idle/);
   assert.match(trialStatusText({ state:"interrupted_unknown", reason:"transport_disconnected:lost" }), /结果未知.*transport_disconnected/);

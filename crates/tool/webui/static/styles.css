@@ -901,6 +901,8 @@ pre {
 
 @media (max-width: 1100px) {
   :root { --sidebar: 216px; }
+  .page-identity small, .active-transport span { display: none; }
+  .page-identity strong, .topbar-link { white-space: nowrap; }
   .workspace-status { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .global-stop { grid-column: 1 / -1; }
   .telemetry-layout { grid-template-columns: 1fr; }
@@ -931,7 +933,7 @@ pre {
   .icon-button { width: 44px; height: 44px; }
   .workspace-status { position: static; grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 7px 14px; }
   .notice { right: max(14px, env(safe-area-inset-right)); bottom: max(14px, env(safe-area-inset-bottom)); width: min(420px, calc(100vw - 28px)); }
-  .global-stop { grid-column: 1 / -1; min-height: 44px; }
+  .button.global-stop { grid-column: 1 / -1; min-height: 44px; }
   main { padding: 18px 14px 28px; }
   .page-header { align-items: start; flex-direction: column; gap: 14px; }
   .card-header { align-items: start; flex-direction: column; }
@@ -954,9 +956,13 @@ pre {
 }
 
 @media (max-width: 420px) {
+  .topbar { height: auto; min-height: var(--topbar); gap: 8px; padding-block: 8px; }
+  .mobile-menu { flex: 0 0 44px; width: 44px; min-width: 44px; margin-right: 0; }
   .page-identity, .topbar-link { display: none; }
-  .topbar-actions { margin-left: auto; }
-  .active-transport select { max-width: min(154px, 48vw); }
+  .topbar-actions { flex: 1 1 0; min-width: 0; flex-wrap: wrap; margin-left: 0; }
+  .active-transport { flex: 1 1 112px; min-width: 112px; }
+  #active-can-node-control { flex-basis: 88px; min-width: 88px; }
+  .active-transport select { width: 100%; min-width: 0; max-width: none; }
   .compact-metrics { grid-template-columns: 1fr; }
   .compact-metrics .metric-card { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 0 8px; }
   .compact-metrics .metric-value { margin: 3px 0; }

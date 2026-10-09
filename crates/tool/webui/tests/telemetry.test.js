@@ -94,7 +94,17 @@ test("Active contact is historical when its reported age exceeds the Identity al
   assert.match(selectedContactGuidance("usb", null, { received_age_ms: 10, usb_contact: 1, usb_heartbeat_age_us: 0 }).detail, /等待当前运行实例的 Identity/);
 });
 
-test("heartbeat scheduling errors take priority over enabled state", () => {
+test("current contact clears a retained heartbeat scheduler error", () => {
+  assert.equal(selectedContactGuidance("usb", identity, { received_age_ms: 10, usb_contact: 1, usb_heartbeat_age_us: 20_000 }, { enabled:true, error:"USB write failed" }), null);
+});
+
+test("a retained heartbeat error does not remain current after scheduling stops", () => {
+  const guidance = selectedContactGuidance("usb", identity, { received_age_ms: 10, usb_contact: 2 }, { enabled:false, error:"USB write failed" });
+  assert.equal(guidance.title, "启用入口心跳");
+  assert.match(guidance.detail, /先启用 USB 心跳/);
+});
+
+test("current heartbeat scheduling errors remain visible until contact is confirmed", () => {
   const guidance = selectedContactGuidance("usb", identity, { received_age_ms: 10, usb_contact: 2 }, { enabled:true, error:"USB write failed" });
   assert.equal(guidance.title, "心跳调度错误");
   assert.match(guidance.detail, /查看原始错误和入口新遥测/);

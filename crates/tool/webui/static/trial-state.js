@@ -43,6 +43,7 @@ export function trialState(snapshot, canNodes = [], groupNodes = [], sessions = 
   const stopping = selectedState === "stopping" || groupStates.includes("stopping");
   const terminalUnknown = snapshot?.trial?.unknown === true && !selectedLive;
   return {
+    label: terminalUnknown ? "结果未知（已中断）" : stopping ? "停止中" : live ? "运行中" : selectedState === "completed" ? "已完成" : selectedState === "prepared" ? "预检中" : "未运行",
     live,
     stopping,
     groupScope: groupScope && groupLive,
