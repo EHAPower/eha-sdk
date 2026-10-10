@@ -43,11 +43,19 @@ pub struct AdapterStatus {
     pub notices: u64,
     pub last_notice: Option<(String, Vec<u8>, Instant)>,
 }
-/// 实际接收异常的独立诊断；没有足够信息时不能归因给某条业务请求。
+/// 传输接收与本地普通事件交接异常的独立诊断；没有足够信息时不能归因给某条业务请求。
 #[derive(Clone, Debug, Default)]
 pub struct TransportStatus {
+    /// 传输接收异常及普通事件 FIFO 淘汰的累计次数。
     pub errors: u64,
+    /// 最近一次异常的说明、原始字节及发生时刻。本地 FIFO 淘汰没有原始字节。
     pub last_error: Option<(String, Vec<u8>, Instant)>,
+}
+impl TransportStatus {
+    fn record_error(&mut self, detail: String, raw: Vec<u8>) {
+        self.errors = self.errors.saturating_add(1);
+        self.last_error = Some((detail, raw, Instant::now()));
+    }
 }
 #[derive(Default)]
 pub(crate) struct Inbox {
@@ -59,7 +67,6 @@ pub(crate) struct Inbox {
     pub heartbeat: HeartbeatStatus,
     pub adapter: AdapterStatus,
     pub transport: TransportStatus,
-    pub dropped: u64,
     pub disconnected: Option<String>,
 }
 
@@ -98,7 +105,9 @@ impl EventSink {
             }
             if inbox.events.len() == 64 {
                 inbox.events.pop_front();
-                inbox.dropped += 1;
+                inbox
+                    .transport
+                    .record_error("普通事件 FIFO 已满，已淘汰最早事件".into(), Vec::new());
             }
             inbox.events.push_back(event);
             cv.notify_all();
@@ -116,8 +125,7 @@ impl EventSink {
     pub fn transport_error(&self, detail: impl Into<String>, raw: Vec<u8>) {
         let detail = detail.into();
         if let Ok(mut i) = self.0.0.lock() {
-            i.transport.errors += 1;
-            i.transport.last_error = Some((detail, raw, Instant::now()));
+            i.transport.record_error(detail, raw);
         }
     }
     pub fn received(&self, bytes: Vec<u8>) {

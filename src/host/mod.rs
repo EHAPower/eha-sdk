@@ -599,7 +599,7 @@ impl Client {
             last_telemetry_received_at: telemetry.as_ref().map(|telemetry| telemetry.at),
         }
     }
-    /// 独立接收异常及原始字节；不把未关联的坏帧归因于当前业务。
+    /// 独立传输异常及普通事件 FIFO 淘汰；不把未关联的异常归因于当前业务。
     pub fn transport_status(&self) -> TransportStatus {
         self.backend
             .sink
@@ -958,7 +958,7 @@ impl Client {
 #[cfg(test)]
 #[allow(clippy::panic)]
 mod tests {
-    use super::{Backend, Client, Reply};
+    use super::{Backend, Client, Failure, LocalStage, Reply, Wait};
     use crate::protocol::{
         Response, SampleData,
         responses::{
@@ -968,7 +968,10 @@ mod tests {
             encode_identity, encode_telemetry,
         },
     };
-    use std::time::Instant;
+    use std::{
+        sync::{Arc, atomic::AtomicBool},
+        time::{Duration, Instant},
+    };
 
     fn available(value: f32) -> ValueFields {
         ValueFields::new(
@@ -1139,6 +1142,68 @@ mod tests {
             latest.fields().sample.snapshot_sequence,
             7,
             "开启队列不改变 latest-only telemetry 读取语义"
+        );
+    }
+
+    #[test]
+    fn ordinary_event_fifo_overflow_is_observable_without_claiming_not_submitted() {
+        let mut client = verified_client([1; 16]);
+        for id in 1..=65 {
+            client.backend.sink.submitted(id);
+        }
+
+        let wait = Wait::new(Duration::from_millis(10));
+        let error = client
+            .await_submission(
+                1,
+                Instant::now() + wait.timeout,
+                Arc::new(AtomicBool::new(false)),
+                &wait,
+                true,
+            )
+            .expect_err("第 65 个普通事件会淘汰等待中的 Submitted");
+        assert!(matches!(error.failure, Failure::ResultUnknown(_)));
+        assert_eq!(error.local, LocalStage::MayHaveBeenSubmitted);
+        assert!(
+            error.observed_transport.as_deref().is_some_and(|status| {
+                status.errors >= 1
+                    && matches!(
+                        status.last_error.as_ref(),
+                        Some((detail, raw, _))
+                            if detail == "普通事件 FIFO 已满，已淘汰最早事件" && raw.is_empty()
+                    )
+            }),
+            "调用方必须能观察普通事件 FIFO 的本地淘汰"
+        );
+    }
+
+    #[test]
+    fn ordinary_event_fifo_reply_overflow_keeps_fully_submitted_stage() {
+        let mut client = verified_client([1; 16]);
+        client.backend.sink.received(identity([1; 16]));
+        for id in 2..=65 {
+            client.backend.sink.submitted(id);
+        }
+        client.backend.sink.submitted(1);
+
+        let error = client
+            .query(
+                crate::session::QueryKind::Identity,
+                &Wait::new(Duration::from_millis(10)),
+            )
+            .expect_err("早到的匹配 Reply 被淘汰后不能伪造未提交");
+        assert!(matches!(error.failure, Failure::Timeout));
+        assert_eq!(error.local, LocalStage::FullySubmitted);
+        assert!(
+            error.observed_transport.as_deref().is_some_and(|status| {
+                status.errors >= 1
+                    && matches!(
+                        status.last_error.as_ref(),
+                        Some((detail, raw, _))
+                            if detail == "普通事件 FIFO 已满，已淘汰最早事件" && raw.is_empty()
+                    )
+            }),
+            "调用方必须能观察普通事件 FIFO 的本地淘汰"
         );
     }
 }
