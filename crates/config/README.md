@@ -27,6 +27,8 @@ flowchart LR
 
 `parse_f32` 供 CLI、JSON 原文数值等边界共享一次舍入与有限/下溢检查；保留次正规数与正负零。`validate_f32_tokens` 只扫描已完成语法/类型校验的 JSON 中的小数或指数 token，跳过字符串和整数；不能替代完整 JSON 解码。`Config::from_json` 内部采用这份检查，非零下溢报告 token 字节偏移。主机保存/编辑应保留原文，不能把显示精度或 `Value` 回读用于业务数值。
 
+`within_tolerance(actual, expected, absolute, relative)` 为数值回归和已有物理容差判断提供统一比较，预算为 `absolute + relative * abs(expected)`。绝对预算与被比较量同单位，相对预算无量纲，由调用方按物理量或算法设置；非有限值、负预算以及差值或预算计算溢出均不相近。配置有效性、离散编码、状态标识、方向和保护边界保持严格比较。
+
 `schema.json` 只维护字段类型、固定范围、单位和参数说明；它不含默认值、项目私有关键字或产品数据。完整静态检查由[SDK 客户端](../../README.md#配置检查)维护。
 
 ## 错误与结果边界

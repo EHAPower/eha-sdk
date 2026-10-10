@@ -42,7 +42,7 @@ use trial::{ActiveTrial, PreparedTrial, TrialState};
 pub use trial::{ReachCondition, TrialEnvelope, TrialRequest};
 
 /// Web、Shell 和单次 CLI 共用的明确连接选择。
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum ConnectionRequest {
     Usb {
@@ -54,6 +54,24 @@ pub enum ConnectionRequest {
         mode: String,
         python: Option<String>,
     },
+}
+
+impl ConnectionRequest {
+    /// 从已验重的顶层请求字段读取连接选择，不把路由整数转换为浮点表示。
+    pub(crate) fn from_fields(fields: &crate::RawFields) -> Result<Self, String> {
+        match fields.string("transport")?.as_str() {
+            "usb" => Ok(Self::Usb {
+                serial: fields.string("serial")?,
+            }),
+            "can" => Ok(Self::Can {
+                channel: fields.string("channel")?,
+                node: fields.decode_field("node")?,
+                mode: fields.string("mode")?,
+                python: fields.optional_string("python")?,
+            }),
+            transport => Err(format!("未知 transport：{transport}")),
+        }
+    }
 }
 
 /// 一个会话内可执行的业务动作。所有控制动作的成功只表示 SDK 的本地完整提交。
@@ -104,67 +122,62 @@ pub enum Command {
     EnterUpdate,
 }
 
-/// serde 的带 tag 枚举会缓存通用数值；在业务输入入口保留每个字段原文。
+impl Command {
+    /// 由已检查字段重复的原文表一次解码动作；业务浮点只通过共享 binary32 入口量化。
+    pub(crate) fn from_fields(fields: &crate::RawFields) -> Result<Self, String> {
+        let action = fields.string("action")?;
+        Ok(match action.as_str() {
+            "status" => Self::Status,
+            "measurements" => Self::Measurements,
+            "diagnostics" => Self::Diagnostics,
+            "telemetry" => Self::Telemetry,
+            "heartbeat_start" => Self::HeartbeatStart,
+            "heartbeat_stop" => Self::HeartbeatStop,
+            "heartbeat_once" => Self::HeartbeatOnce,
+            "position" => Self::Position {
+                mm: fields.decode_f32_field("mm")?,
+            },
+            "velocity" => Self::Velocity {
+                mm_s: fields.decode_f32_field("mm_s")?,
+            },
+            "force" => Self::Force {
+                n: fields.decode_f32_field("n")?,
+            },
+            "impedance" => Self::Impedance {
+                equilibrium_mm: fields.decode_f32_field("equilibrium_mm")?,
+                stiffness_n_per_mm: fields.decode_f32_field("stiffness_n_per_mm")?,
+                damping_ns_per_mm: fields.decode_f32_field("damping_ns_per_mm")?,
+            },
+            "stop" => Self::Stop,
+            "config_read" => Self::ConfigRead {
+                view: fields.decode_field("view")?,
+            },
+            "config_validate" => Self::ConfigValidate {
+                record: fields.decode_field("record")?,
+            },
+            "config_save" => Self::ConfigSave {
+                record: fields.decode_field("record")?,
+            },
+            "restore_factory" => Self::RestoreFactory,
+            "maintenance_result" => Self::MaintenanceResult {
+                operation_key: fields.decode_field("operation_key")?,
+            },
+            "maintenance_release" => Self::MaintenanceRelease {
+                operation_key: fields.decode_field("operation_key")?,
+            },
+            "reset_application" => Self::ResetApplication,
+            "enter_update" => Self::EnterUpdate,
+            _ => return Err(format!("未知 action：{action}")),
+        })
+    }
+}
+
+/// 嵌套输入直接建立唯一字段表后复用同一动作解码，避免 serde internally-tagged
+/// enum 的通用数值缓存路径。
 impl<'de> Deserialize<'de> for Command {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        let fields = crate::raw_json_fields(raw.get()).map_err(serde::de::Error::custom)?;
-        fn field<T: serde::de::DeserializeOwned>(
-            fields: &std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
-            name: &str,
-        ) -> Result<T, String> {
-            let value = fields.get(name).ok_or_else(|| format!("缺少 {name}"))?;
-            eha_sdk::config::validate_f32_tokens(value.get().as_bytes())
-                .map_err(|error| format!("数值输入无效：{error:?}"))?;
-            serde_json::from_str(value.get()).map_err(|error| error.to_string())
-        }
-        let action: String = field(&fields, "action").map_err(serde::de::Error::custom)?;
-        let decode = || -> Result<Self, String> {
-            Ok(match action.as_str() {
-                "status" => Self::Status,
-                "measurements" => Self::Measurements,
-                "diagnostics" => Self::Diagnostics,
-                "telemetry" => Self::Telemetry,
-                "heartbeat_start" => Self::HeartbeatStart,
-                "heartbeat_stop" => Self::HeartbeatStop,
-                "heartbeat_once" => Self::HeartbeatOnce,
-                "position" => Self::Position {
-                    mm: field(&fields, "mm")?,
-                },
-                "velocity" => Self::Velocity {
-                    mm_s: field(&fields, "mm_s")?,
-                },
-                "force" => Self::Force {
-                    n: field(&fields, "n")?,
-                },
-                "impedance" => Self::Impedance {
-                    equilibrium_mm: field(&fields, "equilibrium_mm")?,
-                    stiffness_n_per_mm: field(&fields, "stiffness_n_per_mm")?,
-                    damping_ns_per_mm: field(&fields, "damping_ns_per_mm")?,
-                },
-                "stop" => Self::Stop,
-                "config_read" => Self::ConfigRead {
-                    view: field(&fields, "view")?,
-                },
-                "config_validate" => Self::ConfigValidate {
-                    record: field(&fields, "record")?,
-                },
-                "config_save" => Self::ConfigSave {
-                    record: field(&fields, "record")?,
-                },
-                "restore_factory" => Self::RestoreFactory,
-                "maintenance_result" => Self::MaintenanceResult {
-                    operation_key: field(&fields, "operation_key")?,
-                },
-                "maintenance_release" => Self::MaintenanceRelease {
-                    operation_key: field(&fields, "operation_key")?,
-                },
-                "reset_application" => Self::ResetApplication,
-                "enter_update" => Self::EnterUpdate,
-                _ => return Err(format!("未知 action：{action}")),
-            })
-        };
-        decode().map_err(serde::de::Error::custom)
+        let fields = crate::RawFields::deserialize(deserializer)?;
+        Self::from_fields(&fields).map_err(serde::de::Error::custom)
     }
 }
 
@@ -1251,7 +1264,7 @@ impl ToolSession {
             return None;
         }
         let position = observed_f32(&telemetry["main_values"][0]["value"])?;
-        if (position - mm).abs() > reach.tolerance_mm {
+        if !eha_sdk::config::within_tolerance(position, mm, reach.tolerance_mm, 0.0) {
             active.settled_since = None;
             return None;
         }

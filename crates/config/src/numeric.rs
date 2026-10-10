@@ -15,6 +15,28 @@ pub enum FloatParseError {
     Underflow,
 }
 
+/// 按绝对与相对误差预算比较两个有限 binary32 值。
+///
+/// 预算为 `absolute + relative * abs(expected)`；两个预算都必须有限且非负，候选值和
+/// 期望值也必须有限。若差值或预算的中间计算溢出，返回 `false`，不把无法表示的预算
+/// 当成无限大。绝对预算与被比较量同单位，相对预算无量纲。此函数只用于已明确
+/// 误差预算的近似比较；离散编码、状态标识、方向和保护边界应使用严格比较。
+pub fn within_tolerance(actual: f32, expected: f32, absolute: f32, relative: f32) -> bool {
+    if !actual.is_finite()
+        || !expected.is_finite()
+        || !absolute.is_finite()
+        || !relative.is_finite()
+        || absolute < 0.0
+        || relative < 0.0
+    {
+        return false;
+    }
+    let difference = (actual - expected).abs();
+    let scaled = relative * expected.abs();
+    let budget = absolute + scaled;
+    difference.is_finite() && scaled.is_finite() && budget.is_finite() && difference <= budget
+}
+
 impl fmt::Display for FloatParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -143,5 +165,26 @@ mod tests {
             validate_f32_tokens(br#"{"gain":1e-999}"#),
             Err(JsonError::NumberUnderflow { offset: 8 })
         );
+    }
+
+    #[test]
+    fn tolerance_uses_a_finite_absolute_and_relative_budget() {
+        assert!(within_tolerance(100.005, 100.0, 0.001, 0.0001));
+        assert!(!within_tolerance(100.02, 100.0, 0.001, 0.0001));
+        assert!(within_tolerance(-0.0, 0.0, 0.0, 0.0));
+        assert!(within_tolerance(f32::MAX, f32::MAX, 0.0, 0.0));
+    }
+
+    #[test]
+    fn tolerance_rejects_nonfinite_negative_and_overflowed_budgets() {
+        for (actual, expected, absolute, relative) in [
+            (f32::NAN, 1.0, 0.0, 0.0),
+            (1.0, f32::INFINITY, 0.0, 0.0),
+            (1.0, 1.0, -0.001, 0.0),
+            (0.0, f32::MAX, 0.0, 2.0),
+            (f32::MAX, -f32::MAX, 0.0, 0.0),
+        ] {
+            assert!(!within_tolerance(actual, expected, absolute, relative));
+        }
     }
 }

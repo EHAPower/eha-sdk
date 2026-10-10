@@ -27,7 +27,7 @@ pub use measurement::{
 };
 pub use policy::{ProtectionConfig, RuntimeConfig};
 
-pub use numeric::{FloatParseError, parse_f32, validate_f32_tokens};
+pub use numeric::{FloatParseError, parse_f32, validate_f32_tokens, within_tolerance};
 
 use serde::{Deserialize, Serialize};
 

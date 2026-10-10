@@ -128,33 +128,71 @@ fn deserialize_optional_f32<'de, D: serde::Deserializer<'de>>(
         .map_err(serde::de::Error::custom)
 }
 
-fn raw_json_fields(
-    raw: &str,
-) -> Result<std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>, serde_json::Error>
-{
-    struct FieldVisitor;
-    impl<'de> serde::de::Visitor<'de> for FieldVisitor {
-        type Value = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("具有唯一字段的 JSON 对象")
-        }
-        fn visit_map<M: serde::de::MapAccess<'de>>(
-            self,
-            mut map: M,
-        ) -> Result<Self::Value, M::Error> {
-            let mut fields = std::collections::BTreeMap::new();
-            while let Some((name, value)) =
-                map.next_entry::<String, Box<serde_json::value::RawValue>>()?
-            {
-                if fields.insert(name.clone(), value).is_some() {
-                    return Err(serde::de::Error::custom(format!("重复字段：{name}")));
-                }
-            }
-            Ok(fields)
+/// 已校验 JSON 顶层字段唯一性的原文值表。
+///
+/// Web 请求只保留这一份表示；调用方按需解码已采用的字段。
+pub(crate) struct RawFields(std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>);
+
+impl RawFields {
+    pub(crate) fn parse(raw: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(raw)
+    }
+
+    pub(crate) fn decode_field<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<T, String> {
+        let raw = self.0.get(name).ok_or_else(|| format!("缺少 {name}"))?;
+        serde_json::from_str(raw.get()).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn decode_f32_field(&self, name: &str) -> Result<f32, String> {
+        let raw = self.0.get(name).ok_or_else(|| format!("缺少 {name}"))?;
+        parse_f32(raw.get())
+    }
+
+    pub(crate) fn string(&self, name: &str) -> Result<String, String> {
+        self.decode_field(name)
+    }
+
+    pub(crate) fn optional_string(&self, name: &str) -> Result<Option<String>, String> {
+        if self.contains(name) {
+            self.decode_field(name)
+        } else {
+            Ok(None)
         }
     }
-    let mut deserializer = serde_json::Deserializer::from_str(raw);
-    let fields = serde::Deserializer::deserialize_map(&mut deserializer, FieldVisitor)?;
-    deserializer.end()?;
-    Ok(fields)
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for RawFields {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct FieldVisitor;
+        impl<'de> serde::de::Visitor<'de> for FieldVisitor {
+            type Value = RawFields;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("具有唯一字段的 JSON 对象")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut fields = std::collections::BTreeMap::new();
+                while let Some((name, value)) =
+                    map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+                {
+                    if fields.insert(name.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!("重复字段：{name}")));
+                    }
+                }
+                Ok(RawFields(fields))
+            }
+        }
+        deserializer.deserialize_map(FieldVisitor)
+    }
 }

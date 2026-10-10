@@ -185,18 +185,24 @@ pub enum PositiveForcePressureChannel {
 #[cfg(test)]
 mod tests {
     use super::{HydraulicConversionError, hydraulic_velocity_to_rpm};
+    use crate::within_tolerance;
 
     #[test]
     fn hydraulic_velocity_conversion_preserves_sign_and_rejects_nonfinite_results() {
         // 三步 binary32 舍入的绝对误差预算为 5e-6 rpm。
-        assert!(
-            (hydraulic_velocity_to_rpm(5.0, 100.0, 0.6).expect("合法测试输入") - 50.0).abs()
-                <= 5e-6
-        );
-        assert!(
-            (hydraulic_velocity_to_rpm(-5.0, 100.0, 0.6).expect("合法测试输入") + 50.0).abs()
-                <= 5e-6
-        );
+        let absolute_rpm = 5e-6;
+        assert!(within_tolerance(
+            hydraulic_velocity_to_rpm(5.0, 100.0, 0.6).expect("合法测试输入"),
+            50.0,
+            absolute_rpm,
+            0.0
+        ));
+        assert!(within_tolerance(
+            hydraulic_velocity_to_rpm(-5.0, 100.0, 0.6).expect("合法测试输入"),
+            -50.0,
+            absolute_rpm,
+            0.0
+        ));
 
         assert_eq!(hydraulic_velocity_to_rpm(0.0, 100.0, 0.6), Ok(0.0));
         assert_eq!(

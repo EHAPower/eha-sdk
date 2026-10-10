@@ -530,7 +530,7 @@ fn handle_request_with_scan_body(
     workbench: &mut Workbench,
     odrive: &mut OdriveView,
     scan: &mut CanScanView,
-    parsed_body: Option<Result<JsonBody, String>>,
+    parsed_body: Option<Result<crate::RawFields, String>>,
 ) -> Result<(), String> {
     odrive.reap();
     scan.reap();
@@ -656,22 +656,16 @@ fn handle_request_with_scan_body(
         }
         return match path.as_str() {
             "/api/odrive/read" => {
-                let Some(serial) = body.get("serial").and_then(Value::as_str) else {
+                let Ok(serial) = body.string("serial") else {
                     return respond_json(
                         request,
                         400,
                         json!({"ok":false,"message":"请明确选择 ODrive USB 序列号。"}),
                     );
                 };
-                start_odrive_operation(
-                    request,
-                    odrive,
-                    OdriveOperation::Read {
-                        serial: serial.to_owned(),
-                    },
-                )
+                start_odrive_operation(request, odrive, OdriveOperation::Read { serial })
             }
-            "/api/connect" => match body.decode::<ConnectionRequest>() {
+            "/api/connect" => match ConnectionRequest::from_fields(&body) {
                 Ok(connection) => {
                     let transport = transport_from_connection(&connection);
                     if workbench.has_active_trial() {
@@ -788,7 +782,7 @@ fn handle_request_with_scan_body(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match body.decode::<Command>() {
+                match Command::from_fields(&body) {
                     Ok(command) => {
                         let node = body_node(&body);
                         if (workbench.has_active_trial() || scan.busy)
@@ -853,31 +847,37 @@ fn handle_request_with_scan_body(
                         json!({"ok":false,"message":"试验进行中；CAN 连接已拒绝。"}),
                     );
                 }
-                let Some(channel) = body.get("channel").and_then(Value::as_str) else {
+                let Ok(channel) = body.string("channel") else {
                     return respond_json(
                         request,
                         400,
                         json!({"ok":false,"message":"必须明确外部 CAN 通道"}),
                     );
                 };
-                let Some(mode) = body.get("mode").and_then(Value::as_str) else {
+                let Ok(mode) = body.string("mode") else {
                     return respond_json(
                         request,
                         400,
                         json!({"ok":false,"message":"必须明确 CAN 帧格式"}),
                     );
                 };
-                let python = body
-                    .get("python")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                let python = match body.optional_string("python") {
+                    Ok(python) => python,
+                    Err(_) => {
+                        return respond_json(
+                            request,
+                            400,
+                            json!({"ok":false,"message":"python 必须是字符串或 null"}),
+                        );
+                    }
+                };
                 let nodes = match body_nodes(&body) {
                     Ok(nodes) => nodes,
                     Err(message) => {
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match workbench.connect_can(channel.into(), mode.into(), python, &nodes, false) {
+                match workbench.connect_can(channel, mode, python, &nodes, false) {
                     Ok(value) => respond_json(request, 200, value),
                     Err(message) => {
                         respond_json(request, 409, json!({"ok":false,"message":message}))
@@ -895,24 +895,30 @@ fn handle_request_with_scan_body(
                 if let Err(message) = workbench.can_scan_guard() {
                     return respond_json(request, 409, json!({"ok":false,"message":message}));
                 }
-                let Some(channel) = body.get("channel").and_then(Value::as_str) else {
+                let Ok(channel) = body.string("channel") else {
                     return respond_json(
                         request,
                         400,
                         json!({"ok":false,"message":"必须明确外部 CAN 通道"}),
                     );
                 };
-                let Some(mode) = body.get("mode").and_then(Value::as_str) else {
+                let Ok(mode) = body.string("mode") else {
                     return respond_json(
                         request,
                         400,
                         json!({"ok":false,"message":"必须明确 CAN 帧格式"}),
                     );
                 };
-                let python = body
-                    .get("python")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                let python = match body.optional_string("python") {
+                    Ok(python) => python,
+                    Err(_) => {
+                        return respond_json(
+                            request,
+                            400,
+                            json!({"ok":false,"message":"python 必须是字符串或 null"}),
+                        );
+                    }
+                };
                 let nodes = match scan_nodes(&body) {
                     Ok(nodes) => nodes,
                     Err(message) => {
@@ -920,7 +926,7 @@ fn handle_request_with_scan_body(
                     }
                 };
                 if let Err(message) =
-                    workbench.ensure_network(channel.into(), mode.into(), python.clone())
+                    workbench.ensure_network(channel.clone(), mode.clone(), python.clone())
                 {
                     return respond_json(request, 409, json!({"ok":false,"message":message}));
                 }
@@ -939,8 +945,8 @@ fn handle_request_with_scan_body(
                 }
                 let job = CanScanJob {
                     request,
-                    channel: channel.into(),
-                    mode: mode.into(),
+                    channel,
+                    mode,
                     python,
                     connectors,
                 };
@@ -960,10 +966,10 @@ fn handle_request_with_scan_body(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                let action = body.get("action").and_then(Value::as_str);
-                let Some(start) = (action == Some("start"))
+                let action = body.string("action").ok();
+                let Some(start) = (action.as_deref() == Some("start"))
                     .then_some(true)
-                    .or_else(|| (action == Some("stop")).then_some(false))
+                    .or_else(|| (action.as_deref() == Some("stop")).then_some(false))
                 else {
                     return respond_json(
                         request,
@@ -1041,8 +1047,8 @@ fn handle_request_with_scan_body(
                 }
             }
             "/api/group" => {
-                let action = body.get("action").and_then(Value::as_str);
-                let nodes = if action == Some("stop") && body.get("nodes").is_none() {
+                let action = body.string("action").ok();
+                let nodes = if action.as_deref() == Some("stop") && !body.contains("nodes") {
                     Ok(Vec::new())
                 } else {
                     body_nodes(&body)
@@ -1053,7 +1059,7 @@ fn handle_request_with_scan_body(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                let result = match action {
+                let result = match action.as_deref() {
                     Some("trial_start") if !workbench.has_active_trial() && !scan.busy => body
                         .decode_field("trial")
                         .map_err(|error| format!("trial 参数无效：{error}"))
@@ -1137,49 +1143,37 @@ fn query_node(url: &str) -> Result<Option<u8>, &'static str> {
         })
         .transpose()
 }
-fn body_node(body: &Value) -> Option<u8> {
-    body.get("node")
-        .and_then(Value::as_u64)
-        .and_then(|node| u8::try_from(node).ok())
+fn body_node(body: &crate::RawFields) -> Option<u8> {
+    body.decode_field("node").ok()
 }
-fn validate_body_node(body: &Value) -> Result<(), &'static str> {
-    match body.get("node") {
-        None => Ok(()),
-        Some(value) => value
-            .as_u64()
-            .and_then(|node| u8::try_from(node).ok())
-            .filter(|node| *node <= 127)
-            .map(|_| ())
-            .ok_or("node 必须为 0..=127 的整数"),
+fn validate_body_node(body: &crate::RawFields) -> Result<(), &'static str> {
+    if !body.contains("node") {
+        return Ok(());
     }
+    body.decode_field::<u8>("node")
+        .ok()
+        .filter(|node| *node <= 127)
+        .map(|_| ())
+        .ok_or("node 必须为 0..=127 的整数")
 }
-fn body_nodes(body: &Value) -> Result<Vec<u8>, &'static str> {
-    let nodes = body
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or("必须提供 nodes 数组")?;
-    nodes
-        .iter()
-        .map(|value| {
-            value
-                .as_u64()
-                .and_then(|node| u8::try_from(node).ok())
-                .filter(|node| *node <= 127)
+fn body_nodes(body: &crate::RawFields) -> Result<Vec<u8>, &'static str> {
+    body.decode_field::<Vec<u8>>("nodes")
+        .map_err(|_| "必须提供 nodes 数组")?
+        .into_iter()
+        .map(|node| {
+            (node <= 127)
+                .then_some(node)
                 .ok_or("node 必须为 0..=127 的整数")
         })
         .collect()
 }
-fn scan_nodes(body: &Value) -> Result<Vec<u8>, &'static str> {
+fn scan_nodes(body: &crate::RawFields) -> Result<Vec<u8>, &'static str> {
     let start = body
-        .get("start_node")
-        .and_then(Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or("start_node 必须为 0..=127 的整数")?;
+        .decode_field("start_node")
+        .map_err(|_| "start_node 必须为 0..=127 的整数")?;
     let end = body
-        .get("end_node")
-        .and_then(Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-        .ok_or("end_node 必须为 0..=127 的整数")?;
+        .decode_field("end_node")
+        .map_err(|_| "end_node 必须为 0..=127 的整数")?;
     if start > 127 || end > 127 || start > end {
         return Err("扫描范围必须为 0..=127 且 start_node 不大于 end_node");
     }
@@ -1197,8 +1191,8 @@ fn connection_node(connection: &ConnectionRequest) -> Option<u8> {
         ConnectionRequest::Can { node, .. } => Some(*node),
     }
 }
-fn trial_action(body: &JsonBody) -> Result<TrialAction, String> {
-    match body.get("action").and_then(Value::as_str) {
+fn trial_action(body: &crate::RawFields) -> Result<TrialAction, String> {
+    match body.optional_string("action")?.as_deref() {
         Some("start") => body
             .decode_field("trial")
             .map(TrialAction::Start)
@@ -1220,11 +1214,10 @@ fn recording_content_type(file: &str) -> &'static str {
         _ => "application/octet-stream",
     }
 }
-fn body_transport(body: &Value) -> Result<WebTransport, &'static str> {
-    let Some(value) = body.get("transport").and_then(Value::as_str) else {
-        return Err("请求必须明确指定 transport=usb 或 transport=can");
-    };
-    parse_transport_value(value)
+fn body_transport(body: &crate::RawFields) -> Result<WebTransport, &'static str> {
+    body.string("transport")
+        .map_err(|_| "请求必须明确指定 transport=usb 或 transport=can")
+        .and_then(|value| parse_transport_value(&value))
 }
 fn parse_transport_value(value: &str) -> Result<WebTransport, &'static str> {
     match value {
@@ -1312,55 +1305,9 @@ fn validate_write_request(request: &tiny_http::Request, port: u16) -> Result<(),
     }
     Ok(())
 }
-/// 路由元数据使用 Value；业务字段始终从保留的 JSON 原文直接解码为 f32。
-/// Value 只用于字符串、布尔和整数路由判断，不回流业务数值。
-pub(super) struct JsonBody {
-    metadata: Value,
-    raw: String,
-    fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
-}
-
-impl std::ops::Deref for JsonBody {
-    type Target = Value;
-    fn deref(&self) -> &Value {
-        &self.metadata
-    }
-}
-
-impl JsonBody {
-    fn parse(raw: String) -> Result<Self, String> {
-        let metadata = serde_json::from_str(&raw).map_err(|error| format!("JSON 无效：{error}"))?;
-        let fields = crate::raw_json_fields(&raw).map_err(|error| format!("JSON 无效：{error}"))?;
-        Ok(Self {
-            metadata,
-            raw,
-            fields,
-        })
-    }
-
-    fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
-        // 根请求的未知字段保持 serde 兼容行为；Command 只检查实际采用的数值字段。
-        serde_json::from_str(&self.raw).map_err(|error| error.to_string())
-    }
-
-    fn decode_f32_field(&self, name: &str) -> Result<f32, String> {
-        let raw = self
-            .fields
-            .get(name)
-            .ok_or_else(|| format!("缺少 {name}"))?;
-        crate::parse_f32(raw.get())
-    }
-
-    fn decode_field<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<T, String> {
-        let raw = self
-            .fields
-            .get(name)
-            .ok_or_else(|| format!("缺少 {name}"))?;
-        serde_json::from_str(raw.get()).map_err(|error| error.to_string())
-    }
-}
-
-pub(super) fn parse_json_body(request: &mut tiny_http::Request) -> Result<JsonBody, String> {
+pub(super) fn parse_json_body(
+    request: &mut tiny_http::Request,
+) -> Result<crate::RawFields, String> {
     let mut body = String::new();
     request
         .as_reader()
@@ -1370,7 +1317,7 @@ pub(super) fn parse_json_body(request: &mut tiny_http::Request) -> Result<JsonBo
     if body.len() as u64 > MAX_JSON_BODY {
         return Err("JSON 请求过大".into());
     }
-    JsonBody::parse(body)
+    crate::RawFields::parse(&body).map_err(|error| format!("JSON 无效：{error}"))
 }
 fn common_headers(
     response: &mut Response<std::io::Cursor<Vec<u8>>>,
@@ -1462,16 +1409,22 @@ mod tests {
     #[test]
     fn numeric_requests_decode_original_decimal_once() {
         let decimal = "1.0000000596046447753906250000000000000000000001";
-        let action = super::JsonBody::parse(format!(
+        let action = crate::RawFields::parse(&format!(
             r#"{{"action":"position","mm":{decimal},"future":1e-999}}"#
         ))
         .expect("原始动作");
-        let mm = match action.decode().expect("动作 f32") {
+        let mm = match crate::session::Command::from_fields(&action).expect("动作 f32") {
             crate::session::Command::Position { mm } => mm,
             _ => f32::NAN,
         };
         assert_eq!(mm.to_bits(), 0x3f800001);
-        let target = super::JsonBody::parse(format!(r#"{{"action":"target","mm":{decimal}}}"#))
+        let direct: crate::session::Command =
+            serde_json::from_str(&format!(r#"{{"action":"position","mm":{decimal}}}"#))
+                .expect("嵌套 Command 入口");
+        assert!(
+            matches!(direct, crate::session::Command::Position { mm } if mm.to_bits() == 0x3f800001)
+        );
+        let target = crate::RawFields::parse(&format!(r#"{{"action":"target","mm":{decimal}}}"#))
             .expect("目标");
         let mm = match super::trial_action(&target).expect("目标 f32") {
             super::TrialAction::Target(mm) => mm,
@@ -1479,7 +1432,7 @@ mod tests {
         };
         assert_eq!(mm.to_bits(), 0x3f800001);
         for action_name in ["start", "trial_start"] {
-            let body = super::JsonBody::parse(format!(r#"{{"action":"{action_name}","trial":{{"command":{{"action":"position","mm":{decimal},"future":1e-999}},"envelope":{{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":1,"force_abs_max_n":2,"stiffness_max_n_per_mm":3,"damping_max_ns_per_mm":4,"duration_max_s":2}},"duration_s":1,"reach":null}}}}"#)).expect("试验原文");
+            let body = crate::RawFields::parse(&format!(r#"{{"action":"{action_name}","trial":{{"command":{{"action":"position","mm":{decimal},"future":1e-999}},"envelope":{{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":1,"force_abs_max_n":2,"stiffness_max_n_per_mm":3,"damping_max_ns_per_mm":4,"duration_max_s":2}},"duration_s":1,"reach":null}}}}"#)).expect("试验原文");
             let trial: crate::session::TrialRequest =
                 body.decode_field("trial").expect("单台／群组试验 f32");
             let mm = match trial.command {
@@ -1492,25 +1445,60 @@ mod tests {
 
     #[test]
     fn routing_ignores_unknown_numbers_without_adopting_them() {
-        let stop =
-            super::JsonBody::parse(r#"{"transport":"usb","action":"stop","future":1e-999}"#.into())
-                .expect("原始 Stop");
-        assert!(matches!(
-            stop.decode::<crate::session::Command>(),
-            Ok(crate::session::Command::Stop)
-        ));
-        let connection = super::JsonBody::parse(
-            r#"{"transport":"usb","serial":"selected","future":1e-999}"#.into(),
-        )
-        .expect("原始连接");
+        for token in ["1e-999", "1e100", "1e999", "18446744073709551615"] {
+            let stop = crate::RawFields::parse(&format!(
+                r#"{{"transport":"usb","action":"stop","future":{token}}}"#
+            ))
+            .expect("原始 Stop");
+            assert!(matches!(
+                crate::session::Command::from_fields(&stop),
+                Ok(crate::session::Command::Stop)
+            ));
+        }
+        let connection =
+            crate::RawFields::parse(r#"{"transport":"usb","serial":"selected","future":1e-999}"#)
+                .expect("原始连接");
         assert_eq!(
-            connection
-                .decode::<crate::session::ConnectionRequest>()
+            crate::session::ConnectionRequest::from_fields(&connection)
                 .expect("未知数值字段不被采用"),
             crate::session::ConnectionRequest::Usb {
                 serial: "selected".into()
             }
         );
+    }
+
+    #[test]
+    fn routing_integer_fields_do_not_coerce_decimal_or_signed_zero() {
+        for token in ["0", "127"] {
+            let body =
+                crate::RawFields::parse(&format!(r#"{{"node":{token}}}"#)).expect("整数节点 JSON");
+            assert!(super::validate_body_node(&body).is_ok(), "{token}");
+        }
+        for token in ["128", "0.0", "0e0", "-0", "18446744073709551615", "\"0\""] {
+            let body =
+                crate::RawFields::parse(&format!(r#"{{"node":{token}}}"#)).expect("JSON 语法有效");
+            assert!(super::validate_body_node(&body).is_err(), "{token}");
+        }
+    }
+
+    #[test]
+    fn optional_python_accepts_missing_or_null_but_rejects_other_types() {
+        for raw in [
+            r#"{"transport":"can","channel":"vcan0","node":1,"mode":"fd"}"#,
+            r#"{"transport":"can","channel":"vcan0","node":1,"mode":"fd","python":null}"#,
+            r#"{"transport":"can","channel":"vcan0","node":1,"mode":"fd","python":"python3"}"#,
+        ] {
+            let fields = crate::RawFields::parse(raw).expect("JSON");
+            assert!(
+                crate::session::ConnectionRequest::from_fields(&fields).is_ok(),
+                "{raw}"
+            );
+        }
+        let fields = crate::RawFields::parse(
+            r#"{"transport":"can","channel":"vcan0","node":1,"mode":"fd","python":1}"#,
+        )
+        .expect("JSON");
+        assert!(crate::session::ConnectionRequest::from_fields(&fields).is_err());
     }
 
     #[test]
@@ -1521,7 +1509,18 @@ mod tests {
             r#"{"action":"trial_start","trial":{},"trial":{}}"#,
             r#"{"action":"stop","action":"target"}"#,
         ] {
-            assert!(super::JsonBody::parse(raw.into()).is_err());
+            assert!(crate::RawFields::parse(raw).is_err());
+        }
+        for raw in [
+            r#"{"action":"position","mm":null}"#,
+            r#"{"action":"position"}"#,
+            r#"{"action":"position","mm":{"$serde_json::private::Number":"1"}}"#,
+            r#"{"action":"stop","future":1,"future":2}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<crate::session::Command>(raw).is_err(),
+                "Command 必须拒绝：{raw}"
+            );
         }
         for token in [
             "1e-999",
@@ -1529,23 +1528,33 @@ mod tests {
             "1e100",
             "1000000000000000000000000000000000000000000000000000",
         ] {
-            let body = super::JsonBody::parse(format!(r#"{{"action":"target","mm":{token}}}"#));
-            assert!(body.and_then(|body| super::trial_action(&body)).is_err());
+            assert!(
+                serde_json::from_str::<crate::session::Command>(&format!(
+                    r#"{{"action":"position","mm":{token}}}"#
+                ))
+                .is_err(),
+                "Command 不能采用 {token}"
+            );
+            let body = crate::RawFields::parse(&format!(r#"{{"action":"target","mm":{token}}}"#));
+            assert!(
+                body.map_err(|error| error.to_string())
+                    .and_then(|body| super::trial_action(&body))
+                    .is_err()
+            );
         }
         let trial = r#"{"command":{"action":"position","mm":1},"envelope":{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":1,"force_abs_max_n":2,"stiffness_max_n_per_mm":3,"damping_max_ns_per_mm":4,"duration_max_s":2},"duration_s":1,"reach":{"tolerance_mm":1,"settle_ms":1}}"#;
         for field in ["mm", "velocity_abs_max_mm_s", "duration_s", "tolerance_mm"] {
             let bad = trial.replace(&format!("\"{field}\":1"), &format!("\"{field}\":1e-999"));
             let body =
-                super::JsonBody::parse(format!("{{\"trial\":{bad}}}")).expect("合法试验 JSON");
+                crate::RawFields::parse(&format!("{{\"trial\":{bad}}}")).expect("合法试验 JSON");
             assert!(
                 body.decode_field::<crate::session::TrialRequest>("trial")
                     .is_err(),
                 "{field} 下溢不能被采用"
             );
         }
-        let body =
-            super::JsonBody::parse(r#"{"action":"target","mm":1.401298464324817e-45}"#.into())
-                .expect("次正规数");
+        let body = crate::RawFields::parse(r#"{"action":"target","mm":1.401298464324817e-45}"#)
+            .expect("次正规数");
         let mm = match super::trial_action(&body).expect("保留次正规数") {
             super::TrialAction::Target(mm) => mm,
             _ => f32::NAN,
@@ -1772,6 +1781,15 @@ mod tests {
         });
         let mut sessions = Sessions::new();
         let mut odrive = OdriveView::with_runner(runner);
+
+        let invalid = request_client(
+            address,
+            request_text(port, "POST", "/api/odrive/read", Some(r#"{"serial":1}"#)),
+        );
+        handle_request(server.recv()?, port, &mut sessions, &mut odrive)?;
+        let invalid = invalid.join().map_err(|_| "invalid client panicked")??;
+        assert!(invalid.starts_with("HTTP/1.1 400"));
+        assert!(!odrive.busy, "错误类型不得启动 ODrive 工作线程");
 
         let slow = request_client(
             address,
