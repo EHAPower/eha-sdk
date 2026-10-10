@@ -107,3 +107,54 @@ fn main() -> ExitCode {
         }
     }
 }
+
+fn parse_f32(token: &str) -> Result<f32, String> {
+    eha_sdk::config::parse_f32(token).map_err(|error| error.to_string())
+}
+
+fn deserialize_f32<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let raw = <Box<serde_json::value::RawValue> as serde::Deserialize>::deserialize(deserializer)?;
+    parse_f32(raw.get()).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_f32<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<f32>, D::Error> {
+    let raw = <Option<Box<serde_json::value::RawValue>> as serde::Deserialize>::deserialize(
+        deserializer,
+    )?;
+    raw.map(|raw| parse_f32(raw.get()))
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+fn raw_json_fields(
+    raw: &str,
+) -> Result<std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>, serde_json::Error>
+{
+    struct FieldVisitor;
+    impl<'de> serde::de::Visitor<'de> for FieldVisitor {
+        type Value = std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("具有唯一字段的 JSON 对象")
+        }
+        fn visit_map<M: serde::de::MapAccess<'de>>(
+            self,
+            mut map: M,
+        ) -> Result<Self::Value, M::Error> {
+            let mut fields = std::collections::BTreeMap::new();
+            while let Some((name, value)) =
+                map.next_entry::<String, Box<serde_json::value::RawValue>>()?
+            {
+                if fields.insert(name.clone(), value).is_some() {
+                    return Err(serde::de::Error::custom(format!("重复字段：{name}")));
+                }
+            }
+            Ok(fields)
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    let fields = serde::Deserializer::deserialize_map(&mut deserializer, FieldVisitor)?;
+    deserializer.end()?;
+    Ok(fields)
+}

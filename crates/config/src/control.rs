@@ -4,28 +4,29 @@
 
 use serde::{Deserialize, Serialize};
 
-/// 等面积液压速度换算无法产生有限 rpm 的原因。
+/// 等面积液压速度换算失败的原因。
 ///
-/// 此错误只表达输入、几何参数或中间换算超出 `f64` 有限表示；不判断参数的静态正值
-/// 前提、安装方向、保护范围或输出授权。
+/// 只检查 binary32 运算域；静态正值前提、安装方向、保护范围和输出授权由调用方判断。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HydraulicConversionError {
     /// 输入、几何参数或中间换算结果为 NaN 或无穷。
     NonFinite,
+    /// 非零换算在某一步舍入为零，不能作为有效派生参数。
+    Underflow,
 }
 
 /// 将产品线速度换算为不含安装方向的等效泵流量转速，单位 rpm。
 ///
-/// 速度符号直接保留。调用方提供两腔共同的有效受压面积（mm²）和泵每转排量
-/// （cm³/rev）；本函数不检查它们是否为正数，也不读取运行配置或设备状态。输入、参数或
-/// 中间结果为 NaN 或无穷时返回 [`HydraulicConversionError::NonFinite`]；合法零输入返回
-/// `Ok(0.0)`。
+/// 固定依次计算速度乘面积、乘 `0.06`、除排量，每步使用 binary32 最近取偶。
+/// 本函数只接受该运算顺序内每步有限且非零派生不归零的参数域，不借助更宽精度
+/// 挽救中间溢出。它不检查几何参数是否为正数。有限参数且排量非零时，零速度返回
+/// `Ok(0.0)`；其他非零输入派生归零返回 [`HydraulicConversionError::Underflow`]。
 pub fn hydraulic_velocity_to_rpm(
-    velocity_mm_s: f64,
-    effective_area_mm2: f64,
-    pump_displacement_cm3_rev: f64,
-) -> Result<f64, HydraulicConversionError> {
-    let finite = |value: f64| {
+    velocity_mm_s: f32,
+    effective_area_mm2: f32,
+    pump_displacement_cm3_rev: f32,
+) -> Result<f32, HydraulicConversionError> {
+    let finite = |value: f32| {
         value
             .is_finite()
             .then_some(value)
@@ -34,9 +35,23 @@ pub fn hydraulic_velocity_to_rpm(
     finite(velocity_mm_s)?;
     finite(effective_area_mm2)?;
     finite(pump_displacement_cm3_rev)?;
-    let flow_mm3_s = finite(velocity_mm_s * effective_area_mm2)?;
-    let flow_cm3_min = finite(flow_mm3_s * 0.06)?;
-    finite(flow_cm3_min / pump_displacement_cm3_rev)
+    if pump_displacement_cm3_rev == 0.0 {
+        return Err(HydraulicConversionError::NonFinite);
+    }
+    if velocity_mm_s == 0.0 {
+        return Ok(0.0);
+    }
+    let nonzero = |value: f32| {
+        let value = finite(value)?;
+        if velocity_mm_s != 0.0 && value == 0.0 {
+            Err(HydraulicConversionError::Underflow)
+        } else {
+            Ok(value)
+        }
+    };
+    let flow_mm3_s = nonzero(velocity_mm_s * effective_area_mm2)?;
+    let flow_cm3_min = nonzero(flow_mm3_s * 0.06)?;
+    nonzero(flow_cm3_min / pump_displacement_cm3_rev)
 }
 
 /// Position、Velocity、Force 与 Impedance 共用的固定控制参数。
@@ -173,19 +188,42 @@ mod tests {
 
     #[test]
     fn hydraulic_velocity_conversion_preserves_sign_and_rejects_nonfinite_results() {
-        assert_eq!(hydraulic_velocity_to_rpm(5.0, 100.0, 0.6), Ok(50.0));
-        assert_eq!(hydraulic_velocity_to_rpm(-5.0, 100.0, 0.6), Ok(-50.0));
-
-        let large = hydraulic_velocity_to_rpm(
-            f64::from(f32::MAX),
-            f64::from(f32::MAX),
-            f64::from(f32::MIN_POSITIVE),
-        )
-        .expect("有限 f64 换算结果");
-        assert!(large > f64::from(f32::MAX));
-        assert_eq!(
-            hydraulic_velocity_to_rpm(f64::MAX, 100.0, 0.6),
-            Err(HydraulicConversionError::NonFinite)
+        // 三步 binary32 舍入的绝对误差预算为 5e-6 rpm。
+        assert!(
+            (hydraulic_velocity_to_rpm(5.0, 100.0, 0.6).expect("合法测试输入") - 50.0).abs()
+                <= 5e-6
         );
+        assert!(
+            (hydraulic_velocity_to_rpm(-5.0, 100.0, 0.6).expect("合法测试输入") + 50.0).abs()
+                <= 5e-6
+        );
+
+        assert_eq!(hydraulic_velocity_to_rpm(0.0, 100.0, 0.6), Ok(0.0));
+        assert_eq!(
+            hydraulic_velocity_to_rpm(-0.0, 100.0, 0.6)
+                .expect("合法零速度")
+                .to_bits(),
+            0
+        );
+        for (speed, area, displacement) in [
+            (f32::MAX, f32::MAX, f32::MIN_POSITIVE),
+            (f32::NAN, 100.0, 0.6),
+            (0.0, 100.0, 0.0),
+        ] {
+            assert_eq!(
+                hydraulic_velocity_to_rpm(speed, area, displacement),
+                Err(HydraulicConversionError::NonFinite)
+            );
+        }
+        for (speed, area, displacement) in [
+            (f32::from_bits(1), 0.5, 1.0),
+            (f32::from_bits(1), 1.0, 1.0),
+            (1e-30, 1e-10, 1e30),
+        ] {
+            assert_eq!(
+                hydraulic_velocity_to_rpm(speed, area, displacement),
+                Err(HydraulicConversionError::Underflow)
+            );
+        }
     }
 }

@@ -18,6 +18,28 @@ const tokenEnd = (raw, start) => {
   while (index < raw.length && !/[\s,}\]]/.test(raw[index])) index++;
   return index;
 };
+const jsonNumber = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
+
+// 控制与试验的 f32 在 Rust 边界才量化。浏览器只检查 JSON 数字语法，
+// 并在请求体中逐字输出用户输入，避免 Number/JSON.stringify 的双重舍入。
+export class RawJsonNumber {
+  constructor(raw) { this.raw = raw; }
+}
+
+export function rawJsonNumber(value, label, { optional = false } = {}) {
+  const raw = String(value ?? "").trim();
+  if (!raw && optional) return null;
+  if (!jsonNumber.test(raw)) throw new Error(`${label} 必须是 JSON 数值字面量。`);
+  return new RawJsonNumber(raw);
+}
+
+export function stringifyJson(value) {
+  if (value instanceof RawJsonNumber) return value.raw;
+  if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((entry) => entry === undefined ? "null" : stringifyJson(entry)).join(",")}]`;
+  if (typeof value === "object") return `{${Object.entries(value).filter(([, entry]) => entry !== undefined).map(([key, entry]) => `${JSON.stringify(key)}:${stringifyJson(entry)}`).join(",")}}`;
+  return JSON.stringify(value);
+}
 
 export function parseJsonTree(raw) {
   // This parser keeps token spans, but JSON.parse remains the grammar

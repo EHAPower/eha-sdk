@@ -1,13 +1,42 @@
 // Copyright The eha-sdk Contributors
 
 import { trialState, trialStatusText } from "./trial-state.js";
+import { rawJsonNumber } from "./config-editor.js";
 
 const $ = (selector) => document.querySelector(selector);
 const number = (value, label, { optional = false } = {}) => {
+  return rawJsonNumber(value, label, { optional });
+};
+const integer = (value, label, { optional = false } = {}) => {
   const raw = String(value ?? "").trim();
   if (!raw && optional) return null;
-  const parsed = Number(raw); if (!raw || !Number.isFinite(parsed)) throw new Error(`${label} 必须是有限数值。`); return parsed;
+  const parsed = Number(raw);
+  if (!raw || !Number.isSafeInteger(parsed) || parsed < 0) throw new Error(`${label} 必须是非负整数。`);
+  return parsed;
 };
+const decimalParts = (value) => {
+  const match = /^(-?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/.exec(value.raw);
+  if (!match) throw new Error("范围必须是 JSON 数值字面量。");
+  const exponent = BigInt(match[4] || "0") - BigInt((match[3] || "").length);
+  if (exponent < -1000n || exponent > 1000n) throw new Error("范围过大，不能用于连续位置滑块；仍可直接提交试验。");
+  const coefficient = BigInt(`${match[2]}${match[3] || ""}`) * (match[1] ? -1n : 1n);
+  return { coefficient, exponent };
+};
+const decimalText = (coefficient, exponent) => {
+  const negative = coefficient < 0n; const digits = (negative ? -coefficient : coefficient).toString();
+  if (exponent >= 0n) return `${negative ? "-" : ""}${digits}${"0".repeat(Number(exponent))}`;
+  const scale = Number(-exponent);
+  const body = digits.length > scale ? `${digits.slice(0, -scale)}.${digits.slice(-scale)}` : `0.${"0".repeat(scale - digits.length)}${digits}`;
+  return `${negative ? "-" : ""}${body}`;
+};
+export function sliderTarget(minimum, maximum, step) {
+  const min = decimalParts(minimum); const max = decimalParts(maximum);
+  const base = min.exponent < max.exponent ? min.exponent : max.exponent;
+  const left = min.coefficient * (10n ** (min.exponent - base));
+  const right = max.coefficient * (10n ** (max.exponent - base));
+  if (left >= right) return null;
+  return decimalText(left * (1000n - step) + right * step, base - 3n);
+}
 
 export function createTrialUi({ run, activeTransport }) {
   let canNodes = []; let rememberedNodes = new Set(); let lastPositionTargetAt = 0;
@@ -37,7 +66,7 @@ export function createTrialUi({ run, activeTransport }) {
     const duration = number($("#trial-duration").value, "有限运行时间", { optional:true });
     const position = $("#trial-position");
     const tolerance = active === "position" ? number(new FormData(position).get("tolerance_mm"), "到位容差", { optional:true }) : null;
-    const settle = active === "position" ? number(new FormData(position).get("settle_ms"), "到位稳定时间", { optional:true }) : null;
+    const settle = active === "position" ? integer(new FormData(position).get("settle_ms"), "到位稳定时间", { optional:true }) : null;
     return { command:command(), envelope:envelope(), duration_s:duration, reach:tolerance === null ? null : { tolerance_mm:tolerance, settle_ms:settle ?? 0 } };
   };
   const scope = () => $("input[name=trial-scope]:checked").value;
@@ -116,13 +145,14 @@ export function createTrialUi({ run, activeTransport }) {
   $$(".trial-command").forEach((form) => form.addEventListener("submit", (event) => event.preventDefault()));
   const slider = $("#trial-position-slider");
   slider.addEventListener("input", () => {
-    let min; let max;
+    let min; let max; let target;
     try {
       min = number(document.querySelector('[name="position_min_mm"]').value, "位置下限", { optional:true });
       max = number(document.querySelector('[name="position_max_mm"]').value, "位置上限", { optional:true });
+      target = min === null || max === null ? null : sliderTarget(min, max, BigInt(slider.value));
     } catch (error) { showLocalMessage(error.message, "is-error"); return; }
-    if (min === null || max === null || min >= max) return;
-    $("#trial-position input[name=mm]").value = (min + (max - min) * Number(slider.value) / 1000).toFixed(3);
+    if (target === null) return;
+    $("#trial-position input[name=mm]").value = target;
     if (scope() !== "single" || window.__ehaSnapshot?.trial?.state !== "active") return;
     const submitLatest = () => {
       positionTimer = undefined; lastPositionTargetAt = performance.now();

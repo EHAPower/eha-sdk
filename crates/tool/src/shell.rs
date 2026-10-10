@@ -61,17 +61,23 @@ enum Command {
     HeartbeatStop,
     HeartbeatOnce,
     Position {
+        #[arg(value_parser = crate::parse_f32)]
         mm: f32,
     },
     Velocity {
+        #[arg(value_parser = crate::parse_f32)]
         mm_s: f32,
     },
     Force {
+        #[arg(value_parser = crate::parse_f32)]
         n: f32,
     },
     Impedance {
+        #[arg(value_parser = crate::parse_f32)]
         equilibrium_mm: f32,
+        #[arg(value_parser = crate::parse_f32)]
         stiffness_n_per_mm: f32,
+        #[arg(value_parser = crate::parse_f32)]
         damping_ns_per_mm: f32,
     },
     Stop,
@@ -95,6 +101,7 @@ enum Command {
     EnterUpdate,
     /// 纯本地等待；不发送查询、心跳或控制。
     Wait {
+        #[arg(value_parser = crate::parse_f32)]
         seconds: f32,
     },
     Version,
@@ -206,7 +213,9 @@ impl Session {
                 if !seconds.is_finite() || seconds < 0.0 {
                     return Err("wait seconds 必须是非负有限值".into());
                 }
-                thread::sleep(Duration::from_secs_f32(seconds));
+                let duration = Duration::try_from_secs_f32(seconds)
+                    .map_err(|_| "wait seconds 超出主机时钟可表示范围")?;
+                thread::sleep(duration);
                 println!(
                     "仅本地等待完成；未发送任何设备消息。\n{}",
                     serde_json::to_string_pretty(&self.tool.snapshot())
@@ -460,5 +469,23 @@ impl Completer for ShellHelper {
             }
         }
         self.files.complete(line, pos, context)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn shell_control_parses_decimal_once_and_rejects_loss_before_device_io() {
+        let decimal = "1.0000000596046447753906250000000000000000000001";
+        let input = Input::try_parse_from(["position", decimal]).expect("Shell 原文");
+        let mm = match input.command {
+            Command::Position { mm } => mm,
+            _ => f32::NAN,
+        };
+        assert_eq!(mm.to_bits(), 0x3f800001);
+        for token in ["1e-999", "NaN", "1e100"] {
+            assert!(Input::try_parse_from(["position", token]).is_err());
+        }
     }
 }

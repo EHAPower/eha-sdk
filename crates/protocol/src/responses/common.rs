@@ -106,18 +106,17 @@ impl ValueFields {
         Self { value, state }
     }
 
-    /// 将内部 f64 观测投影到 binary32 字段，保留来源质量和过期事实。
+    /// 将内部 f32 观测投影到 binary32 字段，保留来源质量和过期事实。
     ///
-    /// 仅 `Available` 缩窄数值；非有限值、溢出或非零值缩窄为零改报
+    /// 仅 `Available` 采用数值；非有限值改报
     /// `CalculationFailed` 并使用正零占位，其他不可用状态保持原分类并使用正零。
-    /// 有限可表示值按 binary32 舍入，包括次正规数和正负零；本方法不检查产品范围。
+    /// 有限值保持原位模式，包括次正规数和正负零；本方法不检查产品范围。
     /// 失败只描述本次对外表示，不改变内部原值、计算历史、来源或保护判断。
-    pub fn from_f64(value: f64, state: ValueState) -> Self {
+    pub fn from_f32(value: f32, state: ValueState) -> Self {
         if state.result() != ValueResult::Available {
             return Self::new(0.0, state);
         }
-        let narrowed = value as f32;
-        if !narrowed.is_finite() || (value != 0.0 && narrowed == 0.0) {
+        if !value.is_finite() {
             Self::new(
                 0.0,
                 ValueState::new(
@@ -127,7 +126,7 @@ impl ValueFields {
                 ),
             )
         } else {
-            Self::new(narrowed, state)
+            Self::new(value, state)
         }
     }
 }

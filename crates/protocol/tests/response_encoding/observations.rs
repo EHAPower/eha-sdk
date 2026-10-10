@@ -3,19 +3,19 @@
 use super::*;
 
 #[test]
-fn observation_narrowing_preserves_quality_and_reports_representation_failure() {
+fn observation_projection_preserves_quality_and_reports_nonfinite_failure() {
     let state = ValueState::new(ValueResult::Available, SourceQuality::Faulted, true);
-    let rounded = ValueFields::from_f64(16_777_217.0, state);
-    assert_eq!(rounded, ValueFields::new(16_777_216.0, state));
-    for value in [f64::MAX, -f64::MAX, 1e-50, -1e-50, f64::NAN, f64::INFINITY] {
-        let field = ValueFields::from_f64(value, state);
+    let available = ValueFields::from_f32(16_777_216.0, state);
+    assert_eq!(available, ValueFields::new(16_777_216.0, state));
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let field = ValueFields::from_f32(value, state);
         assert_eq!(field.value.to_bits(), 0, "失败值必须使用正零占位");
         assert_eq!(field.state.result(), ValueResult::CalculationFailed);
         assert_eq!(field.state.quality(), SourceQuality::Faulted);
         assert!(field.state.is_stale());
     }
     for value in [-0.0_f32, f32::from_bits(1)] {
-        let field = ValueFields::from_f64(f64::from(value), state);
+        let field = ValueFields::from_f32(value, state);
         assert_eq!(field.value.to_bits(), value.to_bits());
         assert_eq!(field.state, state);
     }
@@ -25,7 +25,7 @@ fn observation_narrowing_preserves_quality_and_reports_representation_failure() 
         false,
     );
     assert_eq!(
-        ValueFields::from_f64(f64::NAN, unavailable),
+        ValueFields::from_f32(f32::NAN, unavailable),
         ValueFields::new(0.0, unavailable)
     );
 }

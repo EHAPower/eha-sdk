@@ -129,7 +129,11 @@ fn run_bridge_script(
         .arg(script)
         .arg(mode)
         .arg(serial)
-        .arg(timeout.as_secs_f64().to_string())
+        .arg(format!(
+            "{}.{:09}",
+            timeout.as_secs(),
+            timeout.subsec_nanos()
+        ))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

@@ -5,8 +5,8 @@
 //! session loop would prevent trial deadlines and Stop confirmation from being polled.  This
 //! worker owns at most one such reader and both sides of its hand-off are bounded.
 
-use super::{parse_json_body, respond_json};
-use serde_json::{Value, json};
+use super::{JsonBody, parse_json_body, respond_json};
+use serde_json::json;
 use std::{
     sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
     thread::{self, JoinHandle},
@@ -16,7 +16,7 @@ const QUEUE_CAPACITY: usize = 8;
 
 pub(super) struct ReadyRequest {
     pub(super) request: tiny_http::Request,
-    pub(super) body: Result<Value, String>,
+    pub(super) body: Result<JsonBody, String>,
 }
 
 pub(super) struct BodyReader {

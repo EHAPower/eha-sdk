@@ -67,7 +67,7 @@ const SCHEMA_JSON: &str = config::SCHEMA_JSON;
 ///
 /// 先按 schema 检查原始 JSON，再使用固件解码器确认表示，并对转换后的值执行同一
 /// schema、标定和保护范围关系以及控制参数派生检查。浮点舍入为零、端点合并或派生转速
-/// 无法表示时不会通过。此结果不证明设备适用性或目标固件匹配，也不在固件的保存或启动
+/// 或共同输出上限与 Ki 的积分夹限边界非零归零时不会通过。此结果不证明设备适用性或目标固件匹配，也不在固件的保存或启动
 /// 路径调用。
 pub fn validate_json(json: &[u8]) -> Result<Config, ConfigurationError> {
     if json.len() > config::MAX_JSON_LEN {
@@ -149,11 +149,11 @@ pub fn validate_json(json: &[u8]) -> Result<Config, ConfigurationError> {
     }
     validate_protection(&config)?;
     // 配置接受范围保持 binary32 的既有表示约束；检查未与电机软上限取小前的派生 rpm。
-    // 只复用液压换算，不装配运行参数；计算结果保持 f64，缩窄值仅用于此边界检查。
-    let derived_rpm = config::hydraulic_velocity_to_rpm(
-        f64::from(config.protection.soft_velocity_max_mm_s),
-        f64::from(config.control.hydraulics.effective_area_mm2),
-        f64::from(config.control.hydraulics.pump_displacement_cm3_rev),
+    // 复用实际 binary32 换算与失败域，不装配运行参数。
+    let hydraulic_limit_rpm = config::hydraulic_velocity_to_rpm(
+        config.protection.soft_velocity_max_mm_s,
+        config.control.hydraulics.effective_area_mm2,
+        config.control.hydraulics.pump_displacement_cm3_rev,
     )
     .map_err(|source| {
         error(
@@ -162,13 +162,30 @@ pub fn validate_json(json: &[u8]) -> Result<Config, ConfigurationError> {
             format!("/config/control：派生控制参数无法表示：{source:?}"),
         )
     })?;
-    let represented_rpm = derived_rpm as f32;
-    if !represented_rpm.is_finite() || (derived_rpm != 0.0 && represented_rpm == 0.0) {
-        return Err(error(
-            ValidationStage::DerivedParameter,
-            Some("/config/control"),
-            "/config/control：派生控制参数无法表示：NotRepresentable",
-        ));
+    let control_limit_rpm = hydraulic_limit_rpm.min(config.protection.soft_motor_speed_max_rpm);
+    // 只检查实际积分夹限边界的非零归零。极小 Ki 的商可溢出为 infinity，
+    // 控制器在未夹限时不需要该商，因此不能据此拒绝合法小增益。
+    for (path, ki) in [
+        (
+            "/config/control/position/ki_rpm_per_mm_s",
+            config.control.position.ki_rpm_per_mm_s,
+        ),
+        (
+            "/config/control/velocity/ki_rpm_per_mm",
+            config.control.velocity.ki_rpm_per_mm,
+        ),
+        (
+            "/config/control/pressure/ki_rpm_per_mpa_s",
+            config.control.pressure.ki_rpm_per_mpa_s,
+        ),
+    ] {
+        if ki > 0.0 && control_limit_rpm / ki == 0.0 {
+            return Err(error(
+                ValidationStage::DerivedParameter,
+                Some(path),
+                format!("{path}：共同输出上限 control_limit_rpm / Ki 非零但舍入为零（Underflow）"),
+            ));
+        }
     }
     // 只排除名义心跳周期已超过联系年龄的组合，不据此证明实际收发、抖动或链路容量。
     if u64::from(config.runtime.host_heartbeat_hz)
@@ -264,17 +281,30 @@ mod tests {
     #[test]
     fn checks_ranges_after_conversion_to_firmware_numbers() {
         let mut value = candidate();
-        value["config"]["measurements"]["position"]["mm_per_count"] = json!(1e-50);
-        let error = check(&value).expect_err("positive JSON value becomes zero in f32");
-        assert!(error.to_string().contains("mm_per_count"));
+        value["config"]["control"]["position"]["ki_rpm_per_mm_s"] = json!(0.0_f32);
+        let bytes = serde_json::to_string(&value)
+            .expect("合法测试输入")
+            .replace("\"ki_rpm_per_mm_s\":0.0", "\"ki_rpm_per_mm_s\":1e-100");
+        let error = validate_json(bytes.as_bytes()).expect_err("非零增益不能变成关闭积分");
+        assert_eq!(error.stage, ValidationStage::FirmwareRepresentation);
+        assert!(error.to_string().contains("NumberUnderflow"));
+        value["config"]["control"]["position"]["kp_rpm_per_mm"] = json!(1.0_f32);
+        let midpoint = serde_json::to_string(&value)
+            .expect("合法测试输入")
+            .replace(
+                "\"kp_rpm_per_mm\":1.0",
+                "\"kp_rpm_per_mm\":1.000000059604644775390625000001",
+            );
+        let config = validate_json(midpoint.as_bytes()).expect("原token中点上侧可表示");
+        assert_eq!(config.control.position.kp_rpm_per_mm.to_bits(), 0x3f800001);
     }
 
     #[test]
     fn checks_pressure_relations_on_each_channel_after_rounding() {
         for channel in ["a", "b"] {
             let mut value = candidate();
-            value["config"]["measurements"]["pressure"][channel]["min_mpa"] = json!(-1.0);
-            value["config"]["measurements"]["pressure"][channel]["max_mpa"] = json!(1.0);
+            value["config"]["measurements"]["pressure"][channel]["min_mpa"] = json!(-1.0_f32);
+            value["config"]["measurements"]["pressure"][channel]["max_mpa"] = json!(1.0_f32);
             assert!(check(&value).is_ok(), "negative pressures remain valid");
             let raw_min = value["config"]["measurements"]["pressure"][channel]["raw_min"].clone();
             value["config"]["measurements"]["pressure"][channel]["raw_max"] = raw_min;
@@ -283,9 +313,14 @@ mod tests {
             assert_eq!(error.path.as_deref(), Some(path.as_str()));
             assert!(error.to_string().contains("必须大于同通道 raw_min"));
             let mut value = candidate();
-            value["config"]["measurements"]["pressure"][channel]["min_mpa"] = json!(1.00000001);
-            value["config"]["measurements"]["pressure"][channel]["max_mpa"] = json!(1.00000002);
-            let error = check(&value).expect_err("distinct JSON endpoints collapse to one f32");
+            value["config"]["measurements"]["pressure"][channel]["min_mpa"] = json!(1.0_f32);
+            value["config"]["measurements"]["pressure"][channel]["max_mpa"] = json!(1.0_f32);
+            let raw = serde_json::to_string(&value)
+                .expect("合法测试输入")
+                .replace("\"min_mpa\":1.0", "\"min_mpa\":1.00000001")
+                .replace("\"max_mpa\":1.0", "\"max_mpa\":1.00000002");
+            let error = validate_json(raw.as_bytes())
+                .expect_err("distinct JSON endpoints collapse to one f32");
             assert!(
                 error
                     .to_string()
@@ -296,7 +331,7 @@ mod tests {
 
     #[test]
     fn checks_control_limits_after_hydraulic_conversion() {
-        for (area, displacement) in [(1e30, 1e-30), (1e-30, 1e30)] {
+        for (area, displacement) in [(1e30_f32, 1e-30_f32), (1e-30_f32, 1e30_f32)] {
             let mut value = candidate();
             value["config"]["control"]["hydraulics"]["effective_area_mm2"] = json!(area);
             value["config"]["control"]["hydraulics"]["pump_displacement_cm3_rev"] =
@@ -304,15 +339,42 @@ mod tests {
             let error = check(&value).expect_err("derived rpm must remain representable");
             assert_eq!(error.stage, ValidationStage::DerivedParameter);
             assert!(error.to_string().contains("/config/control"));
-            assert!(error.to_string().contains("NotRepresentable"));
+            assert!(
+                error.to_string().contains("NonFinite") || error.to_string().contains("Underflow")
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_integral_bound_underflow_but_keeps_tiny_positive_gain() {
+        for (mode, field) in [
+            ("position", "ki_rpm_per_mm_s"),
+            ("velocity", "ki_rpm_per_mm"),
+            ("pressure", "ki_rpm_per_mpa_s"),
+        ] {
+            let mut value = candidate();
+            value["config"]["protection"]["soft_velocity_max_mm_s"] = json!(1e-30_f32);
+            value["config"]["control"][mode][field] = json!(1e20_f32);
+            let error = check(&value).expect_err("非零积分上限不能舍入为零");
+            assert_eq!(error.stage, ValidationStage::DerivedParameter);
+            assert_eq!(
+                error.path.as_deref(),
+                Some(format!("/config/control/{mode}/{field}").as_str())
+            );
+            assert!(error.message.contains("control_limit_rpm / Ki"));
+            // 极小 Ki 不要求其未使用的商有限，不能据此拒绝合法配置。
+            value["config"]["control"][mode][field] = json!(f32::from_bits(1));
+            assert!(check(&value).is_ok());
+            value["config"]["protection"]["soft_velocity_max_mm_s"] = json!(8.0_f32);
+            assert!(check(&value).is_ok());
         }
     }
 
     #[test]
     fn checks_protection_relations_after_firmware_rounding() {
         for (field, hard_max, quantity) in [
-            ("soft_velocity_max_mm_s", 30.0, "velocity"),
-            ("soft_pressure_max_mpa", 10.0, "pressure"),
+            ("soft_velocity_max_mm_s", 30.0_f32, "velocity"),
+            ("soft_pressure_max_mpa", 10.0_f32, "pressure"),
         ] {
             let mut value = candidate();
             assert!(check(&value).is_ok());
@@ -325,9 +387,19 @@ mod tests {
             assert!(error.to_string().contains(quantity), "{quantity}: {error}");
         }
         let mut value = candidate();
-        value["config"]["protection"]["soft_position_min_mm"] = json!(1.00000001);
-        value["config"]["protection"]["soft_position_max_mm"] = json!(1.00000002);
-        let error = check(&value).expect_err("不同端点舍入后重合");
+        value["config"]["protection"]["soft_position_min_mm"] = json!(1.0_f32);
+        value["config"]["protection"]["soft_position_max_mm"] = json!(1.0_f32);
+        let raw = serde_json::to_string(&value)
+            .expect("合法测试输入")
+            .replace(
+                "\"soft_position_min_mm\":1.0",
+                "\"soft_position_min_mm\":1.00000001",
+            )
+            .replace(
+                "\"soft_position_max_mm\":1.0",
+                "\"soft_position_max_mm\":1.00000002",
+            );
+        let error = validate_json(raw.as_bytes()).expect_err("不同端点舍入后重合");
         assert!(error.to_string().contains("position"));
     }
 

@@ -266,6 +266,7 @@ fn preflight_rejects_measured_velocity_or_force_outside_the_trial_envelope() {
 
 fn active(request: TrialRequest, started_at: Instant, started_sample_time_us: u64) -> ActiveTrial {
     ActiveTrial {
+        duration: request.duration_limit().expect("测试试验时长"),
         request,
         started_at,
         pending_position_mm: None,
@@ -431,10 +432,11 @@ pub(crate) fn session_fixture(
                         } => {
                             pump.sink.submitted(request.id);
                             let qualified = behavior != FixtureBehavior::PreflightFails;
+                            // 先交付启动所需的被动事实，再唤醒 Status 等待者；测试不依赖
+                            // 两次 EventSink 写入之间的线程调度。设备快照时间仍晚于 Status。
+                            pump.sink.received(can_observation_bytes(0, 11, qualified));
                             pump.sink
                                 .received(can_observation_bytes(query_id, 10, qualified));
-                            // This later passive frame is the fresh fact required after Status.
-                            pump.sink.received(can_observation_bytes(0, 11, qualified));
                         }
                         Message::Position(mm) | Message::Velocity(mm) | Message::Force(mm) => {
                             let mut observed = backend_observed.lock().expect("observed lock");
@@ -912,4 +914,27 @@ fn reach_requires_a_new_matching_current_run_sample() {
     assert_eq!(harness.observed.lock().expect("observed lock").stops, 1);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert_eq!(session.trial_snapshot()["stop_reason"], "position_reached");
+}
+
+#[test]
+fn trial_duration_rejects_unrepresentable_clock_values() {
+    let mut request = trial_request(Command::Position { mm: 0.0 });
+    for duration in [
+        f32::MAX,
+        f32::from_bits(1),
+        f32::NAN,
+        f32::INFINITY,
+        -1.0,
+        0.0,
+    ] {
+        request.duration_s = Some(duration);
+        request.envelope.duration_max_s = duration;
+        assert!(validate_trial_request(&request).is_err());
+    }
+    request.duration_s = Some(0.125);
+    request.envelope.duration_max_s = 1.0;
+    assert_eq!(
+        request.duration_limit().expect("可表示期限"),
+        Duration::from_millis(125)
+    );
 }

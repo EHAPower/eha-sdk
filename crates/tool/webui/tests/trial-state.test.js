@@ -2,7 +2,16 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { rawJsonNumber } from "../static/config-editor.js";
 import { trialState, trialStatusText } from "../static/trial-state.js";
+import { sliderTarget } from "../static/trial-ui.js";
+
+test("连续位置滑块拒绝超出可计算范围的十进制指数", () => {
+  assert.throws(
+    () => sliderTarget(rawJsonNumber("1e1001", "位置下限"), rawJsonNumber("2", "位置上限"), 500n),
+    /范围过大/,
+  );
+});
 
 test("completed selected member still exposes group Stop while another member is stopping", () => {
   const view = trialState(

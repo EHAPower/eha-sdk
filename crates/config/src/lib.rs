@@ -15,6 +15,7 @@ pub const SCHEMA_JSON: &str = include_str!("../schema.json");
 
 mod control;
 mod measurement;
+mod numeric;
 mod policy;
 
 pub use control::{
@@ -25,6 +26,8 @@ pub use measurement::{
     MeasurementConfig, PositionConfig, PositionDirection, PressureCalibration, PressureConfig,
 };
 pub use policy::{ProtectionConfig, RuntimeConfig};
+
+pub use numeric::{FloatParseError, parse_f32, validate_f32_tokens};
 
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +119,11 @@ pub enum JsonError {
     InvalidLength,
     /// 数值参数不能表示为有限 f32；包括 null 和解析后溢出的指数。
     NonFiniteNumber,
+    /// 原文非零数值舍入为零；偏移用于定位对应 JSON token。
+    NumberUnderflow {
+        /// 数值 token 在输入中的首字节偏移。
+        offset: usize,
+    },
     /// JSON 声明的版本不受当前配置类型支持。
     UnsupportedVersion {
         /// JSON 文档声明的版本。
@@ -159,6 +167,7 @@ impl Config {
         {
             return Err(JsonError::NonFiniteNumber);
         }
+        validate_f32_tokens(json)?;
         Ok(document.config)
     }
 
@@ -195,6 +204,26 @@ mod tests {
     extern crate std;
 
     use super::*;
+
+    #[test]
+    fn rejects_nonzero_underflow_even_for_zero_allowed_gain() {
+        let json = core::str::from_utf8(TEST_JSON)
+            .expect("合法测试输入")
+            .replace(r#""ki_rpm_per_mm_s":0.0"#, r#""ki_rpm_per_mm_s":1e-100"#);
+        assert!(Config::from_json(json.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn parses_decimal_midpoint_directly_to_binary32() {
+        let json = core::str::from_utf8(TEST_JSON)
+            .expect("合法测试输入")
+            .replace("0.5", "1.000000059604644775390625000001");
+        let config = Config::from_json(json.as_bytes()).expect("合法测试输入");
+        assert_eq!(
+            config.measurements.position.mm_per_count.to_bits(),
+            0x3f800001
+        );
+    }
 
     #[test]
     fn rejects_nonfinite_json_numbers_before_storage_or_encoding() {

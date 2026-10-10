@@ -120,8 +120,7 @@ impl Recording {
                 .and_then(|values| values.get(index))
                 .unwrap_or(&Value::Null);
             [
-                value["value"]
-                    .as_f64()
+                super::observed_f32(&value["value"])
                     .map_or_else(String::new, |number| number.to_string()),
                 value["result"]
                     .as_u64()

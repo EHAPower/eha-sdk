@@ -93,21 +93,32 @@ enum Action {
     /// 显式提交速度目标，单位 mm/s；返回仅表示本地 I/O 完整提交。
     Velocity {
         /// 目标速度，单位 mm/s。
+        #[arg(value_parser = crate::parse_f32)]
         mm_s: f32,
     },
     /// 显式提交位置目标，单位 mm；返回仅表示本地 I/O 完整提交。
-    Position { mm: f32 },
+    Position {
+        #[arg(value_parser = crate::parse_f32)]
+        mm: f32,
+    },
     /// 显式提交力目标，单位 N；返回仅表示本地 I/O 完整提交。
-    Force { n: f32 },
+    Force {
+        #[arg(value_parser = crate::parse_f32)]
+        n: f32,
+    },
     /// 显式提交阻抗目标：平衡位置 mm、刚度 N/mm、阻尼 N·s/mm。
     Impedance {
+        #[arg(value_parser = crate::parse_f32)]
         equilibrium_mm: f32,
+        #[arg(value_parser = crate::parse_f32)]
         stiffness_n_per_mm: f32,
+        #[arg(value_parser = crate::parse_f32)]
         damping_ns_per_mm: f32,
     },
     /// 在同一会话内显式启停心跳和控制，进行受启动配置限值约束的短时速度试验。
     VelocityTest {
         /// 目标速度，单位 mm/s；必须为非零有限值，且不超过实际启动配置的速度软幅值。
+        #[arg(value_parser = crate::parse_f32)]
         mm_s: f32,
         /// 保持目标并观察遥测的时长，单位秒；只能是 1 至 10 秒。
         #[arg(value_parser = clap::value_parser!(u8).range(1..=10))]
@@ -655,6 +666,33 @@ fn hex_bytes(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cli_control_parses_decimal_once_and_rejects_loss_before_device_io() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            device: DeviceCommand,
+        }
+        let decimal = "1.0000000596046447753906250000000000000000000001";
+        let cli = <TestCli as clap::Parser>::try_parse_from([
+            "test", "--usb", "missing", "position", decimal,
+        ])
+        .expect("CLI 原文");
+        let mm = match cli.device.action {
+            Action::Position { mm } => mm,
+            _ => f32::NAN,
+        };
+        assert_eq!(mm.to_bits(), 0x3f800001);
+        for token in ["1e-999", "NaN", "1e100"] {
+            assert!(
+                <TestCli as clap::Parser>::try_parse_from([
+                    "test", "--usb", "missing", "position", token
+                ])
+                .is_err()
+            );
+        }
+    }
+
     use super::{Action, DeviceCommand, run};
 
     fn missing_usb_velocity_test(mm_s: f32) -> DeviceCommand {

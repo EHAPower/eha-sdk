@@ -1092,10 +1092,14 @@ mod tests {
         let (mut workbench, probe, _) =
             group_workbench(FixtureBehavior::Ready, FixtureBehavior::Ready);
 
-        workbench
+        let first = workbench
             .group_trial_start(&[1], request())
-            .expect("first group starts");
-        workbench.group_stop(&[]).expect("group stop submits once");
+            .expect("first group returns results");
+        assert_eq!(first["ok"], true, "first group did not start: {first}");
+        assert_eq!(probe.observed.lock().expect("observations").targets, 1);
+        let stopped = workbench.group_stop(&[]).expect("group stop submits once");
+        assert_eq!(stopped["ok"], true);
+        assert_eq!(probe.observed.lock().expect("observations").stops, 1);
         probe.complete_stop();
         for _ in 0..20 {
             workbench.tick();
@@ -1111,5 +1115,7 @@ mod tests {
                 .expect("second group result")["ok"]
                 == true
         );
+        assert_eq!(probe.observed.lock().expect("observations").targets, 2);
+        assert_eq!(probe.observed.lock().expect("observations").stops, 1);
     }
 }

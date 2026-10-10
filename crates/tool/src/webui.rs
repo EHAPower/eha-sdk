@@ -530,7 +530,7 @@ fn handle_request_with_scan_body(
     workbench: &mut Workbench,
     odrive: &mut OdriveView,
     scan: &mut CanScanView,
-    parsed_body: Option<Result<Value, String>>,
+    parsed_body: Option<Result<JsonBody, String>>,
 ) -> Result<(), String> {
     odrive.reap();
     scan.reap();
@@ -671,7 +671,7 @@ fn handle_request_with_scan_body(
                     },
                 )
             }
-            "/api/connect" => match serde_json::from_value::<ConnectionRequest>(body) {
+            "/api/connect" => match body.decode::<ConnectionRequest>() {
                 Ok(connection) => {
                     let transport = transport_from_connection(&connection);
                     if workbench.has_active_trial() {
@@ -788,7 +788,7 @@ fn handle_request_with_scan_body(
                         return respond_json(request, 400, json!({"ok":false,"message":message}));
                     }
                 };
-                match serde_json::from_value::<Command>(body.clone()) {
+                match body.decode::<Command>() {
                     Ok(command) => {
                         let node = body_node(&body);
                         if (workbench.has_active_trial() || scan.busy)
@@ -1054,11 +1054,10 @@ fn handle_request_with_scan_body(
                     }
                 };
                 let result = match action {
-                    Some("trial_start") if !workbench.has_active_trial() && !scan.busy => {
-                        serde_json::from_value(body.get("trial").cloned().unwrap_or(Value::Null))
-                            .map_err(|error| format!("trial 参数无效：{error}"))
-                            .and_then(|trial| workbench.group_trial_start(&nodes, trial))
-                    }
+                    Some("trial_start") if !workbench.has_active_trial() && !scan.busy => body
+                        .decode_field("trial")
+                        .map_err(|error| format!("trial 参数无效：{error}"))
+                        .and_then(|trial| workbench.group_trial_start(&nodes, trial)),
                     Some("stop") => workbench.group_stop(&nodes),
                     Some("heartbeat_start") if !workbench.has_active_trial() && !scan.busy => {
                         workbench.group_heartbeat(&nodes, true)
@@ -1198,18 +1197,14 @@ fn connection_node(connection: &ConnectionRequest) -> Option<u8> {
         ConnectionRequest::Can { node, .. } => Some(*node),
     }
 }
-fn trial_action(body: &Value) -> Result<TrialAction, String> {
+fn trial_action(body: &JsonBody) -> Result<TrialAction, String> {
     match body.get("action").and_then(Value::as_str) {
-        Some("start") => serde_json::from_value(body.get("trial").cloned().unwrap_or(Value::Null))
+        Some("start") => body
+            .decode_field("trial")
             .map(TrialAction::Start)
             .map_err(|error| format!("trial 参数无效：{error}")),
         Some("stop") => Ok(TrialAction::Stop),
-        Some("target") => body
-            .get("mm")
-            .and_then(Value::as_f64)
-            .filter(|mm| mm.is_finite())
-            .map(|mm| TrialAction::Target(mm as f32))
-            .ok_or_else(|| "target 必须提供有限 mm".into()),
+        Some("target") => body.decode_f32_field("mm").map(TrialAction::Target),
         _ => Err("trial action 必须为 start、stop 或 target".into()),
     }
 }
@@ -1317,7 +1312,55 @@ fn validate_write_request(request: &tiny_http::Request, port: u16) -> Result<(),
     }
     Ok(())
 }
-pub(super) fn parse_json_body(request: &mut tiny_http::Request) -> Result<Value, String> {
+/// 路由元数据使用 Value；业务字段始终从保留的 JSON 原文直接解码为 f32。
+/// Value 只用于字符串、布尔和整数路由判断，不回流业务数值。
+pub(super) struct JsonBody {
+    metadata: Value,
+    raw: String,
+    fields: std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
+}
+
+impl std::ops::Deref for JsonBody {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.metadata
+    }
+}
+
+impl JsonBody {
+    fn parse(raw: String) -> Result<Self, String> {
+        let metadata = serde_json::from_str(&raw).map_err(|error| format!("JSON 无效：{error}"))?;
+        let fields = crate::raw_json_fields(&raw).map_err(|error| format!("JSON 无效：{error}"))?;
+        Ok(Self {
+            metadata,
+            raw,
+            fields,
+        })
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
+        // 根请求的未知字段保持 serde 兼容行为；Command 只检查实际采用的数值字段。
+        serde_json::from_str(&self.raw).map_err(|error| error.to_string())
+    }
+
+    fn decode_f32_field(&self, name: &str) -> Result<f32, String> {
+        let raw = self
+            .fields
+            .get(name)
+            .ok_or_else(|| format!("缺少 {name}"))?;
+        crate::parse_f32(raw.get())
+    }
+
+    fn decode_field<T: serde::de::DeserializeOwned>(&self, name: &str) -> Result<T, String> {
+        let raw = self
+            .fields
+            .get(name)
+            .ok_or_else(|| format!("缺少 {name}"))?;
+        serde_json::from_str(raw.get()).map_err(|error| error.to_string())
+    }
+}
+
+pub(super) fn parse_json_body(request: &mut tiny_http::Request) -> Result<JsonBody, String> {
     let mut body = String::new();
     request
         .as_reader()
@@ -1327,7 +1370,7 @@ pub(super) fn parse_json_body(request: &mut tiny_http::Request) -> Result<Value,
     if body.len() as u64 > MAX_JSON_BODY {
         return Err("JSON 请求过大".into());
     }
-    serde_json::from_str(&body).map_err(|error| format!("JSON 无效：{error}"))
+    JsonBody::parse(body)
 }
 fn common_headers(
     response: &mut Response<std::io::Cursor<Vec<u8>>>,
@@ -1416,6 +1459,100 @@ mod tests {
         time::Duration,
     };
     use tiny_http::Server;
+    #[test]
+    fn numeric_requests_decode_original_decimal_once() {
+        let decimal = "1.0000000596046447753906250000000000000000000001";
+        let action = super::JsonBody::parse(format!(
+            r#"{{"action":"position","mm":{decimal},"future":1e-999}}"#
+        ))
+        .expect("原始动作");
+        let mm = match action.decode().expect("动作 f32") {
+            crate::session::Command::Position { mm } => mm,
+            _ => f32::NAN,
+        };
+        assert_eq!(mm.to_bits(), 0x3f800001);
+        let target = super::JsonBody::parse(format!(r#"{{"action":"target","mm":{decimal}}}"#))
+            .expect("目标");
+        let mm = match super::trial_action(&target).expect("目标 f32") {
+            super::TrialAction::Target(mm) => mm,
+            _ => f32::NAN,
+        };
+        assert_eq!(mm.to_bits(), 0x3f800001);
+        for action_name in ["start", "trial_start"] {
+            let body = super::JsonBody::parse(format!(r#"{{"action":"{action_name}","trial":{{"command":{{"action":"position","mm":{decimal},"future":1e-999}},"envelope":{{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":1,"force_abs_max_n":2,"stiffness_max_n_per_mm":3,"damping_max_ns_per_mm":4,"duration_max_s":2}},"duration_s":1,"reach":null}}}}"#)).expect("试验原文");
+            let trial: crate::session::TrialRequest =
+                body.decode_field("trial").expect("单台／群组试验 f32");
+            let mm = match trial.command {
+                crate::session::Command::Position { mm } => mm,
+                _ => f32::NAN,
+            };
+            assert_eq!(mm.to_bits(), 0x3f800001);
+        }
+    }
+
+    #[test]
+    fn routing_ignores_unknown_numbers_without_adopting_them() {
+        let stop =
+            super::JsonBody::parse(r#"{"transport":"usb","action":"stop","future":1e-999}"#.into())
+                .expect("原始 Stop");
+        assert!(matches!(
+            stop.decode::<crate::session::Command>(),
+            Ok(crate::session::Command::Stop)
+        ));
+        let connection = super::JsonBody::parse(
+            r#"{"transport":"usb","serial":"selected","future":1e-999}"#.into(),
+        )
+        .expect("原始连接");
+        assert_eq!(
+            connection
+                .decode::<crate::session::ConnectionRequest>()
+                .expect("未知数值字段不被采用"),
+            crate::session::ConnectionRequest::Usb {
+                serial: "selected".into()
+            }
+        );
+    }
+
+    #[test]
+    fn numeric_requests_reject_underflow_and_overflow_before_submission() {
+        for raw in [
+            r#"{"action":"position","mm":1,"mm":2}"#,
+            r#"{"action":"target","mm":1,"mm":2}"#,
+            r#"{"action":"trial_start","trial":{},"trial":{}}"#,
+            r#"{"action":"stop","action":"target"}"#,
+        ] {
+            assert!(super::JsonBody::parse(raw.into()).is_err());
+        }
+        for token in [
+            "1e-999",
+            "-1e-999",
+            "1e100",
+            "1000000000000000000000000000000000000000000000000000",
+        ] {
+            let body = super::JsonBody::parse(format!(r#"{{"action":"target","mm":{token}}}"#));
+            assert!(body.and_then(|body| super::trial_action(&body)).is_err());
+        }
+        let trial = r#"{"command":{"action":"position","mm":1},"envelope":{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":1,"force_abs_max_n":2,"stiffness_max_n_per_mm":3,"damping_max_ns_per_mm":4,"duration_max_s":2},"duration_s":1,"reach":{"tolerance_mm":1,"settle_ms":1}}"#;
+        for field in ["mm", "velocity_abs_max_mm_s", "duration_s", "tolerance_mm"] {
+            let bad = trial.replace(&format!("\"{field}\":1"), &format!("\"{field}\":1e-999"));
+            let body =
+                super::JsonBody::parse(format!("{{\"trial\":{bad}}}")).expect("合法试验 JSON");
+            assert!(
+                body.decode_field::<crate::session::TrialRequest>("trial")
+                    .is_err(),
+                "{field} 下溢不能被采用"
+            );
+        }
+        let body =
+            super::JsonBody::parse(r#"{"action":"target","mm":1.401298464324817e-45}"#.into())
+                .expect("次正规数");
+        let mm = match super::trial_action(&body).expect("保留次正规数") {
+            super::TrialAction::Target(mm) => mm,
+            _ => f32::NAN,
+        };
+        assert_eq!(mm.to_bits(), 1);
+    }
+
     fn send_request(
         request: impl FnOnce(u16) -> String,
     ) -> Result<String, Box<dyn Error + Send + Sync>> {

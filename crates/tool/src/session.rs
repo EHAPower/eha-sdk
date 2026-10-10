@@ -57,7 +57,7 @@ pub enum ConnectionRequest {
 }
 
 /// 一个会话内可执行的业务动作。所有控制动作的成功只表示 SDK 的本地完整提交。
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum Command {
     Status,
@@ -102,6 +102,70 @@ pub enum Command {
     },
     ResetApplication,
     EnterUpdate,
+}
+
+/// serde 的带 tag 枚举会缓存通用数值；在业务输入入口保留每个字段原文。
+impl<'de> Deserialize<'de> for Command {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let fields = crate::raw_json_fields(raw.get()).map_err(serde::de::Error::custom)?;
+        fn field<T: serde::de::DeserializeOwned>(
+            fields: &std::collections::BTreeMap<String, Box<serde_json::value::RawValue>>,
+            name: &str,
+        ) -> Result<T, String> {
+            let value = fields.get(name).ok_or_else(|| format!("缺少 {name}"))?;
+            eha_sdk::config::validate_f32_tokens(value.get().as_bytes())
+                .map_err(|error| format!("数值输入无效：{error:?}"))?;
+            serde_json::from_str(value.get()).map_err(|error| error.to_string())
+        }
+        let action: String = field(&fields, "action").map_err(serde::de::Error::custom)?;
+        let decode = || -> Result<Self, String> {
+            Ok(match action.as_str() {
+                "status" => Self::Status,
+                "measurements" => Self::Measurements,
+                "diagnostics" => Self::Diagnostics,
+                "telemetry" => Self::Telemetry,
+                "heartbeat_start" => Self::HeartbeatStart,
+                "heartbeat_stop" => Self::HeartbeatStop,
+                "heartbeat_once" => Self::HeartbeatOnce,
+                "position" => Self::Position {
+                    mm: field(&fields, "mm")?,
+                },
+                "velocity" => Self::Velocity {
+                    mm_s: field(&fields, "mm_s")?,
+                },
+                "force" => Self::Force {
+                    n: field(&fields, "n")?,
+                },
+                "impedance" => Self::Impedance {
+                    equilibrium_mm: field(&fields, "equilibrium_mm")?,
+                    stiffness_n_per_mm: field(&fields, "stiffness_n_per_mm")?,
+                    damping_ns_per_mm: field(&fields, "damping_ns_per_mm")?,
+                },
+                "stop" => Self::Stop,
+                "config_read" => Self::ConfigRead {
+                    view: field(&fields, "view")?,
+                },
+                "config_validate" => Self::ConfigValidate {
+                    record: field(&fields, "record")?,
+                },
+                "config_save" => Self::ConfigSave {
+                    record: field(&fields, "record")?,
+                },
+                "restore_factory" => Self::RestoreFactory,
+                "maintenance_result" => Self::MaintenanceResult {
+                    operation_key: field(&fields, "operation_key")?,
+                },
+                "maintenance_release" => Self::MaintenanceRelease {
+                    operation_key: field(&fields, "operation_key")?,
+                },
+                "reset_application" => Self::ResetApplication,
+                "enter_update" => Self::EnterUpdate,
+                _ => return Err(format!("未知 action：{action}")),
+            })
+        };
+        decode().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1024,6 +1088,7 @@ impl ToolSession {
         let initial_position = matches!(request.command, Command::Position { .. });
         self.trial.active = Some(ActiveTrial {
             request: request.clone(),
+            duration: request.duration_limit()?,
             started_at: Instant::now(),
             pending_position_mm: None,
             last_position_submit: initial_position.then(Instant::now),
@@ -1122,11 +1187,7 @@ impl ToolSession {
         if active.stop_submission.is_some() {
             return None;
         }
-        let deadline = active
-            .request
-            .duration_s
-            .unwrap_or(active.request.envelope.duration_max_s);
-        if active.started_at.elapsed().as_secs_f64() >= deadline {
+        if active.started_at.elapsed() >= active.duration {
             return Some("duration_elapsed".into());
         }
         let telemetry = match self
@@ -1163,14 +1224,13 @@ impl ToolSession {
             return Some("runtime_facts_invalid".into());
         }
         let values = telemetry["main_values"].as_array().expect("checked length");
-        if values[0]["value"].as_f64().is_none_or(|value| {
-            value < f64::from(active.request.envelope.position_min_mm)
-                || value > f64::from(active.request.envelope.position_max_mm)
-        }) || values[1]["value"].as_f64().is_none_or(|value| {
-            value.abs() > f64::from(active.request.envelope.velocity_abs_max_mm_s)
-        }) || values[4]["value"]
-            .as_f64()
-            .is_none_or(|value| value.abs() > f64::from(active.request.envelope.force_abs_max_n))
+        if observed_f32(&values[0]["value"]).is_none_or(|value| {
+            value < active.request.envelope.position_min_mm
+                || value > active.request.envelope.position_max_mm
+        }) || observed_f32(&values[1]["value"])
+            .is_none_or(|value| value.abs() > active.request.envelope.velocity_abs_max_mm_s)
+            || observed_f32(&values[4]["value"])
+                .is_none_or(|value| value.abs() > active.request.envelope.force_abs_max_n)
         {
             return Some("runtime_envelope_exceeded".into());
         }
@@ -1190,7 +1250,7 @@ impl ToolSession {
             active.settled_since = None;
             return None;
         }
-        let position = telemetry["main_values"][0]["value"].as_f64()? as f32;
+        let position = observed_f32(&telemetry["main_values"][0]["value"])?;
         if (position - mm).abs() > reach.tolerance_mm {
             active.settled_since = None;
             return None;
@@ -1562,15 +1622,14 @@ fn trial_target_matches(telemetry: &Value, command: &Command) -> bool {
         && values.is_some_and(|values| {
             values.len() == 3
                 && values.iter().zip(expected).all(|(actual, expected)| {
-                    actual
-                        .as_f64()
-                        .is_some_and(|value| (value as f32 - expected).abs() <= 1e-4)
+                    observed_f32(actual).is_some_and(|value| value == expected)
                 })
         })
 }
 
 fn validate_trial_request(request: &TrialRequest) -> Result<(), SessionError> {
     let envelope = &request.envelope;
+    request.duration_limit()?;
     if !matches!(
         request.command,
         Command::Position { .. }
@@ -1682,33 +1741,44 @@ fn validate_trial_facts(
     if values.len() < 5 || !values.iter().take(5).all(fresh_value) {
         return Err(invalid("位置、速度、压力或力测量不新鲜/不合格"));
     }
-    if values[0]["value"].as_f64().is_none_or(|value| {
-        value < f64::from(request.envelope.position_min_mm)
-            || value > f64::from(request.envelope.position_max_mm)
-    }) || values[1]["value"]
-        .as_f64()
-        .is_none_or(|value| value.abs() > f64::from(request.envelope.velocity_abs_max_mm_s))
-        || values[4]["value"]
-            .as_f64()
-            .is_none_or(|value| value.abs() > f64::from(request.envelope.force_abs_max_n))
+    if observed_f32(&values[0]["value"]).is_none_or(|value| {
+        value < request.envelope.position_min_mm || value > request.envelope.position_max_mm
+    }) || observed_f32(&values[1]["value"])
+        .is_none_or(|value| value.abs() > request.envelope.velocity_abs_max_mm_s)
+        || observed_f32(&values[4]["value"])
+            .is_none_or(|value| value.abs() > request.envelope.force_abs_max_n)
     {
         return Err(invalid("当前位置、速度或力超出本次试验范围"));
     }
     let config = startup["data_utf8"]
         .as_str()
         .ok_or_else(|| invalid("实际 Startup 配置不可读"))?;
-    let config: Value =
-        serde_json::from_str(config).map_err(|_| invalid("实际 Startup 配置不是有效 JSON"))?;
-    let protection = &config["config"]["protection"];
-    let number = |name: &str| protection[name].as_f64().map(|value| value as f32);
-    let (Some(position_min), Some(position_max), Some(velocity_max), Some(force_max)) = (
-        number("hard_position_min_mm"),
-        number("hard_position_max_mm"),
-        number("hard_velocity_max_mm_s"),
-        number("hard_force_max_n"),
-    ) else {
-        return Err(invalid("实际 Startup 配置缺少硬保护范围"));
-    };
+    #[derive(Deserialize)]
+    struct Protection {
+        hard_position_min_mm: f32,
+        hard_position_max_mm: f32,
+        hard_velocity_max_mm_s: f32,
+        hard_force_max_n: f32,
+    }
+    #[derive(Deserialize)]
+    struct StartupConfig {
+        protection: Protection,
+    }
+    #[derive(Deserialize)]
+    struct StartupRecord {
+        config: StartupConfig,
+    }
+    eha_sdk::config::validate_f32_tokens(config.as_bytes())
+        .map_err(|_| invalid("实际 Startup 配置包含不可表示数值"))?;
+    let config: StartupRecord = serde_json::from_str(config)
+        .map_err(|_| invalid("实际 Startup 配置缺少硬保护范围或不是有效 JSON"))?;
+    let protection = config.config.protection;
+    let (position_min, position_max, velocity_max, force_max) = (
+        protection.hard_position_min_mm,
+        protection.hard_position_max_mm,
+        protection.hard_velocity_max_mm_s,
+        protection.hard_force_max_n,
+    );
     let envelope = &request.envelope;
     if envelope.position_min_mm < position_min
         || envelope.position_max_mm > position_max
@@ -2766,3 +2836,11 @@ mod tests {
 #[cfg(test)]
 #[path = "trial_tests.rs"]
 pub(crate) mod trial_tests;
+
+/// 仅接受 SDK 实际 f32 序列化的内部遥测 Number，展示字符串不参与保护判断。
+pub(crate) fn observed_f32(value: &Value) -> Option<f32> {
+    let Value::Number(number) = value else {
+        return None;
+    };
+    eha_sdk::config::parse_f32(&number.to_string()).ok()
+}

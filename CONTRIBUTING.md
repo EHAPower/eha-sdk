@@ -44,7 +44,7 @@ rustup target add thumbv7em-none-eabihf
 python3 scripts/check.py
 ```
 
-入口运行 SDK 与工具的格式、Rust 测试、Web UI 遥测测试、Clippy、API 文档、SDK ARM `no_std`
+入口首先检查自有 Rust 的 binary32 规则，再运行 SDK 与工具的格式、Rust 测试、Web UI 遥测测试、Clippy、API 文档、SDK ARM `no_std`
 检查和工具 release 构建，不访问设备。局部变更按实际影响选择相称命令。已有 vendor 资源可直接构建，
 不需要先安装 npm 依赖。
 
@@ -65,3 +65,5 @@ cargo build -p eha-tool --release --locked
 SDK 与工具共用 `workspace.package.version`；修改后运行
 `cargo update --workspace --offline` 更新工作区锁文件。消费者选择兼容的 SDK 修订并维护
 自己的 `Cargo.lock`。
+
+仅检查数值规则可执行 `python3 scripts/check.py --numeric-only`；采用方可加 `--numeric-root PATH`，对其工作区复用同一规则。业务字段和测试用 `f32`；整数计数／时基保持整数。JSON 依赖显式启用 `float_roundtrip`，有用户输入的入口保留原文直接解码，并使用 `eha-config` 数值解析检查非有限、溢出和非零下溢。第三方库与浏览器原生数值不纳入 Rust 源码扫描。

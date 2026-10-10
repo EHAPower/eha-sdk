@@ -636,7 +636,12 @@ impl Client {
             .heartbeat_hz
             .filter(|hz| *hz > 0)
             .ok_or_else(|| invalid("身份未给出有效心跳频率"))?;
-        let period = Duration::from_secs_f64(1.0 / f64::from(hz));
+        // 整数纳秒按最近取偶舍入，避免将整数频率转为浮点时基。
+        let divisor = u64::from(hz);
+        let quotient = 1_000_000_000 / divisor;
+        let remainder = 1_000_000_000 % divisor;
+        let round_up = remainder * 2 > divisor || (remainder * 2 == divisor && quotient % 2 != 0);
+        let period = Duration::from_nanos(quotient + u64::from(round_up));
         if period.is_zero() {
             return Err(invalid("心跳周期无法以主机时钟表示"));
         }

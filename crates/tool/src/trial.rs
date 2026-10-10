@@ -2,28 +2,36 @@
 
 //! 单次显式试验的客户端范围和生命周期状态。
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::Command;
+use super::{Command, SessionError, invalid};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrialEnvelope {
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub position_min_mm: f32,
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub position_max_mm: f32,
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub velocity_abs_max_mm_s: f32,
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub force_abs_max_n: f32,
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub stiffness_max_n_per_mm: f32,
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub damping_max_ns_per_mm: f32,
-    pub duration_max_s: f64,
+    #[serde(deserialize_with = "crate::deserialize_f32")]
+    pub duration_max_s: f32,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReachCondition {
+    #[serde(deserialize_with = "crate::deserialize_f32")]
     pub tolerance_mm: f32,
     pub settle_ms: u64,
 }
@@ -33,7 +41,8 @@ pub struct ReachCondition {
 pub struct TrialRequest {
     pub command: Command,
     pub envelope: TrialEnvelope,
-    pub duration_s: Option<f64>,
+    #[serde(default, deserialize_with = "crate::deserialize_optional_f32")]
+    pub duration_s: Option<f32>,
     pub reach: Option<ReachCondition>,
 }
 
@@ -48,6 +57,7 @@ pub(crate) struct PreparedTrial {
 pub(crate) struct ActiveTrial {
     pub(crate) request: TrialRequest,
     pub(crate) started_at: Instant,
+    pub(crate) duration: Duration,
     pub(crate) pending_position_mm: Option<f32>,
     pub(crate) last_position_submit: Option<Instant>,
     pub(crate) settled_since: Option<Instant>,
@@ -87,5 +97,14 @@ impl TrialState {
             return completed.clone();
         }
         json!({"state":"idle"})
+    }
+}
+
+impl TrialRequest {
+    pub(crate) fn duration_limit(&self) -> Result<Duration, SessionError> {
+        Duration::try_from_secs_f32(self.duration_s.unwrap_or(self.envelope.duration_max_s))
+            .ok()
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| invalid("试验时长必须为主机时钟可表示的正数"))
     }
 }

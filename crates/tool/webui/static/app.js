@@ -1,7 +1,7 @@
 // Copyright The eha-sdk Contributors
 
 import { createTelemetryChart, selectedContactGuidance, telemetryReception } from "./telemetry.js";
-import { createConfigEditor } from "./config-editor.js";
+import { createConfigEditor, rawJsonNumber, stringifyJson } from "./config-editor.js";
 import { createTrialUi } from "./trial-ui.js";
 import { createRecordingUi } from "./recording-ui.js";
 import { trialState } from "./trial-state.js";
@@ -320,7 +320,7 @@ async function responseJson(response) {
   catch (_) { throw new Error("服务返回了非 JSON 响应。"); }
 }
 async function post(path, payload = {}) {
-  const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload), credentials: "same-origin" });
+  const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: stringifyJson(payload), credentials: "same-origin" });
   const body = await responseJson(response);
   if (!response.ok || body.ok === false) {
     const error = new Error(body.message || `HTTP ${response.status}`);
@@ -643,7 +643,7 @@ function unavailable() {
   updateActionAvailability();
 }
 function command(action, fields = {}) { return run("/api/action", { action, ...fields }, actionLabel(action)); }
-function number(form, name) { const raw = String(new FormData(form).get(name) ?? "").trim(); if (!raw) throw new Error(`${name} 不能为空。`); const value = Number(raw); if (!Number.isFinite(value)) throw new Error(`${name} 必须是有限数值。`); return value; }
+function number(form, name) { return rawJsonNumber(new FormData(form).get(name), name); }
 function populateDevices(select, devices, valueKey, placeholder) {
   const previous = select.value;
   const candidates = devices.filter((device) => device[valueKey]);
