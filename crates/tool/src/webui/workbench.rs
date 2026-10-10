@@ -135,9 +135,22 @@ impl Workbench {
             })
     }
 
+    pub(crate) fn has_pending_interrupted_trial(&self) -> bool {
+        std::iter::once(&self.usb)
+            .chain(self.can_nodes.values())
+            .any(|session| session.trial_snapshot()["state"] == "interrupted_unknown")
+    }
+
+    pub(crate) fn has_unresolved_trial(&self) -> bool {
+        self.has_active_trial() || self.has_pending_interrupted_trial()
+    }
+
     /// 扫描会建立短生命周期的 Identity 查询。只要任一已持有会话仍在心跳或最后遥测
     /// 显示非 Idle 持续目标，就不能让这类查询与控制共享同一设备入口竞争。
     pub(crate) fn can_scan_guard(&mut self) -> Result<(), String> {
+        if self.has_unresolved_trial() {
+            return Err("有中断且结果未知的试验；先重连原会话、核对身份并显式 Stop。".into());
+        }
         let mut sessions = std::iter::once(&mut self.usb).chain(self.can_nodes.values_mut());
         if sessions.any(session_scan_blocker) {
             return Err(
@@ -185,6 +198,11 @@ impl Workbench {
     pub(crate) fn connect(&mut self, request: ConnectionRequest) -> Result<Value, SessionError> {
         match request {
             ConnectionRequest::Usb { .. } => {
+                if self.has_pending_interrupted_trial() {
+                    return Err(session_error(
+                        "中断试验等待同一会话重连；不能新建或切换连接",
+                    ));
+                }
                 self.usb.connect(request)?;
                 Ok(json!({"connected": true}))
             }
@@ -219,6 +237,15 @@ impl Workbench {
         set_default: bool,
     ) -> Result<Value, String> {
         validate_nodes(nodes)?;
+        if self.has_pending_interrupted_trial()
+            && nodes.iter().any(|node| {
+                self.can_nodes.get(node).is_none_or(|session| {
+                    session.trial_snapshot()["state"] != "interrupted_unknown"
+                })
+            })
+        {
+            return Err("中断试验等待原节点重连；不能连接或切换其他 CAN 节点".into());
+        }
         self.ensure_network(channel.clone(), mode.clone(), python.clone())?;
         let mut results = Vec::with_capacity(nodes.len());
         for &node in nodes {
@@ -274,6 +301,11 @@ impl Workbench {
         transport: Transport,
         node: Option<u8>,
     ) -> Result<(), SessionError> {
+        if self.has_pending_interrupted_trial()
+            && self.session_mut(transport, node)?.trial_snapshot()["state"] != "interrupted_unknown"
+        {
+            return Err(session_error("中断试验等待其原会话重连；不能恢复其他连接"));
+        }
         if transport == Transport::Can {
             let selected = self.selected_node(node).map_err(session_error)?;
             if !self.can_nodes.contains_key(&selected) {
@@ -318,7 +350,7 @@ impl Workbench {
         node: Option<u8>,
         command: Command,
     ) -> Result<CommandResult, SessionError> {
-        if self.has_active_trial() {
+        if self.has_unresolved_trial() {
             if matches!(command, Command::Stop) {
                 return self.stop_control(transport, node);
             }
@@ -370,7 +402,7 @@ impl Workbench {
         node: Option<u8>,
         start: bool,
     ) -> Result<Value, SessionError> {
-        if start && self.has_active_trial() {
+        if start && self.has_unresolved_trial() {
             return Err(session_error(
                 "有进行中的试验或 Stop 确认；不能从另一通路启动记录并读取 Startup。",
             ));
@@ -392,7 +424,7 @@ impl Workbench {
     ) -> Result<Value, SessionError> {
         match action {
             TrialAction::Start(request) => {
-                if self.has_active_trial() {
+                if self.has_unresolved_trial() {
                     return Err(session_error(
                         "已有进行中的试验或 Stop 确认；不能启动第二个试验",
                     ));
@@ -457,7 +489,7 @@ impl Workbench {
         request: TrialRequest,
     ) -> Result<Value, String> {
         validate_nodes(nodes)?;
-        if self.has_active_trial() {
+        if self.has_unresolved_trial() {
             return Err("上一组试验仍在运行或等待 Stop 确认；不能启动新试验".into());
         }
         let mut identities = BTreeSet::new();
@@ -548,13 +580,9 @@ impl Workbench {
                 .to_owned();
             let result = match state.as_str() {
                 "active" | "stopping" => session.stop_trial(),
-                // Transport interruption has no active Trial state to stop, but the user has
-                // explicitly asked to cover the original group range once. Do not retry this
-                // submission automatically.
-                "interrupted_unknown" => session
-                    .execute(Command::Stop)
-                    .and_then(|result| serde_json::to_value(result).map_err(json_error)),
-                "idle" | "completed" => Ok(json!({"state":state,"skipped":true})),
+                "idle" | "completed" | "interrupted_unrecoverable" => {
+                    Ok(json!({"state":state,"skipped":true}))
+                }
                 _ => session.stop_trial(),
             };
             match result {
@@ -793,7 +821,7 @@ fn identity_of(session: &mut ToolSession) -> Value {
 fn trial_active(session: &ToolSession) -> bool {
     matches!(
         session.trial_snapshot()["state"].as_str(),
-        Some("active" | "stopping")
+        Some("active" | "stopping" | "interrupted_unknown")
     )
 }
 
@@ -810,13 +838,11 @@ fn scan_snapshot_blocker(heartbeat: &Value, telemetry: Option<&Value>) -> bool {
             .is_some_and(|mode| mode != 0)
 }
 
-/// 只有成员已报告终态才释放群组范围。`stopping` 和任何未知/中断投影都保留范围，
-/// 让用户仍可覆盖原始成员发出显式 Stop；未来 TrialSession 若加入 `completed`，也
-/// 不会让已结束组永久锁住重连或下一轮试验。
+/// 只有成员已报告终态，或经 Identity 确认不是原运行实例时，才释放群组范围。
 fn group_member_terminal(session: &ToolSession) -> bool {
     matches!(
         session.trial_snapshot()["state"].as_str(),
-        Some("idle" | "completed")
+        Some("idle" | "completed" | "interrupted_unrecoverable")
     )
 }
 
@@ -867,10 +893,6 @@ fn session_error(message: impl Into<String>) -> SessionError {
         observed_transport: None,
         transport_raw_hex: None,
     }
-}
-
-fn json_error(error: serde_json::Error) -> SessionError {
-    session_error(error.to_string())
 }
 
 fn valid_run_id(id: &str) -> bool {

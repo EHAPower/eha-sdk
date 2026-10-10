@@ -67,13 +67,24 @@ pub(crate) struct ActiveTrial {
     pub(crate) started_sample_time_us: u64,
     pub(crate) stop_after_sample_time_us: Option<u64>,
     pub(crate) stop_attempt_finished_at: Option<Instant>,
+    pub(crate) stop_recovery_after_received_at: Option<Instant>,
     pub(crate) settled_sample_time_us: Option<u64>,
+}
+
+pub(crate) struct InterruptedTrial {
+    pub(crate) active: ActiveTrial,
+    pub(crate) identity: Option<super::IdentityFacts>,
+    pub(crate) reason: String,
+    pub(crate) last_telemetry: Option<Value>,
+    pub(crate) stop_available: bool,
+    pub(crate) unrecoverable: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct TrialState {
     pub(crate) prepared: Option<PreparedTrial>,
     pub(crate) active: Option<ActiveTrial>,
+    pub(crate) interrupted: Option<InterruptedTrial>,
     pub(crate) completed: Option<Value>,
 }
 
@@ -92,6 +103,17 @@ impl TrialState {
         }
         if let Some(prepared) = &self.prepared {
             return json!({"state":"prepared", "request": prepared.request, "status": prepared.status, "startup": prepared.startup});
+        }
+        if let Some(interrupted) = &self.interrupted {
+            return json!({
+                "state": if interrupted.unrecoverable { "interrupted_unrecoverable" } else { "interrupted_unknown" },
+                "unknown": true,
+                "stop_available": interrupted.stop_available,
+                "request": interrupted.active.request,
+                "reason": interrupted.reason,
+                "stop_submission": interrupted.active.stop_submission,
+                "last_telemetry": interrupted.last_telemetry,
+            });
         }
         if let Some(completed) = &self.completed {
             return completed.clone();

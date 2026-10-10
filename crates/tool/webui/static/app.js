@@ -252,10 +252,11 @@ function updateActionAvailability() {
     const session = sessionForTransport(transport);
     const held = Boolean(session?.connected);
     const pending = discovering.has(transport);
+    const recoveryReconnect = session?.trial?.state === "interrupted_unknown" && (!session?.connected || Boolean(session?.transport?.disconnected));
     setDisabled(`#${transport}-connection-form input, #${transport}-connection-form select`, busy || held || pending || trialLocked);
     setDisabled(`#discover-${transport}`, busy || held || pending || trialLocked);
     setDisabled(`#connect-${transport}`, locked || held || pending || trialLocked);
-    setDisabled(`#reconnect-${transport}`, locked || !session?.connection || (held && !session.transport?.disconnected) || trialLocked);
+    setDisabled(`#reconnect-${transport}`, locked || !session?.connection || (held && !session.transport?.disconnected) || (trialLocked && !recoveryReconnect));
     setDisabled(`#disconnect-${transport}`, locked || !held || trialLocked);
   }
   setDisabled("button[data-action], .command-form button, [data-stop-control], #save-config, #restore-factory, #reset-application, #enter-update", locked || !active);

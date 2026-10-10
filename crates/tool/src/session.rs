@@ -37,7 +37,7 @@ mod recording;
 mod trial;
 
 use recording::Recording;
-use trial::{ActiveTrial, PreparedTrial, TrialState};
+use trial::{ActiveTrial, InterruptedTrial, PreparedTrial, TrialState};
 #[allow(unused_imports)]
 pub use trial::{ReachCondition, TrialEnvelope, TrialRequest};
 
@@ -388,6 +388,8 @@ enum Connector {
     Usb(UsbConnector),
     Can(CanConnector),
     SharedCan(CanNodeConnector),
+    #[cfg(test)]
+    Test(Box<dyn FnMut() -> Result<eha_sdk::host::backend::Backend, String>>),
 }
 
 impl Connector {
@@ -396,6 +398,8 @@ impl Connector {
             Self::Usb(connector) => connector.open(),
             Self::Can(connector) => connector.open(),
             Self::SharedCan(connector) => connector.open(),
+            #[cfg(test)]
+            Self::Test(open) => open(),
         }
     }
 }
@@ -498,6 +502,7 @@ impl ToolSession {
             }
         };
         self.identity = Some(identity);
+        self.reconcile_interrupted_trial();
         self.request = Some(request);
         self.connector = Some(connector);
         self.client = Some(client);
@@ -542,6 +547,7 @@ impl ToolSession {
             }
         };
         self.identity = Some(identity);
+        self.reconcile_interrupted_trial();
         self.request = Some(request);
         self.connector = Some(shared);
         self.client = Some(client);
@@ -557,6 +563,7 @@ impl ToolSession {
             return Err(invalid("试验进行中；普通 disconnect 不停止也不切换设备"));
         }
         self.finish_recording_boundary("disconnect");
+        self.mark_interrupted_reconnect_required();
         self.trial.prepared = None;
         let client = self
             .client
@@ -623,6 +630,7 @@ impl ToolSession {
         }
         self.clear_observations();
         self.identity = Some(identity);
+        self.reconcile_interrupted_trial();
         self.client = Some(client);
         self.disconnected_reason = None;
         self.disconnected_pending_operation = None;
@@ -660,6 +668,7 @@ impl ToolSession {
             self.clear_observations();
         }
         self.identity = Some(identity);
+        self.reconcile_interrupted_trial();
         self.client = Some(client);
         self.disconnected = None;
         self.disconnected_reason = None;
@@ -762,7 +771,13 @@ impl ToolSession {
 
     /// 执行普通 SDK 动作。试验活跃时，控制及阻塞查询必须通过试验入口协调。
     pub fn execute(&mut self, command: Command) -> Result<CommandResult, SessionError> {
-        if self.trial.active.is_some() {
+        if self.trial.active.is_some()
+            || self
+                .trial
+                .interrupted
+                .as_ref()
+                .is_some_and(|trial| !trial.unrecoverable)
+        {
             return Err(invalid(
                 "试验进行中；仅允许读取快照、显式 stop_trial 或 update_trial_position",
             ));
@@ -1020,6 +1035,17 @@ impl ToolSession {
         if self.trial.active.is_some() {
             return Err(invalid("已有进行中的试验"));
         }
+        if self
+            .trial
+            .interrupted
+            .as_ref()
+            .is_some_and(|trial| !trial.unrecoverable)
+        {
+            return Err(invalid(
+                "上次试验中断且结果未知；重连并核对同一运行实例后请显式 Stop",
+            ));
+        }
+        self.trial.interrupted = None;
         validate_trial_request(request)?;
         let wait = self.wait();
         let (startup_reply, status_reply) = {
@@ -1112,6 +1138,7 @@ impl ToolSession {
             started_sample_time_us,
             stop_after_sample_time_us: None,
             stop_attempt_finished_at: None,
+            stop_recovery_after_received_at: None,
             settled_sample_time_us: None,
         });
         let result = match self.execute_trial_command(request.command.clone()) {
@@ -1167,6 +1194,7 @@ impl ToolSession {
 
     /// 显式发送一次 Stop，并仅以其后的新遥测确认目标清除；任何失败均不重放。
     pub fn stop_trial(&mut self) -> Result<Value, SessionError> {
+        self.resume_interrupted_trial_for_stop()?;
         self.submit_trial_stop("explicit")?;
         Ok(self.trial_snapshot())
     }
@@ -1409,8 +1437,9 @@ impl ToolSession {
             && fresh
             && received_at.is_some_and(|received| {
                 active
-                    .stop_attempt_finished_at
-                    .is_some_and(|submitted| received > submitted)
+                    .stop_recovery_after_received_at
+                    .or(active.stop_attempt_finished_at)
+                    .is_some_and(|not_before| received > not_before)
             });
         if confirmed {
             let completed = json!({
@@ -1570,17 +1599,64 @@ impl ToolSession {
             .last_telemetry
             .as_ref()
             .and_then(|reply| reply_json(reply).ok());
-        self.trial.completed = Some(json!({
-            "state": "interrupted_unknown",
-            "request": active.request,
-            "reason": reason,
-            "stop_submission": active.stop_submission,
-            "last_telemetry": evidence,
-        }));
-        self.record_event(
-            "trial_interrupted_unknown",
-            self.trial.completed.clone().unwrap_or(Value::Null),
-        );
+        self.trial.interrupted = Some(InterruptedTrial {
+            active,
+            identity: self.identity.as_ref().and_then(identity_facts),
+            reason: reason.into(),
+            last_telemetry: evidence,
+            stop_available: false,
+            unrecoverable: false,
+        });
+        self.record_event("trial_interrupted_unknown", self.trial.snapshot());
+    }
+
+    fn reconcile_interrupted_trial(&mut self) {
+        let Some(interrupted) = self.trial.interrupted.as_mut() else {
+            return;
+        };
+        let current = self.identity.as_ref().and_then(identity_facts);
+        let same_instance = interrupted
+            .identity
+            .zip(current)
+            .is_some_and(|(original, current)| same_trial_instance(original, current));
+        interrupted.stop_available = same_instance;
+        interrupted.unrecoverable = current.is_some() && !same_instance;
+    }
+
+    fn mark_interrupted_reconnect_required(&mut self) {
+        if let Some(interrupted) = self.trial.interrupted.as_mut()
+            && !interrupted.unrecoverable
+        {
+            interrupted.stop_available = false;
+        }
+    }
+
+    fn resume_interrupted_trial_for_stop(&mut self) -> Result<(), SessionError> {
+        let Some(mut interrupted) = self.trial.interrupted.take() else {
+            return Ok(());
+        };
+        let same_instance = self
+            .client
+            .as_ref()
+            .is_some_and(|client| client.connection_status().disconnected.is_none())
+            && self
+                .identity
+                .as_ref()
+                .and_then(identity_facts)
+                .zip(interrupted.identity)
+                .is_some_and(|(current, original)| same_trial_instance(original, current));
+        if !same_instance {
+            self.trial.interrupted = Some(interrupted);
+            return Err(invalid(
+                "中断试验尚未重连到同一设备和运行实例；不能向未知对象发送 Stop",
+            ));
+        }
+        interrupted.active.pending_position_mm = None;
+        if interrupted.active.stop_submission.is_some() {
+            interrupted.active.stop_recovery_after_received_at = Some(Instant::now());
+        }
+        self.trial.active = Some(interrupted.active);
+        Ok(())
     }
 }
 
@@ -1924,11 +2000,15 @@ fn parse_key(value: &str) -> Result<MaintenanceKey, SessionError> {
 fn key_hex(key: MaintenanceKey) -> String {
     hex(&key.to_bytes())
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct IdentityFacts {
     uid: [u8; 12],
     run_nonce: [u8; 16],
     retained_operation_id: u64,
+}
+
+fn same_trial_instance(left: IdentityFacts, right: IdentityFacts) -> bool {
+    left.uid == right.uid && left.run_nonce == right.run_nonce
 }
 fn identity_facts(reply: &Reply) -> Option<IdentityFacts> {
     let Response::Identity(identity) = reply.response().ok()? else {

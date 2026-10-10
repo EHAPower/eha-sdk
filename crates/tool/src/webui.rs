@@ -785,7 +785,7 @@ fn handle_request_with_scan_body(
                 match Command::from_fields(&body) {
                     Ok(command) => {
                         let node = body_node(&body);
-                        if (workbench.has_active_trial() || scan.busy)
+                        if (workbench.has_unresolved_trial() || scan.busy)
                             && !matches!(command, Command::Stop)
                         {
                             return respond_json(
@@ -885,7 +885,7 @@ fn handle_request_with_scan_body(
                 }
             }
             "/api/can/scan" => {
-                if workbench.has_active_trial() || scan.busy {
+                if workbench.has_unresolved_trial() || scan.busy {
                     return respond_json(
                         request,
                         409,
@@ -1060,15 +1060,15 @@ fn handle_request_with_scan_body(
                     }
                 };
                 let result = match action.as_deref() {
-                    Some("trial_start") if !workbench.has_active_trial() && !scan.busy => body
+                    Some("trial_start") if !workbench.has_unresolved_trial() && !scan.busy => body
                         .decode_field("trial")
                         .map_err(|error| format!("trial 参数无效：{error}"))
                         .and_then(|trial| workbench.group_trial_start(&nodes, trial)),
                     Some("stop") => workbench.group_stop(&nodes),
-                    Some("heartbeat_start") if !workbench.has_active_trial() && !scan.busy => {
+                    Some("heartbeat_start") if !workbench.has_unresolved_trial() && !scan.busy => {
                         workbench.group_heartbeat(&nodes, true)
                     }
-                    Some("heartbeat_stop") if !workbench.has_active_trial() => {
+                    Some("heartbeat_stop") if !workbench.has_unresolved_trial() => {
                         workbench.group_heartbeat(&nodes, false)
                     }
                     Some(_) => Err("当前试验运行中；该群组操作已拒绝".into()),

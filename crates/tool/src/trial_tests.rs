@@ -72,10 +72,19 @@ fn identity_bytes(query_id: u32) -> Vec<u8> {
 }
 
 fn identity_bytes_for(query_id: u32, uid: [u8; 12], node: u8) -> Vec<u8> {
+    identity_bytes_with_nonce_for(query_id, uid, node, [9; 16])
+}
+
+fn identity_bytes_with_nonce_for(
+    query_id: u32,
+    uid: [u8; 12],
+    node: u8,
+    run_nonce: [u8; 16],
+) -> Vec<u8> {
     let fields = IdentityFields {
         sample: SampleData {
             query_id,
-            run_nonce: [9; 16],
+            run_nonce,
             snapshot_sequence: 1,
             snapshot_time_us: 1,
         },
@@ -276,6 +285,7 @@ fn active(request: TrialRequest, started_at: Instant, started_sample_time_us: u6
         stop_reason: None,
         stop_observed: false,
         stop_attempt_finished_at: None,
+        stop_recovery_after_received_at: None,
         started_sample_time_us,
         stop_after_sample_time_us: None,
         settled_sample_time_us: None,
@@ -572,6 +582,47 @@ fn harness() -> (ToolSession, TrialHarness) {
     )
 }
 
+fn reconnect_connector(
+    observed: Arc<Mutex<Observed>>,
+    sink_slot: Arc<Mutex<Option<eha_sdk::host::backend::EventSink>>>,
+    run_nonce: [u8; 16],
+) -> Connector {
+    Connector::Test(Box::new(move || {
+        let observed = Arc::clone(&observed);
+        let sink_slot = Arc::clone(&sink_slot);
+        Backend::spawn("eha-tool-reconnect-test", move |commands, sink| {
+            *sink_slot.lock().expect("reconnect sink lock") = Some(sink.clone());
+            let mut pump = Pump::new(commands, sink);
+            while pump.poll() {
+                for lane in 0..3 {
+                    while let Some(request) = pump.take(lane) {
+                        match protocol::decode(&request.bytes, Direction::HostToFirmware)
+                            .expect("tool emits contract-valid request")
+                        {
+                            Message::Query {
+                                query_id,
+                                category: 0,
+                            } => {
+                                pump.sink.submitted(request.id);
+                                pump.sink.received(identity_bytes_with_nonce_for(
+                                    query_id, [7; 12], 1, run_nonce,
+                                ));
+                            }
+                            Message::Stop => {
+                                observed.lock().expect("observed lock").stops += 1;
+                                pump.sink.submitted(request.id);
+                            }
+                            other => panic!("recovery must not replay a target: {other:?}"),
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+        .map_err(|error| error.to_string())
+    }))
+}
+
 fn tick_after_telemetry(
     session: &mut ToolSession,
     harness: &TrialHarness,
@@ -642,6 +693,145 @@ fn reconnect_while_connected_preserves_active_trial_without_sending() {
     let observed = harness.observed.lock().expect("observed lock");
     assert!(observed.positions.is_empty());
     assert_eq!(observed.stops, 0);
+}
+
+#[test]
+fn interrupted_trial_reconnects_then_explicit_stop_needs_a_fresh_idle() {
+    let (mut session, _) = harness();
+    session.trial.active = Some(active(
+        trial_request(Command::Velocity { mm_s: 0.5 }),
+        Instant::now(),
+        0,
+    ));
+    session.interrupt_trial_unknown("transport_disconnected:synthetic");
+    assert_eq!(session.trial_snapshot()["state"], "interrupted_unknown");
+    assert_eq!(session.trial_snapshot()["unknown"], true);
+    assert!(
+        session.execute(Command::Velocity { mm_s: 0.5 }).is_err(),
+        "an unknown interruption must block a replacement target"
+    );
+
+    let client = session.client.take().expect("fixture client exists");
+    session.disconnected = Some(client.disconnect());
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let sink_slot = Arc::new(Mutex::new(None));
+    session.connector = Some(reconnect_connector(
+        Arc::clone(&observed),
+        Arc::clone(&sink_slot),
+        [9; 16],
+    ));
+
+    session.reconnect().expect("same instance reconnects");
+    assert_eq!(session.trial_snapshot()["stop_available"], true);
+    session
+        .disconnect()
+        .expect("normal disconnect only closes local I/O");
+    assert_eq!(session.trial_snapshot()["stop_available"], false);
+    assert!(
+        session.stop_trial().is_err(),
+        "a disconnected session cannot Stop"
+    );
+    assert_eq!(session.trial_snapshot()["state"], "interrupted_unknown");
+    assert_eq!(observed.lock().expect("observed lock").stops, 0);
+    session.reconnect().expect("same instance reconnects again");
+    session
+        .stop_trial()
+        .expect("explicit Stop resumes confirmation");
+    assert_eq!(observed.lock().expect("observed lock").stops, 1);
+    assert_eq!(session.trial_snapshot()["state"], "stopping");
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let sink = loop {
+        if let Some(sink) = sink_slot.lock().expect("reconnect sink lock").clone() {
+            break sink;
+        }
+        assert!(Instant::now() < deadline, "reconnect backend did not start");
+        thread::sleep(Duration::from_millis(1));
+    };
+    sink.received(telemetry_bytes(
+        [9; 16],
+        200,
+        TargetMode::None,
+        0.0,
+        0.0,
+        1,
+        true,
+        false,
+    ));
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while session.trial_snapshot()["state"] != "completed" {
+        session.tick();
+        assert!(Instant::now() < deadline, "fresh Idle did not confirm Stop");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+#[test]
+fn interrupted_trial_reconnect_to_new_run_never_stops_new_instance() {
+    let (mut session, _) = harness();
+    session.trial.active = Some(active(
+        trial_request(Command::Velocity { mm_s: 0.5 }),
+        Instant::now(),
+        0,
+    ));
+    session.interrupt_trial_unknown("transport_disconnected:synthetic");
+
+    let client = session.client.take().expect("fixture client exists");
+    session.disconnected = Some(client.disconnect());
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let sink_slot = Arc::new(Mutex::new(None));
+    session.connector = Some(reconnect_connector(
+        Arc::clone(&observed),
+        sink_slot,
+        [8; 16],
+    ));
+
+    session
+        .reconnect()
+        .expect("new instance still permits identity recovery");
+    assert_eq!(
+        session.trial_snapshot()["state"],
+        "interrupted_unrecoverable"
+    );
+    assert_eq!(session.trial_snapshot()["unknown"], true);
+    assert_eq!(session.trial_snapshot()["stop_available"], false);
+    assert!(
+        session.stop_trial().is_err(),
+        "a new run must not receive the interrupted run's Stop"
+    );
+    assert_eq!(
+        session.trial_snapshot()["state"],
+        "interrupted_unrecoverable"
+    );
+    assert_eq!(observed.lock().expect("observed lock").stops, 0);
+}
+
+#[test]
+fn trial_instance_match_ignores_maintenance_high_water() {
+    assert!(same_trial_instance(
+        IdentityFacts {
+            uid: [7; 12],
+            run_nonce: [9; 16],
+            retained_operation_id: 1,
+        },
+        IdentityFacts {
+            uid: [7; 12],
+            run_nonce: [9; 16],
+            retained_operation_id: 2,
+        },
+    ));
+    assert!(!same_trial_instance(
+        IdentityFacts {
+            uid: [7; 12],
+            run_nonce: [9; 16],
+            retained_operation_id: 2,
+        },
+        IdentityFacts {
+            uid: [7; 12],
+            run_nonce: [8; 16],
+            retained_operation_id: 2,
+        },
+    ));
 }
 
 #[test]

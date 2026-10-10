@@ -25,11 +25,29 @@ test("completed selected member still exposes group Stop while another member is
   assert.equal(view.label, "停止中");
 });
 
-test("terminal unknown warns without holding the recovery lock", () => {
+test("interrupted unknown waits for reconnect before it can be stopped", () => {
   const view = trialState({ trial:{ state:"interrupted_unknown", unknown:true } });
+  assert.equal(view.live, true);
+  assert.equal(view.stopAvailable, false);
+  assert.equal(view.terminalUnknown, true);
+});
+
+test("instance-changed interruption warns without holding the recovery lock", () => {
+  const view = trialState({ trial:{ state:"interrupted_unrecoverable", unknown:true } });
   assert.equal(view.live, false);
   assert.equal(view.stopAvailable, false);
   assert.equal(view.terminalUnknown, true);
+});
+
+test("same-instance reconnected interruption keeps explicit Stop available", () => {
+  const view = trialState({
+    connected:true,
+    trial:{ state:"interrupted_unknown", unknown:true, stop_available:true },
+  });
+  assert.equal(view.live, true);
+  assert.equal(view.stopAvailable, true);
+  assert.equal(view.terminalUnknown, true);
+  assert.equal(view.label, "结果未知（需显式停止）");
 });
 
 test("USB Identity CAN node never overwrites the CAN node's live trial", () => {
