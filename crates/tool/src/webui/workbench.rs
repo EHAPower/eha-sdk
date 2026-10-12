@@ -5,6 +5,7 @@
 //! 这里不保存浏览器“当前节点”。每个调用者都必须随请求给出 transport，CAN 请求还须
 //! 给出 node（旧单节点入口可以省略 node，使用它连接时明确保存的默认节点）。
 
+use crate::connections::{ConnectionProfile, ConnectionStore, managed_factory};
 use crate::session::{
     Command, CommandResult, ConnectionRequest, SessionError, ToolSession, TrialRequest,
 };
@@ -54,6 +55,7 @@ pub(crate) struct Workbench {
     /// 节点的 Stop 被新遥测确认，避免浏览器下一次请求缩窄 Stop 覆盖范围。
     group_nodes: BTreeSet<u8>,
     runs_dir: PathBuf,
+    profiles: ConnectionStore,
 }
 
 impl Workbench {
@@ -65,6 +67,7 @@ impl Workbench {
             default_can_node: None,
             group_nodes: BTreeSet::new(),
             runs_dir,
+            profiles: ConnectionStore::load_default(),
         }
     }
 
@@ -81,6 +84,9 @@ impl Workbench {
             default_can_node,
             group_nodes: BTreeSet::new(),
             runs_dir: std::env::temp_dir().join("eha-tool-webui-tests"),
+            profiles: ConnectionStore::load(
+                std::env::temp_dir().join("eha-tool-webui-tests-connections.json"),
+            ),
         }
     }
 
@@ -122,6 +128,134 @@ impl Workbench {
         {
             self.group_nodes.clear();
         }
+    }
+
+    pub(crate) fn profiles_json(&self) -> Value {
+        let mut value = self.profiles.response();
+        value["runtime"] = crate::runtime::status();
+        value
+    }
+    pub(crate) fn save_profile(
+        &mut self,
+        profile: ConnectionProfile,
+    ) -> Result<ConnectionProfile, String> {
+        self.profiles.save(profile)
+    }
+    pub(crate) fn delete_profile(&mut self, id: &str) -> Result<(), String> {
+        self.profiles.delete(id)
+    }
+    pub(crate) fn adapters(&self) -> Result<Vec<Value>, String> {
+        crate::runtime::python(None).and_then(|python| crate::connections::adapters(&python))
+    }
+
+    /// WebUI 启动时最多执行一次；失败只写入可见状态，不阻止本机页面服务。
+    pub(crate) fn autoconnect_once(&mut self) {
+        let Some(profile) = self.profiles.autoconnect_profile() else {
+            return;
+        };
+        let result = self
+            .connect_managed(profile)
+            .map(|_| ())
+            .map_err(|error| error.message.into_string());
+        self.profiles.autoconnect_result(result);
+    }
+
+    pub(crate) fn connect_profile(&mut self, id: &str) -> Result<Value, SessionError> {
+        let profile = self.profiles.profile(id).map_err(session_error)?;
+        self.connect_managed(profile)
+    }
+
+    pub(crate) fn connect_managed(
+        &mut self,
+        profile: ConnectionProfile,
+    ) -> Result<Value, SessionError> {
+        if self.has_pending_interrupted_trial()
+            && self
+                .can_nodes
+                .get(&profile.node)
+                .is_none_or(|session| session.trial_snapshot()["state"] != "interrupted_unknown")
+        {
+            return Err(session_error(
+                "中断试验等待原会话重连；不能连接或切换其他 CAN 连接档案",
+            ));
+        }
+        let python = crate::runtime::python(None).map_err(session_error)?;
+        let key = format!("managed:{}", profile.adapter.serial);
+        if let Some(network) = self.can_network.as_ref() {
+            if network.channel != key
+                || network.mode != profile.mode
+                || network.python.as_deref() != Some(&python)
+            {
+                return Err(session_error(
+                    "CAN 网络已绑定到另一连接档案；请先显式恢复原会话或重启 WebUI",
+                ));
+            }
+        } else {
+            let parsed = crate::session::parse_can_mode(&profile.mode)?;
+            let network = CanNetwork::new(
+                managed_factory(profile.adapter.serial.clone(), python.clone()),
+                parsed,
+            )
+            .map_err(session_error)?;
+            self.can_network = Some(CanNetworkState {
+                network,
+                channel: key,
+                mode: profile.mode.clone(),
+                python: Some(python),
+            });
+        }
+        let expected_uid = profile.expected_uid.clone();
+        let request = ConnectionRequest::ManagedCan {
+            serial: profile.adapter.serial,
+            node: profile.node,
+            mode: profile.mode,
+            python: None,
+            expected_uid,
+        };
+        let node = profile.node;
+        let snapshot = if self.can_nodes.contains_key(&node) {
+            let session = self.can_nodes.get_mut(&node).expect("checked CAN node");
+            session.adopt_managed_request(request)?;
+            let current = session.snapshot();
+            if current.connected && current.transport["disconnected"].is_null() {
+                current
+            } else {
+                self.reconnect(Transport::Can, Some(node))?;
+                self.can_nodes
+                    .get_mut(&node)
+                    .expect("CAN node just reconnected")
+                    .snapshot()
+            }
+        } else {
+            let connector = self.network_connector(node).map_err(session_error)?;
+            let mut session = new_session();
+            match session.connect_shared_can(request, connector) {
+                Ok(snapshot) => {
+                    self.can_nodes.insert(node, session);
+                    snapshot
+                }
+                Err(error) => {
+                    // 首次握手失败没有任何可恢复的节点或试验；释放空 owner，允许用户
+                    // 明确选择另一份档案重试。已有节点的网络绝不在这里丢弃。
+                    if self.can_nodes.is_empty() {
+                        self.can_network = None;
+                    }
+                    return Err(error);
+                }
+            }
+        };
+        self.default_can_node = Some(node);
+        Ok(json!({"connected":true,"node":node,"identity":snapshot.identity,"snapshot":snapshot}))
+    }
+
+    pub(crate) fn bind_profile_identity(&mut self, id: &str, node: u8) -> Result<(), String> {
+        let identity = self
+            .identity_for(Transport::Can, Some(node))
+            .map_err(|error| error.message.into_string())?;
+        let uid = identity["uid"]
+            .as_str()
+            .ok_or("Identity 回复没有 EHA UID")?;
+        self.profiles.bind_identity(id, uid)
     }
 
     pub(crate) fn has_active_trial(&self) -> bool {
@@ -223,6 +357,9 @@ impl Workbench {
                         result["errors"]
                     )))
                 }
+            }
+            ConnectionRequest::ManagedCan { .. } => {
+                Err(session_error("受管 CANable2 连接必须通过连接档案入口"))
             }
         }
     }

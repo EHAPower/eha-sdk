@@ -30,6 +30,10 @@ class FakeUtil:
 class FakeCan:
     util = FakeUtil
 
+    class BitTimingFd:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     @staticmethod
     def Bus(**kwargs):
         return kwargs
@@ -63,6 +67,49 @@ class PythonCanBridgeTests(unittest.TestCase):
             BRIDGE.configured_bus(FakeCan, "EHA"),
             {"config_context": "EHA", "interface": "virtual", "channel": 7},
         )
+
+    def test_explicit_bus_ignores_user_defaults_and_preserves_fd_timing(self):
+        FakeUtil.file_config = {"interface": "virtual", "channel": "wrong"}
+        config = {
+            "interface": "slcan",
+            "channel": "/dev/cu.usbmodem-stable",
+            "fd": True,
+            "bitrate": 1_000_000,
+            "data_bitrate": 2_000_000,
+            "timing": {"f_clock": 80_000_000, "nom_brp": 1, "nom_tseg1": 63, "nom_tseg2": 16, "nom_sjw": 16, "data_brp": 1, "data_tseg1": 31, "data_tseg2": 8, "data_sjw": 8},
+        }
+        bus = BRIDGE.explicit_bus(FakeCan, BRIDGE.json.dumps(config))
+        self.assertTrue(bus["ignore_config"])
+        self.assertEqual(bus["interface"], "slcan")
+        self.assertEqual(bus["channel"], "/dev/cu.usbmodem-stable")
+        self.assertNotIn("bitrate", bus)
+        self.assertNotIn("data_bitrate", bus)
+        timing = bus["timing"].kwargs
+        self.assertEqual(timing["f_clock"], 80_000_000)
+        self.assertEqual(timing["nom_brp"], 1)
+        self.assertEqual(timing["data_tseg2"], 8)
+
+    def test_explicit_fd_timing_constructs_real_python_can_object(self):
+        try:
+            import can
+        except ImportError:
+            self.skipTest("真实 python-can 仅在受管运行时测试")
+
+        class RealTimingCan:
+            BitTimingFd = can.BitTimingFd
+
+            @staticmethod
+            def Bus(**kwargs):
+                return kwargs
+
+        config = {"interface": "slcan", "channel": "/dev/not-opened", "timing": {
+            "f_clock": 80_000_000, "nom_brp": 1, "nom_tseg1": 63, "nom_tseg2": 16, "nom_sjw": 16,
+            "data_brp": 1, "data_tseg1": 31, "data_tseg2": 8, "data_sjw": 8,
+        }}
+        timing = BRIDGE.explicit_bus(RealTimingCan, BRIDGE.json.dumps(config))["timing"]
+        self.assertIsInstance(timing, can.BitTimingFd)
+        self.assertEqual(timing.nom_bitrate, 1_000_000)
+        self.assertEqual(timing.data_bitrate, 2_000_000)
 
     def test_fd_byte_length_is_converted_to_wire_dlc(self):
         frame = BRIDGE.frame_to_wire(FakeMessage())

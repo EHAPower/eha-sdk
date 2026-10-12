@@ -22,33 +22,36 @@
 
 ## 主机 CAN 通道
 
-CAN 适配器是操作系统和驱动的资源，不是 EHA SDK 或官方工具管理的设备。部署方负责选择实际设备、安装驱动、授予进程访问权限、设置总线模式与速率，并在故障后按本地运行规程处理。SDK 只接收一个可以发送和接收原始 CAN 帧的 `CanChannel`；它不枚举 USB、串口或 PCI 设备，不识别厂商，不设置比特率，也不执行适配器复位或恢复。
+SDK 的 `CanChannel` 只发送和接收原始帧：Rust 应用以 `CanChannelFactory` 接入自己的系统／驱动服务，SDK 不发现、初始化或恢复物理 CAN 设备，也不解释厂商协议或指定比特率。Python 不是公共协议或 Rust SDK 的必需依赖。
 
-Python 不是公共协议或 Rust SDK 的必需依赖。Rust 应用可以通过 `CanChannelFactory` 接入自己的系统服务或驱动。官方工具当前选择 `python-can`，用于复用其多种设备后端及统一的帧接口；这是第三方驱动接入方案，并非三个操作系统共同提供的原生 CAN 标准。选择该方案需部署 Python 运行时，并承担进程通信开销；具体平台、设备与帧格式的可用性仍由外部驱动决定。
+官方 `eha-tool` 提供两条明确边界的接入路径。普通路径使用每用户 `connections.json` 中保存的连接档案：位置为 `XDG_CONFIG_HOME/eha-tool/connections.json`，macOS 为 `~/Library/Application Support/eha-tool/connections.json`，未设 `XDG_CONFIG_HOME` 的其它系统为 `~/.config/eha-tool/connections.json`。工具只支持其中 `adapter.kind="canable2"` 的 CANable2/SLCAN 档案：按保存的稳定 USB 序列号寻找唯一串口，并应用 1 Mbps 仲裁速率、2 Mbps FD 数据速率的预设。它不识别或实现厂商 USB 协议，也不尝试复位或恢复驱动。
 
-官方工具需要 Python 3.9+，运行依赖由 [requirements.txt](requirements.txt) 维护，包含 CAN 库及串口后端依赖。首次部署时，在 SDK 仓库根目录安装到持久虚拟环境；已有环境可直接使用其 Python 执行安装，后续启动无需重复安装：
+连接档案包含名称、适配器序列号、EHA 节点、帧形态、可选自动连接与默认标记；`connection save` 先通过 Identity 和已有 UID 门禁，才写入或绑定预期 EHA UID，Python 路径只用于本次操作而不写入档案。普通用户用 `connection adapters [--can-python PATH]` 列出候选、`connection list` 查看档案，再用下列命令保存、连接或删除档案：
 
 ```sh
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
+eha-tool connection save ID --name NAME --serial SERIAL --node N \
+  [--mode fd] [--default] [--autoconnect] [--can-python PATH]
+eha-tool connection connect ID [--can-python PATH] [--timeout-secs N]
+eha-tool connection delete ID
+eha-tool device --connection ID ACTION
 ```
 
-CLI／Shell 的 `--can-python` 或 WebUI 的“Python 路径”填写该环境解释器的绝对路径，例如 `/path/to/eha-sdk/.venv/bin/python`。Windows 使用 `.venv\Scripts\python.exe`。路径属于运行工具的主机；未指定时使用工具进程 `PATH` 中的 `python3`。
+精确参数和输出以各子命令的 `--help` 为准。发布 bundle 通过私有 `runtime/python` 运行已锁定的 `python-can` 和 `pyserial`，因此普通使用不依赖 `PATH`、`pip`、虚拟环境或 `can.conf`。
 
-官方 `eha-tool` 将 `--can-channel CONTEXT` 交给一个持久的通用 `python-can` 进程。该进程使用命名配置上下文打开驱动，转发原始帧，并在关闭时释放该通道；它不包含任何适配器的专用协议。Linux／macOS 可将上下文保存在运行工具用户的 `~/can.conf`，Windows 可使用 `%USERPROFILE%/can.conf`；无需包装脚本。例如：
+同序列号候选不唯一、适配器缺失、通道打不开、Identity 失败或返回 UID 不等于档案预期 UID 时，工具拒绝连接；绝不改用另一串口、适配器、USB 或历史目标。首次连接和物理重连只执行 Identity：不自启 Heartbeat、不恢复控制、不重放目标或维护操作。用户先处理实际物理连接，再显式发起通信恢复。
 
-```ini
-[EHA_PRODUCTION]
-interface = <外部驱动接口名>
-channel = <该驱动的通道>
-fd = true
+更换电脑时复制完整发行目录，在新主机首次执行 `connection adapters`，选择实际可见适配器并 `connection save`，再显式连接；普通路径不需要手改设备路径、Python 或 `can.conf`。档案保存在运行 backend 的该用户目录，不在浏览器中；换 CAN 适配器须新建档案或明确重新绑定，旧档案不会静默指向新硬件。一个运行中的 WebUI CAN 网络绑定其首次打开的适配器；要切换到另一档案/适配器，先结束该网络上的会话，再重启 WebUI 后连接。
+
+高级路径保留 `--can-channel CONTEXT --node N [--can-mode classic|fd] [--can-python PATH]`，供其它 `python-can` 后端使用。`CONTEXT` 仍按 `python-can` 的命名配置或等价 `CAN_CONFIG_<CONTEXT>` 环境配置提供；调用方负责所选设备的驱动、权限、总线设置及恢复。`--can-mode` 和 SDK 的 `transport::can::Mode` 只选择 EHA CAN 绑定所要求的帧形态，必须与控制器实际启动配置一致；`fd` 仍要求操作系统、驱动和设备实际支持 CAN FD 与 BRS。可参照 [python-can 配置说明](https://python-can.readthedocs.io/en/stable/configuration.html) 与 [总线接口](https://python-can.readthedocs.io/en/stable/bus.html)。
+
+发布包制作者为每个已验证的 OS／架构构建工具与 runtime。当前受支持的普通 bundle 使用：
+
+```sh
+python3 scripts/package_tool.py --binary /abs/target/release/eha-tool \
+  --target aarch64-apple-darwin --output /abs/eha-tool-aarch64-apple-darwin
 ```
 
-CLI／Shell 的 `--can-channel` 或 WebUI 的“外部 CAN 通道”填写 `EHA_PRODUCTION`，不是配置文件或设备路径。节点号与帧形态另按控制器实际启动配置填写。
-
-也可为隔离部署设置 `CAN_CONFIG_EHA_PRODUCTION` 为等价 JSON 配置；变量名后缀必须逐字匹配 `--can-channel EHA_PRODUCTION`。每个上下文都应显式给出 `interface` 和 `channel`，避免拼写错误回退到默认通道。权限、终端、仲裁／数据速率和其他驱动属性均由所选驱动的文档决定；示例中的占位符不是可直接使用的驱动设置。参见 [python-can 配置说明](https://python-can.readthedocs.io/en/stable/configuration.html) 与 [总线接口](https://python-can.readthedocs.io/en/stable/bus.html)。
-
-`--can-mode classic|fd` 和 SDK 的 `transport::can::Mode` 只选择 EHA CAN 绑定所要求的帧形态，必须与控制器实际启动配置一致；它们不配置主机设备。请求 `fd` 时，所选操作系统、驱动和设备都必须实际支持 CAN FD 与 BRS。驱动打开、写调用返回或工具显示“已连接”只证明本地通道阶段的事实，仍须在该通道执行 `identify` 并核对返回的身份和通信设置。通道故障会结束本次连接；工具和 SDK 不自动更换设备、重置驱动或重放帧。
+输出目录含 `eha-tool` 与 `runtime/`；这只证明包已生成，不证明任一 CAN 适配器、EHA 身份、总线、控制或机构效果。驱动打开、写调用返回或工具显示“已连接”也只证明本地阶段；仍以同一通路的 Identity 核对身份与通信设置。
 
 ## 报文定义入口
 

@@ -5,7 +5,10 @@ use self::{
     http_body::{BodyReader, ReadyRequest},
     workbench::{Transport as WebTransport, TrialAction, Workbench},
 };
-use crate::session::{Command, ConnectionRequest, ToolSession};
+use crate::{
+    connections::ConnectionProfile,
+    session::{Command, ConnectionRequest, ToolSession},
+};
 use eha_sdk::can::CanNodeConnector;
 use serde_json::{Value, json};
 use std::{
@@ -121,6 +124,11 @@ const ASSETS: &[Asset] = &[
         route: "/recording-ui.js",
         content_type: "application/javascript; charset=utf-8",
         bytes: include_bytes!("../webui/static/recording-ui.js"),
+    },
+    Asset {
+        route: "/can-connection-ui.js",
+        content_type: "application/javascript; charset=utf-8",
+        bytes: include_bytes!("../webui/static/can-connection-ui.js"),
     },
     Asset {
         route: "/favicon.svg",
@@ -429,6 +437,7 @@ pub(crate) fn serve(
     let server = Server::http(("127.0.0.1", port)).map_err(|error| error.to_string())?;
     println!("WebUI 本地入口：http://127.0.0.1:{port}/");
     let mut workbench = Workbench::new(runs_dir.unwrap_or_else(Workbench::default_runs_dir));
+    workbench.autoconnect_once();
     let mut odrive = OdriveView::new(odrive_python);
     let mut scan = CanScanView::new();
     let body_reader = BodyReader::new();
@@ -616,6 +625,19 @@ fn handle_request_with_scan_body(
             Err(error) => respond_json(request, 503, json!({"ok":false,"message":error})),
         };
     }
+    if path == "/api/adapters" && method == Method::Get {
+        return match workbench.adapters() {
+            Ok(adapters) => respond_json(request, 200, json!({"ok":true,"adapters":adapters})),
+            Err(message) => respond_json(
+                request,
+                503,
+                json!({"ok":false,"code":"adapter_discovery_failed","message":message}),
+            ),
+        };
+    }
+    if path == "/api/connections" && method == Method::Get {
+        return respond_json(request, 200, workbench.profiles_json());
+    }
     if path.starts_with("/api/") {
         if method != Method::Post {
             return respond_json(
@@ -655,6 +677,47 @@ fn handle_request_with_scan_body(
             );
         }
         return match path.as_str() {
+            "/api/connections" => {
+                let raw_profile = match body.decode_field::<crate::RawFields>("profile") {
+                    Ok(profile) => profile,
+                    Err(message) => {
+                        return respond_json(
+                            request,
+                            400,
+                            json!({"ok":false,"code":"connection_invalid","message":message}),
+                        );
+                    }
+                };
+                let profile = match profile_from_fields(raw_profile) {
+                    Ok(profile) => profile,
+                    Err(message) => {
+                        return respond_json(
+                            request,
+                            400,
+                            json!({"ok":false,"code":"connection_invalid","message":message}),
+                        );
+                    }
+                };
+                match workbench.save_profile(profile) {
+                    Ok(profile) => respond_json(request, 200, json!({"ok":true,"profile":profile})),
+                    Err(message) => respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"code":"connection_invalid","message":message}),
+                    ),
+                }
+            }
+            "/api/connections/delete" => match body
+                .string("id")
+                .and_then(|id| workbench.delete_profile(&id).map(|_| id))
+            {
+                Ok(id) => respond_json(request, 200, json!({"ok":true,"id":id})),
+                Err(message) => respond_json(
+                    request,
+                    404,
+                    json!({"ok":false,"code":"profile_not_found","message":message}),
+                ),
+            },
             "/api/odrive/read" => {
                 let Ok(serial) = body.string("serial") else {
                     return respond_json(
@@ -664,6 +727,99 @@ fn handle_request_with_scan_body(
                     );
                 };
                 start_odrive_operation(request, odrive, OdriveOperation::Read { serial })
+            }
+            "/api/connect" if body.contains("profile_id") || body.contains("managed") => {
+                if workbench.has_active_trial() {
+                    return respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"message":"试验进行中；连接操作已拒绝。"}),
+                    );
+                }
+                let mut direct_profile = None;
+                let mut direct_flags = None;
+                let result = if let Ok(id) = body.string("profile_id") {
+                    workbench
+                        .connect_profile(&id)
+                        .map(|value| (value, Some(id)))
+                } else {
+                    let managed = match body.decode_field::<crate::RawFields>("managed") {
+                        Ok(managed) => managed,
+                        Err(message) => {
+                            return respond_json(
+                                request,
+                                400,
+                                json!({"ok":false,"code":"connection_invalid","message":message}),
+                            );
+                        }
+                    };
+                    direct_flags = Some((
+                        managed.decode_field::<bool>("save").unwrap_or(false),
+                        managed
+                            .decode_field::<bool>("bind_identity")
+                            .unwrap_or(false),
+                    ));
+                    let profile = match profile_from_fields(managed) {
+                        Ok(profile) => profile,
+                        Err(message) => {
+                            return respond_json(
+                                request,
+                                400,
+                                json!({"ok":false,"code":"connection_invalid","message":message}),
+                            );
+                        }
+                    };
+                    direct_profile = Some(profile.clone());
+                    workbench
+                        .connect_managed(profile)
+                        .map(|value| (value, None))
+                };
+                match result {
+                    Ok((value, profile_id)) => {
+                        if let Some(mut profile) = direct_profile
+                            && direct_flags.is_some_and(|flags| flags.0)
+                        {
+                            if direct_flags.is_some_and(|flags| flags.1) {
+                                profile.expected_uid =
+                                    value["identity"]["uid"].as_str().map(str::to_owned);
+                            }
+                            if let Err(message) = workbench.save_profile(profile) {
+                                return respond_json(
+                                    request,
+                                    409,
+                                    json!({"ok":false,"code":"connection_save_failed","message":message,"connection":value}),
+                                );
+                            }
+                        } else if let Some(id) = profile_id
+                            && body.decode_field::<bool>("bind_identity").unwrap_or(false)
+                            && let Err(message) = workbench.bind_profile_identity(
+                                &id,
+                                value["node"].as_u64().unwrap_or(0) as u8,
+                            )
+                        {
+                            return respond_json(
+                                request,
+                                409,
+                                json!({"ok":false,"code":"connection_save_failed","message":message,"connection":value}),
+                            );
+                        }
+                        session_response(
+                            request,
+                            200,
+                            workbench,
+                            WebTransport::Can,
+                            value["node"].as_u64().map(|node| node as u8),
+                            None,
+                            odrive.last_read.as_ref(),
+                            json!({"ok":true,"connection":value}),
+                        )
+                    }
+                    Err(error) => respond_json(
+                        request,
+                        409,
+                        json!({"ok":false,"code":"connection_failed","message":error.message,"unknown":error.unknown,"error":error}),
+                    ),
+                }
             }
             "/api/connect" => match ConnectionRequest::from_fields(&body) {
                 Ok(connection) => {
@@ -1121,6 +1277,47 @@ fn start_odrive_operation(
 fn snapshot_after(url: &str) -> Option<u64> {
     query_field(url, "after")?.parse().ok()
 }
+
+fn profile_from_fields(fields: crate::RawFields) -> Result<ConnectionProfile, String> {
+    if fields.contains("expected_uid") {
+        return Err("expected_uid 只能由成功的 Identity 绑定，不能由浏览器写入".into());
+    }
+    let name = fields.string("name")?;
+    let id = if fields.contains("id") {
+        fields.string("id")?
+    } else {
+        let id: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if id.is_empty() {
+            return Err("profile name 不能生成有效 id；请提供 id".into());
+        }
+        id
+    };
+    let adapter = fields.decode_field::<crate::RawFields>("adapter")?;
+    Ok(ConnectionProfile {
+        id,
+        name,
+        adapter: crate::connections::ManagedAdapter {
+            kind: adapter.string("kind")?,
+            serial: adapter.string("serial")?,
+        },
+        node: fields.decode_field("node")?,
+        mode: fields.string("mode")?,
+        expected_uid: None,
+        autoconnect: if fields.contains("autoconnect") {
+            fields.decode_field("autoconnect")?
+        } else {
+            false
+        },
+        default: if fields.contains("default") {
+            fields.decode_field("default")?
+        } else {
+            false
+        },
+    })
+}
 fn query_field<'a>(url: &'a str, name: &str) -> Option<&'a str> {
     url.split_once('?')?
         .1
@@ -1182,13 +1379,15 @@ fn scan_nodes(body: &crate::RawFields) -> Result<Vec<u8>, &'static str> {
 fn transport_from_connection(connection: &ConnectionRequest) -> WebTransport {
     match connection {
         ConnectionRequest::Usb { .. } => WebTransport::Usb,
-        ConnectionRequest::Can { .. } => WebTransport::Can,
+        ConnectionRequest::Can { .. } | ConnectionRequest::ManagedCan { .. } => WebTransport::Can,
     }
 }
 fn connection_node(connection: &ConnectionRequest) -> Option<u8> {
     match connection {
         ConnectionRequest::Usb { .. } => None,
-        ConnectionRequest::Can { node, .. } => Some(*node),
+        ConnectionRequest::Can { node, .. } | ConnectionRequest::ManagedCan { node, .. } => {
+            Some(*node)
+        }
     }
 }
 fn trial_action(body: &crate::RawFields) -> Result<TrialAction, String> {

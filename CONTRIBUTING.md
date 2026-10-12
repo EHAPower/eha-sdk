@@ -14,8 +14,19 @@
 | 完整软件检查 | Python 3、Node.js 24、Clippy、rustfmt、`thumbv7em-none-eabihf` target；Python 脚本仅使用标准库 |
 | 更新工具 Web UI vendor 资源 | Node.js 24、npm；前端包由 `crates/tool/webui/package.json`／`package-lock.json` 管理 |
 | 已构建工具运行（仅 USB） | 匹配主机系统和架构的可执行文件；页面资源已内嵌，EHA 操作不需要 Python 或 Node.js |
-| 已构建工具运行（外部 CAN） | Python 3.9+ 与 [requirements.txt](requirements.txt) 中的依赖，以及部署方已配置的 CAN 驱动、权限、通道与总线参数；安装和持久配置见 [CAN 接入指南](CAN接入指南.md#主机-can-通道) |
+| 已构建工具运行（外部 CAN） | 普通发行 bundle 随附私有 `runtime/python`，可直接使用已支持 CANable2/SLCAN 连接档案；其它适配器仍需调用方明确提供带 `python-can` 的解释器、上下文、驱动、权限和总线参数。安装、打包和持久配置见 [CAN 接入指南](CAN接入指南.md#主机-can-通道) |
 | ODrive USB 独立只读（可选） | Python 3、`odrive==0.5.1.post0`（自带 Fibre）、PyUSB、libusb 1.0，以及 USB 驱动／访问权限 |
+
+普通 CAN bundle 的根目录只有 `eha-tool` 与私有 `runtime/python/...`。运行时隔离导入锁定的 `python-can==4.6.1`、`pyserial==3.5` 及其依赖，并保留 CPython 与各分发包许可证到 `runtime/licenses`；损坏或不匹配时工具在五秒健康检查内失败，绝不改用 `PATH` 的 Python。源码构建只可显式设置 `EHA_TOOL_DEVELOPER_PYTHON`，`--can-python PATH` 始终是高级覆盖。
+
+当前已验证的 macOS arm64 bundle 在构建出本机工具后制作：
+
+```sh
+python3 scripts/package_tool.py --binary /abs/target/release/eha-tool \
+  --target aarch64-apple-darwin --output /abs/eha-tool-aarch64-apple-darwin
+```
+
+其它 OS 或架构未经该入口验证时明确拒绝；不要以本地源码虚拟环境替代正式 bundle 的运行时检查。
 
 ## 构建与检查
 

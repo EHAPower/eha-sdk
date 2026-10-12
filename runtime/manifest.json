@@ -1,0 +1,12 @@
+{
+  "format_version": 1,
+  "python_can_version": "4.6.1",
+  "pyserial_version": "3.5",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "archive_name": "cpython-3.13.16+20261009-aarch64-apple-darwin-install_only.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.13.16%2B20261009-aarch64-apple-darwin-install_only.tar.gz",
+      "sha256": "3338fcd572a670ec45ac9ef75480b95595ea9b6b5dd320952fcf5df185089941"
+    }
+  }
+}

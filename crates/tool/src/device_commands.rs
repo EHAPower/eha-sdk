@@ -14,6 +14,7 @@ use std::{
 
 use clap::{Args, Subcommand};
 use eha_sdk::{
+    can::{CanOptions, open as open_can_backend},
     config::Config,
     host::{Client, Failure, Reply, Wait},
     protocol::{
@@ -26,7 +27,10 @@ use eha_sdk::{
     usb,
 };
 
-use crate::session::{Command as SessionCommand, ConnectionRequest, ToolSession};
+use crate::{
+    connections::{ConnectionProfile, ConnectionStore, ManagedAdapter},
+    session::{Command as SessionCommand, ConnectionRequest, ToolSession},
+};
 
 /// 通过一个已明确选择的 CAN 或 USB SDK adapter 执行业务操作。
 #[derive(Args)]
@@ -35,18 +39,21 @@ pub struct DeviceCommand {
     #[arg(long)]
     json: bool,
     /// USB 设备的完整序列号；SDK 会重新枚举并认领 `ff:45:01` Bulk 接口。
-    #[arg(long, conflicts_with = "can_channel")]
+    #[arg(long, conflicts_with_all = ["can_channel", "connection"])]
     usb: Option<String>,
     /// 外部 python-can 配置中的 CAN 通道上下文名。
-    #[arg(long, conflicts_with = "usb")]
+    #[arg(long, conflicts_with_all = ["usb", "connection"])]
     can_channel: Option<String>,
+    /// 已保存的受管 CANable2 连接档案 ID。
+    #[arg(long, conflicts_with_all = ["usb", "can_channel"])]
+    connection: Option<String>,
     /// CAN 逻辑节点号；仅与 `--can-channel` 一起使用。
     #[arg(long, requires = "can_channel")]
     node: Option<u8>,
     /// CAN 帧格式：`classic` 或 `fd`；省略时为 `fd`。
     #[arg(long, requires = "can_channel", default_value = "fd")]
     can_mode: String,
-    /// 运行 python-can 的 Python 路径；省略时使用平台默认解释器。
+    /// 运行 python-can 的 Python 路径；省略时使用随包运行时，源码树须显式配置开发解释器。
     #[arg(long, requires = "can_channel")]
     can_python: Option<String>,
     /// 单次本地提交或固件回复等待上限，单位秒。
@@ -54,6 +61,55 @@ pub struct DeviceCommand {
     timeout_secs: u64,
     #[command(subcommand)]
     action: Action,
+}
+
+/// 管理本机受管 CANable2 连接档案。档案只保存适配器稳定序列号，不保存 Python 路径。
+#[derive(Args)]
+pub struct ConnectionCommand {
+    #[command(subcommand)]
+    action: ConnectionAction,
+}
+
+#[derive(Subcommand)]
+enum ConnectionAction {
+    /// 按稳定 USB 序列号列出当前可用的 CANable2 适配器。
+    Adapters {
+        /// 用于本次发现的 Python；省略时使用随包运行时。
+        #[arg(long)]
+        can_python: Option<String>,
+    },
+    /// 列出本机连接档案。
+    List,
+    /// 核对 Identity 后保存或更新受管 CANable2 档案。
+    Save {
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        serial: String,
+        #[arg(long)]
+        node: u8,
+        #[arg(long, default_value = "fd")]
+        mode: String,
+        #[arg(long)]
+        default: bool,
+        #[arg(long)]
+        autoconnect: bool,
+        /// 仅用于本次 Identity 核对，不写入档案。
+        #[arg(long)]
+        can_python: Option<String>,
+    },
+    /// 使用已保存档案连接并核对 Identity。
+    Connect {
+        id: String,
+        /// 仅用于本次连接，不写入档案。
+        #[arg(long)]
+        can_python: Option<String>,
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+    /// 删除一份连接档案。
+    Delete { id: String },
 }
 
 /// 只提供 SDK 已经覆盖的最小维护与控制编排。
@@ -164,40 +220,20 @@ pub fn run(command: DeviceCommand) -> Result<(), String> {
         );
     }
     let wait = Wait::new(Duration::from_secs(command.timeout_secs));
-    let selected_usb = command.usb.is_some();
-    let backend = match (command.usb, command.can_channel) {
-        (Some(serial), None) => usb::open(&serial)?,
-        (None, Some(channel)) => {
-            let node = command.node.ok_or("CAN 通路需要 --node")?;
-            crate::session::open_can(channel, node, &command.can_mode, command.can_python)?
-        }
-        (None, None) => {
-            return Err("请选择 --usb SERIAL 或 --can-channel CONTEXT --node N".into());
-        }
-        (Some(_), Some(_)) => return Err("USB 与 CAN 通路不能同时选择".into()),
-    };
+    let request = connection_request(&command)?;
+    let selected_usb = matches!(request, ConnectionRequest::Usb { .. });
+    let backend = open_backend(&request)?;
     let mut client = Client::new(backend);
     let identity = client.identify(None, &wait).map_err(format_sdk_error)?;
     print_reply("固件 Identity 回复", &identity)?;
+    verify_expected_uid(&request, &identity)?;
     velocity_test(&mut client, &wait, selected_usb, mm_s, seconds)?;
     client.close();
     Ok(())
 }
 
 fn run_session(command: DeviceCommand) -> Result<(), String> {
-    let request = match (command.usb, command.can_channel) {
-        (Some(serial), None) => ConnectionRequest::Usb { serial },
-        (None, Some(channel)) => ConnectionRequest::Can {
-            channel,
-            node: command.node.ok_or("CAN 通路需要 --node")?,
-            mode: command.can_mode,
-            python: command.can_python,
-        },
-        (None, None) => {
-            return Err("请选择 --usb SERIAL 或 --can-channel CONTEXT --node N".into());
-        }
-        (Some(_), Some(_)) => return Err("USB 与 CAN 通路不能同时选择".into()),
-    };
+    let request = connection_request(&command)?;
     let mut session = ToolSession::new().with_timeout(Duration::from_secs(command.timeout_secs));
     let connected = session
         .connect(request)
@@ -307,6 +343,176 @@ fn run_session(command: DeviceCommand) -> Result<(), String> {
     print_result(
         command.json,
         &serde_json::to_value(result).map_err(|error| error.to_string())?,
+    )
+}
+
+pub fn run_connection(command: ConnectionCommand) -> Result<(), String> {
+    match command.action {
+        ConnectionAction::Adapters { can_python } => {
+            let python = crate::runtime::python(can_python.as_deref())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::connections::adapters(&python)?)
+                    .map_err(|error| error.to_string())?
+            );
+        }
+        ConnectionAction::List => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ConnectionStore::load_default().response())
+                    .map_err(|error| error.to_string())?
+            );
+        }
+        ConnectionAction::Delete { id } => {
+            let mut store = ConnectionStore::load_default();
+            store.delete(&id)?;
+            println!("已删除连接档案：{id}");
+        }
+        ConnectionAction::Connect {
+            id,
+            can_python,
+            timeout_secs,
+        } => {
+            let request = saved_connection_request(&id, can_python)?;
+            let mut session = ToolSession::new().with_timeout(Duration::from_secs(timeout_secs));
+            let snapshot = session
+                .connect(request)
+                .map_err(|error| error.to_string())?;
+            print_result(
+                false,
+                &serde_json::to_value(snapshot).map_err(|error| error.to_string())?,
+            )?;
+        }
+        ConnectionAction::Save {
+            id,
+            name,
+            serial,
+            node,
+            mode,
+            default,
+            autoconnect,
+            can_python,
+        } => {
+            let mut store = ConnectionStore::load_default();
+            let existing = store.profile_optional(&id)?;
+            let expected_uid = existing
+                .as_ref()
+                .and_then(|profile| profile.expected_uid.clone());
+            let mut profile = ConnectionProfile {
+                id,
+                name,
+                adapter: ManagedAdapter {
+                    kind: "canable2".into(),
+                    serial: serial.clone(),
+                },
+                node,
+                mode: mode.clone(),
+                expected_uid,
+                autoconnect,
+                default,
+            };
+            profile.validate()?;
+            let mut session = ToolSession::new();
+            let snapshot = session
+                .connect(ConnectionRequest::ManagedCan {
+                    serial: serial.clone(),
+                    node,
+                    mode: mode.clone(),
+                    python: can_python,
+                    expected_uid: profile.expected_uid.clone(),
+                })
+                .map_err(|error| error.to_string())?;
+            let uid = snapshot
+                .identity
+                .as_ref()
+                .and_then(|identity| identity.get("uid"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Identity 回复没有 EHA UID，不能保存连接档案")?;
+            profile.expected_uid = Some(uid.to_ascii_lowercase());
+            let profile = store.save(profile)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&profile).map_err(|error| error.to_string())?
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn saved_connection_request(
+    id: &str,
+    python: Option<String>,
+) -> Result<ConnectionRequest, String> {
+    let profile = ConnectionStore::load_default().profile(id)?;
+    Ok(ConnectionRequest::ManagedCan {
+        serial: profile.adapter.serial,
+        node: profile.node,
+        mode: profile.mode,
+        python,
+        expected_uid: profile.expected_uid,
+    })
+}
+
+fn connection_request(command: &DeviceCommand) -> Result<ConnectionRequest, String> {
+    match (&command.usb, &command.can_channel, &command.connection) {
+        (Some(serial), None, None) => Ok(ConnectionRequest::Usb {
+            serial: serial.clone(),
+        }),
+        (None, Some(channel), None) => Ok(ConnectionRequest::Can {
+            channel: channel.clone(),
+            node: command.node.ok_or("CAN 通路需要 --node")?,
+            mode: command.can_mode.clone(),
+            python: command.can_python.clone(),
+        }),
+        (None, None, Some(id)) => saved_connection_request(id, None),
+        (None, None, None) => {
+            Err("请选择 --usb SERIAL、--can-channel CONTEXT --node N 或 --connection ID".into())
+        }
+        _ => Err("USB、外部 CAN 上下文和受管连接档案不能同时选择".into()),
+    }
+}
+
+fn open_backend(request: &ConnectionRequest) -> Result<eha_sdk::host::backend::Backend, String> {
+    match request {
+        ConnectionRequest::Usb { serial } => usb::open(serial),
+        ConnectionRequest::Can {
+            channel,
+            node,
+            mode,
+            python,
+        } => crate::session::open_can(channel.clone(), *node, mode, python.clone()),
+        ConnectionRequest::ManagedCan {
+            serial,
+            node,
+            mode,
+            python,
+            ..
+        } => open_can_backend(
+            CanOptions {
+                node: *node,
+                mode: crate::session::parse_can_mode(mode).map_err(|error| error.to_string())?,
+            },
+            crate::connections::managed_factory(
+                serial.clone(),
+                crate::runtime::python(python.as_deref())?,
+            ),
+        ),
+    }
+}
+
+fn verify_expected_uid(request: &ConnectionRequest, identity: &Reply) -> Result<(), String> {
+    let Response::Identity(identity) = identity.response().map_err(format_sdk_error)? else {
+        return Err("Identity 请求没有收到 Identity 回复".into());
+    };
+    let uid: String = identity
+        .fields()
+        .uid
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    crate::connections::expected_uid_matches(
+        request.expected_uid(),
+        &serde_json::json!({"uid": uid}),
     )
 }
 
@@ -705,6 +911,7 @@ mod tests {
             json: false,
             usb: Some("missing-usb-serial".into()),
             can_channel: None,
+            connection: None,
             node: None,
             can_mode: "fd".into(),
             can_python: None,
@@ -720,5 +927,25 @@ mod tests {
                 .expect_err("invalid speed must fail before USB enumeration or connection");
             assert_eq!(error, "速度试验目标必须是非零有限 mm/s 值");
         }
+    }
+
+    #[test]
+    fn saved_connection_cannot_be_mixed_with_legacy_can_context() {
+        #[derive(clap::Parser)]
+        struct TestCli {
+            #[command(flatten)]
+            device: DeviceCommand,
+        }
+        assert!(
+            <TestCli as clap::Parser>::try_parse_from([
+                "test",
+                "--connection",
+                "bench",
+                "--can-channel",
+                "legacy",
+                "status",
+            ])
+            .is_err()
+        );
     }
 }

@@ -38,6 +38,8 @@ pub struct PythonCanOptions {
     pub python: String,
     /// 用户维护的 `python-can` 命名配置上下文。
     pub context: String,
+    /// 完整、显式的 python-can Bus 参数。受管适配器使用它以避免读取用户全局配置。
+    explicit_config: Option<Value>,
 }
 
 impl PythonCanOptions {
@@ -47,6 +49,7 @@ impl PythonCanOptions {
         Self {
             python: default_python().to_owned(),
             context: context.into(),
+            explicit_config: None,
         }
     }
 
@@ -56,6 +59,20 @@ impl PythonCanOptions {
         Self {
             python: python.into(),
             context: context.into(),
+            explicit_config: None,
+        }
+    }
+
+    /// 使用完全显式的 `python-can` Bus 配置。
+    ///
+    /// 配置由调用方构造；桥接以 `ignore_config=True` 打开 Bus，因此不会读取或改写
+    /// 用户的 `can.conf`、环境默认项或命名 context。
+    #[must_use]
+    pub fn with_explicit_config(python: impl Into<String>, config: Value) -> Self {
+        Self {
+            python: python.into(),
+            context: String::new(),
+            explicit_config: Some(config),
         }
     }
 }
@@ -72,7 +89,7 @@ const fn default_python() -> &'static str {
 
 impl CanChannelFactory for PythonCanOptions {
     fn open(&self) -> Result<Box<dyn CanChannel>, String> {
-        if self.context.trim().is_empty() {
+        if self.explicit_config.is_none() && self.context.trim().is_empty() {
             return Err("python-can 配置 context 不能为空".into());
         }
         if self.python.trim().is_empty() {
@@ -98,15 +115,24 @@ impl PythonCanChannel {
     }
 
     fn open_script(options: &PythonCanOptions, script: &str) -> Result<Self, String> {
-        let mut child = Command::new(&options.python)
+        let mut child = Command::new(&options.python);
+        child
+            .arg("-I")
             .arg("-u")
             .arg("-c")
             .arg(script)
-            .arg("--context")
-            .arg(&options.context)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        if let Some(config) = &options.explicit_config {
+            child.arg("--explicit-config").arg(
+                serde_json::to_string(config)
+                    .map_err(|error| format!("无法编码显式 python-can 配置: {error}"))?,
+            );
+        } else {
+            child.arg("--context").arg(&options.context);
+        }
+        let mut child = child
             .spawn()
             .map_err(|error| format!("无法启动 python-can 解释器 {}: {error}", options.python))?;
         let stdin = child

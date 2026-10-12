@@ -54,6 +54,15 @@ pub enum ConnectionRequest {
         mode: String,
         python: Option<String>,
     },
+    /// `eha-tool` 持有的 CANable2 档案。实际串口路径只在每次打开时按 USB 序列号解析。
+    #[serde(rename = "can")]
+    ManagedCan {
+        serial: String,
+        node: u8,
+        mode: String,
+        python: Option<String>,
+        expected_uid: Option<String>,
+    },
 }
 
 impl ConnectionRequest {
@@ -70,6 +79,13 @@ impl ConnectionRequest {
                 python: fields.optional_string("python")?,
             }),
             transport => Err(format!("未知 transport：{transport}")),
+        }
+    }
+
+    pub(crate) fn expected_uid(&self) -> Option<&str> {
+        match self {
+            Self::ManagedCan { expected_uid, .. } => expected_uid.as_deref(),
+            Self::Usb { .. } | Self::Can { .. } => None,
         }
     }
 }
@@ -472,7 +488,7 @@ impl ToolSession {
     }
 
     /// 打开、核对 Identity 并保留同一 Client，期间不启动心跳或发送控制。
-    pub fn connect(&mut self, request: ConnectionRequest) -> Result<Snapshot, SessionError> {
+    pub fn connect(&mut self, mut request: ConnectionRequest) -> Result<Snapshot, SessionError> {
         if self.trial.active.is_some() {
             return Err(invalid("试验进行中；拒绝切换连接"));
         }
@@ -501,6 +517,8 @@ impl ToolSession {
                 return Err(sdk_error(error));
             }
         };
+        expected_uid_matches(&request, &identity)?;
+        bind_managed_request(&mut request, &identity)?;
         self.identity = Some(identity);
         self.reconcile_interrupted_trial();
         self.request = Some(request);
@@ -515,13 +533,16 @@ impl ToolSession {
     /// 绑定到已建立的共享 CAN 网络中的一个节点；网络本身由调用方唯一拥有。
     pub fn connect_shared_can(
         &mut self,
-        request: ConnectionRequest,
+        mut request: ConnectionRequest,
         connector: CanNodeConnector,
     ) -> Result<Snapshot, SessionError> {
         if self.trial.active.is_some() {
             return Err(invalid("试验进行中；拒绝切换连接"));
         }
-        if !matches!(request, ConnectionRequest::Can { .. }) {
+        if !matches!(
+            request,
+            ConnectionRequest::Can { .. } | ConnectionRequest::ManagedCan { .. }
+        ) {
             return Err(invalid("共享 CAN 节点必须使用 CAN 连接请求"));
         }
         if self.client.is_some() {
@@ -546,6 +567,8 @@ impl ToolSession {
                 return Err(sdk_error(error));
             }
         };
+        expected_uid_matches(&request, &identity)?;
+        bind_managed_request(&mut request, &identity)?;
         self.identity = Some(identity);
         self.reconcile_interrupted_trial();
         self.request = Some(request);
@@ -621,6 +644,20 @@ impl ToolSession {
                 return Err(sdk_error(error));
             }
         };
+        if let Err(error) = expected_uid_matches(
+            self.request
+                .as_ref()
+                .ok_or_else(|| invalid("没有连接请求"))?,
+            &identity,
+        ) {
+            self.disconnected = Some(client.disconnect());
+            self.identity = None;
+            self.clear_observations();
+            return Err(error);
+        }
+        if let Some(request) = self.request.as_mut() {
+            bind_managed_request(request, &identity)?;
+        }
         if previous.is_some_and(|previous| {
             identity_facts(&identity).is_some_and(|current| {
                 previous.uid != current.uid || previous.run_nonce != current.run_nonce
@@ -635,6 +672,23 @@ impl ToolSession {
         self.disconnected_reason = None;
         self.disconnected_pending_operation = None;
         Ok(self.snapshot())
+    }
+
+    /// 共享 CAN owner 不变时采用新的受管档案身份约束。它不打开 I/O、不发送帧；若已
+    /// 有缓存 Identity，先以该事实拒绝明显的档案错配，下一次 reconnect 仍会核对新回复。
+    pub fn adopt_managed_request(
+        &mut self,
+        mut request: ConnectionRequest,
+    ) -> Result<(), SessionError> {
+        if !matches!(request, ConnectionRequest::ManagedCan { .. }) {
+            return Err(invalid("只能采用受管 CANable2 连接档案"));
+        }
+        if let Some(identity) = self.identity.as_ref() {
+            expected_uid_matches(&request, identity)?;
+            bind_managed_request(&mut request, identity)?;
+        }
+        self.request = Some(request);
+        Ok(())
     }
 
     /// 在当前已连接通路上重新读取 Identity，供 WebUI 在新建维护键前刷新操作高水位。
@@ -667,6 +721,19 @@ impl ToolSession {
                 return Err(sdk_error(error));
             }
         };
+        if let Err(error) = expected_uid_matches(
+            self.request
+                .as_ref()
+                .ok_or_else(|| invalid("没有连接请求"))?,
+            &identity,
+        ) {
+            self.disconnected_reason = Some("维护前 Identity 与受管连接档案不匹配".into());
+            self.disconnected_pending_operation = client.pending_operation().map(key_hex);
+            self.disconnected = Some(client.disconnect());
+            self.identity = None;
+            self.clear_observations();
+            return Err(error);
+        }
         let current = identity_facts(&identity).ok_or_else(|| invalid("Identity 回复无效"))?;
         if previous.is_some_and(|previous| {
             previous.uid != current.uid || previous.run_nonce != current.run_nonce
@@ -1773,7 +1840,9 @@ fn fresh_value(value: &Value) -> bool {
 fn trial_contact_active(telemetry: &Value, connection: Option<&ConnectionRequest>) -> bool {
     match connection {
         Some(ConnectionRequest::Usb { .. }) => telemetry["usb_contact"].as_u64() == Some(1),
-        Some(ConnectionRequest::Can { .. }) => telemetry["can_contact"].as_u64() == Some(1),
+        Some(ConnectionRequest::Can { .. } | ConnectionRequest::ManagedCan { .. }) => {
+            telemetry["can_contact"].as_u64() == Some(1)
+        }
         None => false,
     }
 }
@@ -1906,7 +1975,9 @@ fn validate_trial_facts(
     }
     let contact_active = match connection {
         Some(ConnectionRequest::Usb { .. }) => status["usb_contact"].as_u64() == Some(1),
-        Some(ConnectionRequest::Can { .. }) => status["can_contact"].as_u64() == Some(1),
+        Some(ConnectionRequest::Can { .. } | ConnectionRequest::ManagedCan { .. }) => {
+            status["can_contact"].as_u64() == Some(1)
+        }
         None => false,
     };
     if !contact_active {
@@ -1980,7 +2051,7 @@ pub(crate) fn open_can(
             node,
             mode: parse_can_mode(mode).map_err(|error| error.message)?,
         },
-        python_factory(channel, python),
+        python_factory(channel, python)?,
     )?;
     connector.open()
 }
@@ -2000,7 +2071,25 @@ fn connector_for(request: &ConnectionRequest) -> Result<Connector, SessionError>
                 node: *node,
                 mode: parse_can_mode(mode)?,
             },
-            python_factory(channel.clone(), python.clone()),
+            python_factory(channel.clone(), python.clone()).map_err(open_error)?,
+        )
+        .map(Connector::Can)
+        .map_err(open_error),
+        ConnectionRequest::ManagedCan {
+            serial,
+            node,
+            mode,
+            python,
+            ..
+        } => CanConnector::new(
+            CanOptions {
+                node: *node,
+                mode: parse_can_mode(mode)?,
+            },
+            crate::connections::managed_factory(
+                serial.clone(),
+                crate::runtime::python(python.as_deref()).map_err(open_error)?,
+            ),
         )
         .map(Connector::Can)
         .map_err(open_error),
@@ -2061,11 +2150,36 @@ pub(crate) fn parse_can_mode(value: &str) -> Result<eha_sdk::transport::can::Mod
     }
 }
 
-fn python_factory(channel: String, python: Option<String>) -> Arc<dyn CanChannelFactory> {
-    Arc::new(match python {
-        Some(python) => PythonCanOptions::with_python(channel, python),
-        None => PythonCanOptions::new(channel),
-    })
+fn python_factory(
+    channel: String,
+    python: Option<String>,
+) -> Result<Arc<dyn CanChannelFactory>, String> {
+    Ok(Arc::new(PythonCanOptions::with_python(
+        channel,
+        crate::runtime::python(python.as_deref())?,
+    )))
+}
+
+fn expected_uid_matches(request: &ConnectionRequest, identity: &Reply) -> Result<(), SessionError> {
+    let identity = reply_json(identity)?;
+    crate::connections::expected_uid_matches(request.expected_uid(), &identity).map_err(invalid)
+}
+
+fn bind_managed_request(
+    request: &mut ConnectionRequest,
+    identity: &Reply,
+) -> Result<(), SessionError> {
+    let ConnectionRequest::ManagedCan { expected_uid, .. } = request else {
+        return Ok(());
+    };
+    if expected_uid.is_none() {
+        let identity = reply_json(identity)?;
+        let uid = identity["uid"]
+            .as_str()
+            .ok_or_else(|| invalid("Identity 回复没有 EHA UID"))?;
+        *expected_uid = Some(uid.to_ascii_lowercase());
+    }
+    Ok(())
 }
 fn parse_view(value: &str) -> Result<ConfigView, SessionError> {
     match value {
@@ -2911,6 +3025,13 @@ mod tests {
             .identify(None, &Wait::new(timeout))
             .expect("initial Identity succeeds");
         let mut session = ToolSession::new().with_timeout(timeout);
+        // 夹具直接注入 backend，仍须给 refresh 建立与真实会话等价的连接身份。
+        session.request = Some(super::ConnectionRequest::Can {
+            channel: "fixture-maintenance".into(),
+            node: 1,
+            mode: "fd".into(),
+            python: Some("fixture-python".into()),
+        });
         session.client = Some(client);
         session.identity = Some(identity);
         session

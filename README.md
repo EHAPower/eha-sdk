@@ -86,7 +86,7 @@ CAN 与 USB 合计只支持**一个调用方串行提交**，无需等待上一�
 | 通路 | 当前 SDK 能力与限制 |
 |---|---|
 | USB Type-C | `usb::discover` 只列出 `1209:0001` 候选；`UsbConnector::new(完整序列号)?.open()` 按实际描述符认领唯一 64 B Bulk IN/OUT 对。它不发 USB reset 或控制请求；打开后仍须 `identify`。 |
-| 外部 CAN | `CanChannel` 是已配置通道上的原始帧 I/O，调用方以 `CanChannelFactory` 提供它；SDK 不发现、初始化或配置物理 CAN 设备。`CanOptions { node, mode }` 只描述 EHA 节点和 Classic／FD 帧形态。官方工具通过外部 `python-can` 上下文取得通道；平台、驱动和设备须实际支持所请求的帧形态。完整部署方法见 [CAN 接入指南](CAN接入指南.md#主机-can-通道)。 |
+| 外部 CAN | `CanChannel` 是通道上的原始帧 I/O，调用方以 `CanChannelFactory` 提供它；SDK 不发现、初始化或配置物理 CAN 设备。`CanOptions { node, mode }` 只描述 EHA 节点和 Classic／FD 帧形态。`eha-tool` 连接档案及其它设备的高级 `python-can` 接入见 [CAN 接入指南](CAN接入指南.md#主机-can-通道)。 |
 
 打开 CAN 通道或认领 USB 接口只证明本地资源取得；首次业务操作必须在同一通路
 `Client::identify`，必要时提供预期 UID。描述符、CAN 节点或同型设备都不能替代身份。
@@ -123,7 +123,7 @@ fn query(factory: Arc<dyn CanChannelFactory>) -> Result<(), String> {
 ```
 
 应用程序在 `CanChannelFactory::open()` 中接入自己的系统／驱动服务；SDK 只调用通道的 `send`／`receive`，
-不会解释厂商设备协议或指定比特率。官方工具已提供外部 `python-can` 接入实现，调用时以命名通道上下文选择。
+不会解释厂商设备协议或指定比特率。官方工具提供受管连接档案和高级 `python-can` 接入；前者只覆盖文档声明的 CANable2/SLCAN 预设，后者由调用方明确选择通道上下文与解释器。
 USB 仅替换为 `UsbConnector::new("完整 USB 序列号")?.open()`。控制前核对身份、配置、
 当前位置、限值和停止条件，调用 `start_heartbeat` 并从新鲜遥测确认联系；结束时显式
 `stop_control`，观察无目标和合格 Idle 后再 `stop_heartbeat`、关闭连接。

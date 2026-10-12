@@ -9,12 +9,14 @@ use std::{
 };
 
 mod configuration;
+mod connections;
 mod build_metadata {
     pub const TOOL_VERSION: &str = env!("EHA_TOOL_VERSION");
 }
 mod device_commands;
 mod devices;
 mod odrive_commands;
+mod runtime;
 mod session;
 mod shell;
 mod webui;
@@ -23,7 +25,7 @@ mod webui;
 #[command(
     version = build_metadata::TOOL_VERSION,
     about = "EHA 控制器维护工具",
-    after_help = "在终端中不带参数运行可进入交互模式。首次使用：USB 使用 devices；CAN 先在外部 python-can 配置中准备通道，再以 device 选择的通路执行 inspect 或 status 核对设备。低速试动使用 device ... velocity-test；它会显式 Stop 并等待停止条件。配置检查不访问设备。"
+    after_help = "在终端中不带参数运行可进入交互模式。首次使用：USB 使用 devices；CANable2 使用 connection adapters/save 建立受管档案，高级 python-can 上下文仍由 device --can-channel 明确选择。低速试动使用 device ... velocity-test；它会显式 Stop 并等待停止条件。配置检查不访问设备。"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -51,6 +53,8 @@ enum Command {
     },
     /// 通过 Rust SDK 在明确选择的 CAN 或 USB 通路上访问一台设备
     Device(device_commands::DeviceCommand),
+    /// 管理本机受管 CANable2 连接档案
+    Connection(device_commands::ConnectionCommand),
     /// 独立读取 ODrive USB 状态，不控制设备或改变 H723 会话
     Odrive(odrive_commands::OdriveCommand),
     /// 启动仅限本机访问、持有持久 SDK 会话的 WebUI
@@ -92,6 +96,7 @@ fn main() -> ExitCode {
             }
         }),
         Some(Command::Device(command)) => device_commands::run(command),
+        Some(Command::Connection(command)) => device_commands::run_connection(command),
         Some(Command::Odrive(command)) => odrive_commands::run(command),
         Some(Command::Webui {
             port,

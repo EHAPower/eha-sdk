@@ -160,11 +160,39 @@ def configured_bus(can, context):
     return can.Bus(config_context=context, **config)
 
 
+def explicit_bus(can, encoded):
+    """打开调用方已经完整给出的 Bus，而不读取进程或用户配置。"""
+    config = json.loads(encoded)
+    if not isinstance(config, dict):
+        raise ValueError("显式 python-can 配置必须是对象")
+    interface = config.get("interface")
+    channel = config.get("channel")
+    if not isinstance(interface, str) or not interface.strip() or not isinstance(channel, str) or not channel.strip():
+        raise ValueError("显式 python-can 配置必须包含 interface 和 channel")
+    timing = config.get("timing")
+    if timing is not None:
+        if not isinstance(timing, dict):
+            raise ValueError("显式 python-can timing 必须是对象")
+        try:
+            config["timing"] = can.BitTimingFd(**timing)
+        except Exception as error:
+            raise ValueError(f"无法构造 CAN FD 位时序: {error}") from error
+        # `timing` 是 python-can 的完整位时序输入；不要再传可能被后端忽略的
+        # bitrate/data_bitrate 标量，避免不同 driver 对两份设置取舍不同。
+        config.pop("bitrate", None)
+        config.pop("data_bitrate", None)
+    return can.Bus(ignore_config=True, **config)
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--context", required=True)
+    parser.add_argument("--context")
+    parser.add_argument("--explicit-config")
     args = parser.parse_args()
-    if not args.context.strip():
+    if bool(args.context) == bool(args.explicit_config):
+        failure(0, "必须选择命名 python-can context 或显式配置之一")
+        return 2
+    if args.context is not None and not args.context.strip():
         failure(0, "python-can 配置上下文不能为空")
         return 2
     try:
@@ -176,7 +204,7 @@ def main():
         failure(0, f"不支持 python-can {can.__version__}；要求 >=4.6.1,<5")
         return 2
     try:
-        bus = configured_bus(can, args.context)
+        bus = explicit_bus(can, args.explicit_config) if args.explicit_config is not None else configured_bus(can, args.context)
     except Exception as error:
         failure(0, f"无法打开外部配置的 python-can 上下文 {args.context!r}: {error}")
         return 2

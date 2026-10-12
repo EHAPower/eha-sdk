@@ -24,5 +24,7 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
           rustup target add thumbv7em-none-eabihf
+      - name: 准备 CAN 桥接测试依赖
+        run: python3 -m pip install 'python-can[serial]==4.6.1'
       - name: 检查 SDK、工具与公共库
         run: python3 scripts/check.py

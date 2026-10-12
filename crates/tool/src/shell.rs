@@ -4,6 +4,8 @@
 
 use crate::{
     configuration,
+    connections::ConnectionStore,
+    device_commands::saved_connection_request,
     devices::{self, Device},
     session::{Command as SessionCommand, ConnectionRequest, ToolSession},
 };
@@ -124,7 +126,14 @@ enum DeviceCommand {
         node: u8,
         /// `classic` 或 `fd`；省略时为 `fd`。
         mode: Option<String>,
-        /// 运行 python-can 的 Python；省略时使用平台默认解释器。
+        /// 运行 python-can 的 Python；省略时使用随包运行时，源码树须显式配置开发解释器。
+        python: Option<String>,
+    },
+    /// 使用已保存的受管 CANable2 档案连接并核对 Identity。
+    ConnectSaved {
+        id: String,
+        /// 仅用于本次连接，不写入档案。
+        #[arg(long)]
         python: Option<String>,
     },
     Disconnect,
@@ -290,6 +299,13 @@ impl Session {
                     })
                     .map_err(|error| error.to_string())?,
             )?,
+            DeviceCommand::ConnectSaved { id, python } => print_snapshot(
+                self.tool
+                    .connect(
+                        saved_connection_request(&id, python).map_err(|error| error.to_string())?,
+                    )
+                    .map_err(|error| error.to_string())?,
+            )?,
             DeviceCommand::Disconnect => {
                 print_snapshot(self.tool.disconnect().map_err(|error| error.to_string())?)?
             }
@@ -372,6 +388,28 @@ pub fn run(script: Option<&Path>, batch: bool) -> Result<(), String> {
         files: FilenameCompleter::new(),
     }));
     let mut session = Session::default();
+    let mut store = ConnectionStore::load_default();
+    if let Some(profile) = store.autoconnect_profile() {
+        let result = session
+            .tool
+            .connect(ConnectionRequest::ManagedCan {
+                serial: profile.adapter.serial,
+                node: profile.node,
+                mode: profile.mode,
+                python: None,
+                expected_uid: profile.expected_uid,
+            })
+            .map_err(|error| error.to_string())
+            .and_then(print_snapshot);
+        store.autoconnect_result(result);
+        let result = store.response()["autoconnect"].clone();
+        if result["status"] == "failed" {
+            eprintln!(
+                "自动连接失败；Shell 保持可用：{}",
+                result["error"]["message"]
+            );
+        }
+    }
     println!(
         "EHA 持久交互工具 {}\n输入 help 查看命令；device connect 后动作会复用同一会话。",
         crate::build_metadata::TOOL_VERSION

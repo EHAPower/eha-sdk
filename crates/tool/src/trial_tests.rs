@@ -698,6 +698,73 @@ fn reconnect_while_connected_preserves_active_trial_without_sending() {
 }
 
 #[test]
+fn managed_reconnect_binds_first_verified_uid_and_rejects_a_mismatch_without_live_client() {
+    let (mut session, harness) = harness();
+    session.request = Some(ConnectionRequest::ManagedCan {
+        serial: "stable-adapter".into(),
+        node: 1,
+        mode: "fd".into(),
+        python: None,
+        expected_uid: None,
+    });
+    let client = session.client.take().expect("fixture client");
+    session.disconnected = Some(client.disconnect());
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let sink = Arc::new(Mutex::new(None));
+    session.connector = Some(reconnect_connector(
+        Arc::clone(&observed),
+        Arc::clone(&sink),
+        [9; 16],
+    ));
+    session.reconnect().expect("same UID reconnects");
+    assert_eq!(
+        session
+            .request
+            .as_ref()
+            .and_then(ConnectionRequest::expected_uid),
+        Some("070707070707070707070707")
+    );
+
+    let client = session.client.take().expect("reconnected client");
+    session.disconnected = Some(client.disconnect());
+    if let Some(ConnectionRequest::ManagedCan { expected_uid, .. }) = session.request.as_mut() {
+        *expected_uid = Some("080808080808080808080808".into());
+    }
+    let error = session
+        .reconnect()
+        .expect_err("profile UID must gate reconnect");
+    assert_eq!(error.kind.as_ref(), "invalid_input");
+    assert!(session.client.is_none());
+    assert!(session.disconnected.is_some(), "retry state is retained");
+    assert!(
+        session.identity.is_none(),
+        "stale identity is not projected"
+    );
+    assert!(session.execute(Command::Velocity { mm_s: 1.0 }).is_err());
+    assert_eq!(harness.observed.lock().expect("observed").stops, 0);
+}
+
+#[test]
+fn managed_refresh_uid_mismatch_clears_the_live_client() {
+    let (mut session, _) = harness();
+    session.request = Some(ConnectionRequest::ManagedCan {
+        serial: "stable-adapter".into(),
+        node: 1,
+        mode: "fd".into(),
+        python: None,
+        expected_uid: Some("080808080808080808080808".into()),
+    });
+    let error = session
+        .refresh_identity()
+        .expect_err("managed UID gates refresh");
+    assert_eq!(error.kind.as_ref(), "invalid_input");
+    assert!(session.client.is_none());
+    assert!(session.disconnected.is_some());
+    assert!(session.identity.is_none());
+    assert!(session.execute(Command::Status).is_err());
+}
+
+#[test]
 fn interrupted_trial_reconnects_then_explicit_stop_needs_a_fresh_idle() {
     let (mut session, _) = harness();
     session.trial.active = Some(active(

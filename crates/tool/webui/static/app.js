@@ -5,6 +5,7 @@ import { createConfigEditor, rawJsonNumber, stringifyJson } from "./config-edito
 import { createTrialUi } from "./trial-ui.js";
 import { createRecordingUi } from "./recording-ui.js";
 import { trialState } from "./trial-state.js";
+import { autoconnectStatus, canableAdapters, connectionControls, connectionErrorGuidance, managedConnectPayload, managedProfilePayload, runtimeStatus, shouldSelectAutoconnectedCan } from "./can-connection-ui.js";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -28,6 +29,10 @@ let sessions = { usb:null, can:null };
 let canNodes = [];
 let canScanNodes = [];
 let groupNodes = [];
+let canProfiles = [];
+let canAdapters = [];
+let canConnections = null;
+let canConnectionsLoading = false;
 const viewStates = { usb:null, can:null };
 const connectionFormSources = { usb:null, can:null };
 const discovering = new Set();
@@ -190,13 +195,112 @@ function syncConnectionForm(transport, connection) {
   const source = JSON.stringify(connection);
   if (connectionFormSources[transport] === source) return;
   if (transport === "usb") selectSavedOption($("#usb-serial"), connection.serial);
-  if (transport === "can") {
+  if (transport === "can" && connection.channel) {
     $("#can-channel").value = connection.channel || "";
-    $("#can-connection-form input[name=node]").value = connection.node ?? "";
     $("#can-connection-form select[name=mode]").value = connection.mode || "fd";
     $("#can-connection-form input[name=python]").value = connection.python || "";
   }
   connectionFormSources[transport] = source;
+}
+function selectedCanProfile() { return canProfiles.find((profile) => profile.id === $("#can-profile").value) || null; }
+function managedCanFields() {
+  const node = Number($("#can-node").value);
+  return {
+    profileId:selectedCanProfile()?.id,
+    adapterSerial:$("#can-adapter").value,
+    node,
+    mode:$("#can-mode").value,
+    name:$("#can-profile-name").value.trim(),
+    autoconnect:$("#can-profile-autoconnect").checked,
+    isDefault:$("#can-profile-default").checked,
+  };
+}
+function canProfileLabel(profile) {
+  const adapter = profile?.adapter?.serial || "未绑定适配器";
+  return `${profile.name || `节点 ${profile.node}`} · ${adapter} · 节点 ${profile.node}`;
+}
+function renderCanProfiles() {
+  const select = $("#can-profile"); const previous = select.value;
+  select.replaceChildren(new Option("新建连接", ""), ...canProfiles.map((profile) => new Option(`${canProfileLabel(profile)}${profile.default ? "（默认）" : ""}`, profile.id)));
+  const selected = canProfiles.some((profile) => profile.id === previous) ? previous : canProfiles.find((profile) => profile.default)?.id || "";
+  select.value = selected;
+  syncManagedCanProfile();
+}
+function renderCanAdapters() {
+  const select = $("#can-adapter"); const previous = select.value;
+  select.replaceChildren(new Option(canAdapters.length ? "请选择 CANable 2" : "未发现 CANable 2，请刷新", ""));
+  for (const adapter of canAdapters) {
+    if (!adapter?.serial) continue;
+    const detail = [adapter.description, adapter.vid && adapter.pid ? `${adapter.vid}:${adapter.pid}` : null].filter(Boolean).join(" · ");
+    select.add(new Option(`${adapter.serial}${detail ? ` · ${detail}` : ""}`, adapter.serial));
+  }
+  if (previous && canAdapters.some((adapter) => adapter.serial === previous)) select.value = previous;
+}
+function syncManagedCanProfile() {
+  const profile = selectedCanProfile();
+  if (!profile) {
+    $("#can-adapter").value = "";
+    $("#can-profile-name").value = "";
+    $("#can-node").value = "1";
+    $("#can-mode").value = "fd";
+    $("#can-profile-autoconnect").checked = false;
+    $("#can-profile-default").checked = false;
+    $("#connect-can").textContent = "连接并保存";
+    updateActionAvailability();
+    return;
+  }
+  $("#can-profile-name").value = profile.name || "";
+  $("#can-node").value = profile.node ?? 1;
+  $("#can-mode").value = profile.mode || "fd";
+  $("#can-profile-autoconnect").checked = Boolean(profile.autoconnect);
+  $("#can-profile-default").checked = Boolean(profile.default);
+  $("#connect-can").textContent = "连接已保存项";
+  const serial = profile.adapter?.serial;
+  if (serial) {
+    const select = $("#can-adapter");
+    if (![...select.options].some((option) => option.value === serial)) select.add(new Option(`${serial}（保存的适配器，本机未发现）`, serial));
+    select.value = serial;
+  }
+  updateActionAvailability();
+}
+function renderCanRuntime(runtime) {
+  const state = runtimeStatus(runtime);
+  const target = $("#can-runtime-state");
+  target.textContent = state.text;
+  target.classList.toggle("is-warning", state.error);
+}
+function renderCanAutoconnect() {
+  $("#can-autoconnect-state").textContent = autoconnectStatus(canConnections?.autoconnect);
+}
+async function refreshCanConnections({ adapters = false, announce = false } = {}) {
+  if (canConnectionsLoading) return;
+  canConnectionsLoading = true;
+  updateActionAvailability();
+  try {
+    const [connections, adapterResult] = await Promise.all([
+      get("/api/connections", { timeout:5000 }),
+      adapters ? get("/api/adapters", { timeout:5000 }) : Promise.resolve(null),
+    ]);
+    canConnections = connections;
+    canProfiles = Array.isArray(connections.profiles) ? connections.profiles : [];
+    if (adapterResult) canAdapters = canableAdapters(adapterResult);
+    renderCanAdapters();
+    renderCanProfiles();
+    const autoProfile = canProfiles.find((profile) => profile.id === connections.active_profile_id) || canProfiles.find((profile) => profile.autoconnect);
+    if (shouldSelectAutoconnectedCan({ status:connections.autoconnect?.status, activeTransport, usbReady:sessionReady(sessions.usb) })) {
+      selectTransport("can", { force:true, announce:false, node:autoProfile?.node });
+    }
+    renderCanAutoconnect();
+    renderCanRuntime(connections.runtime);
+    if (announce) setNotice(adapters ? "已刷新本机 CANable 2 与保存的连接。" : "已刷新保存的连接。");
+  } catch (error) {
+    $("#can-autoconnect-state").textContent = `无法读取保存的连接：${error.message}`;
+    $("#can-runtime-state").textContent = "CAN 运行时状态暂不可用。";
+    if (announce) setNotice(`刷新 CAN 连接失败：${error.message}`, "is-error");
+  } finally {
+    canConnectionsLoading = false;
+    updateActionAvailability();
+  }
 }
 function sessionForTransport(transport) {
   return transport === "can" ? canNodes.find((entry) => entry.node === activeCanNode)?.snapshot || sessions.can : sessions[transport];
@@ -253,9 +357,26 @@ function updateActionAvailability() {
     const held = Boolean(session?.connected);
     const pending = discovering.has(transport);
     const recoveryReconnect = session?.trial?.state === "interrupted_unknown" && (!session?.connected || Boolean(session?.transport?.disconnected));
-    setDisabled(`#${transport}-connection-form input, #${transport}-connection-form select`, busy || held || pending || trialLocked);
-    setDisabled(`#discover-${transport}`, busy || held || pending || trialLocked);
-    setDisabled(`#connect-${transport}`, locked || held || pending || trialLocked);
+    if (transport === "usb") {
+      setDisabled(`#${transport}-connection-form input, #${transport}-connection-form select`, busy || held || pending || trialLocked);
+      setDisabled(`#discover-${transport}`, busy || held || pending || trialLocked);
+      setDisabled(`#connect-${transport}`, locked || held || pending || trialLocked);
+    } else {
+      const controls = connectionControls({ busy:busy || !snapshotReady || canConnectionsLoading, trialLocked, held, identityReady:Boolean(session?.identity?.uid), profileId:selectedCanProfile()?.id, adapterSerial:$("#can-adapter").value });
+      $("#can-profile").disabled = controls.profile;
+      $("#can-adapter").disabled = controls.adapter;
+      $("#can-profile-name").disabled = busy || trialLocked;
+      $("#can-node").disabled = controls.adapter;
+      $("#can-mode").disabled = controls.adapter;
+      $("#can-profile-autoconnect").disabled = busy || trialLocked;
+      $("#can-profile-default").disabled = busy || trialLocked;
+      $("#connect-can").disabled = controls.connect;
+      $("#connect-can-profile").disabled = controls.connect || !selectedCanProfile();
+      $("#save-can-profile").disabled = controls.save;
+      $("#delete-can-profile").disabled = controls.remove;
+      $("#refresh-can-adapters").disabled = controls.refresh;
+      setDisabled("#can-connection-form input, #can-connection-form select, #can-scan-nodes, #can-connect-nodes", busy || trialLocked || held);
+    }
     setDisabled(`#reconnect-${transport}`, locked || !session?.connection || (held && !session.transport?.disconnected) || (trialLocked && !recoveryReconnect));
     setDisabled(`#disconnect-${transport}`, locked || !held || trialLocked);
   }
@@ -272,7 +393,7 @@ function updateActionAvailability() {
   setDisabled("#config-import, #config-export", busy || trialLocked);
   setDisabled("#config-fields input, #config-fields select", busy || trialLocked);
   setDisabled("#save-config, #restore-factory, #reset-application, #enter-update, [data-action=\"config_read\"]", busy || trialLocked || !active);
-  setDisabled("#can-scan-start, #can-scan-end, #can-scan-nodes, #can-connect-nodes, #can-scan-results input", busy || trialLocked);
+  setDisabled("#can-scan-start, #can-scan-end, #can-scan-nodes, #can-connect-nodes, #can-scan-results input", busy || trialLocked || Boolean(sessionForTransport("can")?.connected));
   const stopLabel = `停止 ${transportLabel(activeTransport)} 控制`;
   $$('[data-stop-label]').forEach((target) => { target.textContent = stopLabel; });
   $$('[data-stop-control]').forEach((target) => { target.setAttribute("aria-label", stopLabel); });
@@ -424,7 +545,7 @@ async function run(path, payload, label) {
   const transport = payload.transport || activeTransport;
   const odriveEpoch = odriveRequestEpoch;
   payload = { ...payload, transport };
-  if (transport === "can" && payload.node === undefined && !["/api/group", "/api/can/scan", "/api/can/connect"].includes(path) && Number.isInteger(activeCanNode)) payload.node = activeCanNode;
+  if (transport === "can" && payload.node === undefined && !payload.profile_id && !["/api/group", "/api/can/scan", "/api/can/connect"].includes(path) && Number.isInteger(activeCanNode)) payload.node = activeCanNode;
   label = `${transportLabel(transport)} · ${label}`;
   sessionRevision++;
   setBusy(true);
@@ -458,7 +579,8 @@ async function run(path, payload, label) {
     }
     if (detail?.operation_key) setOperationKey(detail.operation_key, detail.snapshot || snapshot, transport);
     const network = !detail;
-    setNotice(network ? `${label}未得到服务响应；未判断是否提交或执行，请先恢复服务后查看事实。` : detail.unknown ? `${label}结果未知：${error.message}；保留操作键后只读查询。` : `${label}失败：${error.message}`, network || detail?.unknown ? "is-warning" : "is-error");
+    const guidance = connectionErrorGuidance(detail?.error?.code || detail?.code);
+    setNotice(network ? `${label}未得到服务响应；未判断是否提交或执行，请先恢复服务后查看事实。` : detail.unknown ? `${label}结果未知：${error.message}；保留操作键后只读查询。` : `${label}失败：${guidance || error.message}`, network || detail?.unknown ? "is-warning" : "is-error");
     return null;
   } finally {
     setBusy(false);
@@ -760,27 +882,57 @@ async function connectCanNodes() {
 }
 $("#active-transport").addEventListener("change", (event) => selectTransport(event.target.value));
 $("#active-can-node").addEventListener("change", (event) => { const node = Number(event.target.value); if (Number.isInteger(node)) selectTransport("can", { force:true, node }); });
+$("#usb-connection-form").addEventListener("submit", (event) => {
+  event.preventDefault();
+  const serial = String(new FormData(event.currentTarget).get("serial") || "");
+  if (!serial) return setNotice("请先从列表选择 USB 序列号。", "is-error");
+  return run("/api/connect", { transport:"usb", serial }, "连接并核对身份");
+});
+$("#discover-usb").addEventListener("click", () => discoverDevices("usb"));
 for (const transport of ["usb", "can"]) {
-  $("#" + transport + "-connection-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const values = new FormData(event.currentTarget);
-    if (transport === "usb") {
-      const serial = String(values.get("serial") || "");
-      if (!serial) return setNotice("请先从列表选择 USB 序列号。", "is-error");
-      return run("/api/connect", { transport, serial }, "连接并核对身份");
-    }
-    const channel = String(values.get("channel") || "").trim();
-    if (!channel) return setNotice("请先填写外部 CAN 通道。", "is-error");
-    const rawNode = String(values.get("node") ?? "").trim();
-    const node = Number(rawNode);
-    if (!rawNode || !Number.isInteger(node) || node < 0 || node > 127) return setNotice("Customer CAN 节点号必须为 0 至 127 的整数。", "is-error");
-    const python = String(values.get("python") || "").trim();
-    run("/api/connect", { transport, channel, node, mode:values.get("mode"), python:python || null }, "连接并核对身份");
-  });
   $("#disconnect-" + transport).addEventListener("click", () => run("/api/disconnect", { transport }, "关闭本地连接"));
   $("#reconnect-" + transport).addEventListener("click", () => run("/api/reconnect", { transport }, "重新连接"));
-  if (transport === "usb") $("#discover-" + transport).addEventListener("click", () => discoverDevices(transport));
 }
+function validatedManagedCanFields() {
+  const fields = managedCanFields();
+  if (!Number.isInteger(fields.node) || fields.node < 0 || fields.node > 127) {
+    setNotice("Customer CAN 节点号必须为 0 至 127 的整数。", "is-error");
+    return null;
+  }
+  if (!fields.profileId && !fields.adapterSerial) {
+    setNotice("请先刷新并选择本机 CANable 2。", "is-error");
+    return null;
+  }
+  return fields;
+}
+$("#can-managed-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const fields = validatedManagedCanFields();
+  if (!fields) return;
+  const body = await run("/api/connect", managedConnectPayload(fields), fields.profileId ? "连接已保存 CAN" : "连接并保存 CAN");
+  if (body) await refreshCanConnections();
+});
+$("#connect-can-profile").addEventListener("click", async () => {
+  const profile = selectedCanProfile();
+  if (!profile) return setNotice("请先选择一个已保存连接。", "is-error");
+  const body = await run("/api/connect", managedConnectPayload({ profileId:profile.id }), "连接已保存 CAN");
+  if (body) await refreshCanConnections();
+});
+$("#save-can-profile").addEventListener("click", async () => {
+  const fields = validatedManagedCanFields();
+  if (!fields?.profileId) return setNotice("先连接新适配器并核对 Identity，才能保存新的连接。", "is-error");
+  const body = await run("/api/connections", managedProfilePayload({ ...fields, id:fields.profileId }), "更新保存的 CAN 连接");
+  if (body) await refreshCanConnections();
+});
+$("#delete-can-profile").addEventListener("click", async () => {
+  const profile = selectedCanProfile();
+  if (!profile) return setNotice("请先选择要删除的已保存连接。", "is-error");
+  const body = await run("/api/connections/delete", { transport:"can", id:profile.id }, "删除保存的 CAN 连接");
+  if (body) await refreshCanConnections();
+});
+$("#refresh-can-adapters").addEventListener("click", () => refreshCanConnections({ adapters:true, announce:true }));
+$("#can-profile").addEventListener("change", syncManagedCanProfile);
+$("#can-adapter").addEventListener("change", updateActionAvailability);
 $("#can-scan-nodes").addEventListener("click", scanCanNodes);
 $("#can-connect-nodes").addEventListener("click", connectCanNodes);
 $$("button[data-action]").forEach((button) => button.addEventListener("click", () => command(button.dataset.action, button.dataset.view ? { view:button.dataset.view } : {})));
@@ -941,4 +1093,4 @@ void configEditor.loadSchema();
 void recordingUi.refresh();
 poll();
 void discoverDevices("usb", false);
-void discoverDevices("can", false);
+void refreshCanConnections({ adapters:true });

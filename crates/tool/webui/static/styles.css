@@ -668,6 +668,8 @@ fieldset input { width: auto; min-height: auto; margin: 0; accent-color: var(--p
 .connection-form { display: grid; gap: 12px; }
 .connection-card .form-actions button { flex: 1 1 128px; }
 .connection-card .facts { margin-top: 14px; }
+.managed-can-fields { align-items: end; }
+.managed-can-fields fieldset { gap: 8px 14px; }
 
 .facts {
   display: grid;
@@ -892,8 +894,8 @@ pre {
   .form-grid fieldset, .form-grid .form-actions, .form-grid .can-fields { grid-column: 1 / -1; }
   .can-fields { grid-template-columns: 2fr 1fr 1fr; }
   .connection-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  #can-connection-form { grid-template-columns: minmax(0, 1.5fr) minmax(92px, .5fr) minmax(0, .75fr) minmax(0, 1fr); }
-  #can-connection-form .form-actions { grid-column: 1 / -1; }
+  #can-managed-form .managed-can-fields { grid-template-columns: minmax(0, 1.2fr) minmax(92px, .45fr) minmax(0, .75fr); }
+  #can-managed-form .managed-can-fields fieldset { grid-column: 1 / -1; }
   .maintenance-grid { grid-template-columns: minmax(0, 1fr) auto; align-items: end; }
 }
 
