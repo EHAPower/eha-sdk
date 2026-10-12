@@ -2,7 +2,7 @@
 
 use crate::codec::payload_len;
 use crate::validation::payload_len_is_valid;
-use crate::{Error, MessageKind, OperationKey, Response};
+use crate::{Error, ExpectedIdentity, MessageKind, Response};
 
 /// 已解码的应用消息。固件回复通过具名的借用视图访问；接收缓冲在视图存活期间不可复用。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -40,33 +40,28 @@ pub enum Message<'a> {
         /// 合同定义的配置视图。
         view: u8,
     },
-    /// 维护结果读取。
-    ReadResult {
+    /// 借用的完整候选配置原字节。
+    SaveAndRestart {
         /// 非零查询标识。
         query_id: u32,
-        /// 被查询的维护键。
-        key: OperationKey<'a>,
-    },
-    /// 借用的完整候选配置原字节。
-    SaveConfig {
-        /// 此请求的维护键。
-        key: OperationKey<'a>,
+        /// 当前期望的控制器和运行实例。
+        identity: ExpectedIdentity<'a>,
         /// 借用的完整候选记录原字节。
         record: &'a [u8],
     },
-    /// 无候选字节的维护操作。
-    Maintenance {
-        /// `RestoreFactory`、`ResetApplication` 或 `EnterUpdate`。
-        kind: MessageKind,
-        /// 此请求的维护键。
-        key: OperationKey<'a>,
+    /// 请求应用复位。
+    ResetApplication {
+        /// 非零查询标识。
+        query_id: u32,
+        /// 当前期望的控制器和运行实例。
+        identity: ExpectedIdentity<'a>,
     },
-    /// 已结清结果的释放请求。
-    ReleaseResult {
-        /// 此请求的维护键。
-        key: OperationKey<'a>,
-        /// 精确匹配的留存结果版本。
-        revision: u32,
+    /// 请求更新入口。
+    EnterUpdate {
+        /// 非零查询标识。
+        query_id: u32,
+        /// 当前期望的控制器和运行实例。
+        identity: ExpectedIdentity<'a>,
     },
     /// 具有字段访问器的固件回复。
     Response(Response<'a>),
@@ -84,10 +79,9 @@ impl<'a> Message<'a> {
             Self::Heartbeat => MessageKind::Heartbeat,
             Self::Query { .. } => MessageKind::Query,
             Self::ReadConfig { .. } => MessageKind::ReadConfig,
-            Self::ReadResult { .. } => MessageKind::ReadResult,
-            Self::SaveConfig { .. } => MessageKind::SaveConfig,
-            Self::Maintenance { kind, .. } => *kind,
-            Self::ReleaseResult { .. } => MessageKind::ReleaseResult,
+            Self::SaveAndRestart { .. } => MessageKind::SaveAndRestart,
+            Self::ResetApplication { .. } => MessageKind::ResetApplication,
+            Self::EnterUpdate { .. } => MessageKind::EnterUpdate,
             Self::Response(response) => response.kind(),
         }
     }

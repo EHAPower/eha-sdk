@@ -3,16 +3,16 @@
 use crate::validation::{u32_at, u64_at};
 use crate::{Error, responses};
 
-/// 维护会话键的借用表示。
+/// 变异请求的期望控制器和运行实例。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OperationKey<'a> {
+pub struct ExpectedIdentity<'a> {
     pub(crate) bytes: &'a [u8],
 }
 
-impl<'a> OperationKey<'a> {
-    /// 从精确36字节线上表示构造键。
+impl<'a> ExpectedIdentity<'a> {
+    /// 从精确28字节线上表示构造期望身份。
     pub fn new(bytes: &'a [u8]) -> Result<Self, Error> {
-        if bytes.len() == 36 {
+        if bytes.len() == 28 {
             Ok(Self { bytes })
         } else {
             Err(Error::InvalidField)
@@ -26,68 +26,53 @@ impl<'a> OperationKey<'a> {
     pub fn run_nonce(self) -> &'a [u8] {
         &self.bytes[12..28]
     }
-    /// 非零维护操作标识。
-    pub fn operation_id(self) -> u64 {
-        u64_at(self.bytes, 28)
-    }
     /// 原始完整线上表示。
     pub fn as_bytes(self) -> &'a [u8] {
         self.bytes
     }
 
-    /// 将借用的线上表示复制为可长期保存的具名维护键。
-    pub fn fields(self) -> OperationKeyFields {
+    /// 将借用的线上表示复制为可长期保存的具名期望身份。
+    pub fn fields(self) -> ExpectedIdentityFields {
         let mut uid = [0; 12];
         uid.copy_from_slice(&self.bytes[..12]);
         let mut run_nonce = [0; 16];
         run_nonce.copy_from_slice(&self.bytes[12..28]);
-        OperationKeyFields::new(uid, run_nonce, self.operation_id())
+        ExpectedIdentityFields::new(uid, run_nonce)
     }
 }
 
-/// 可长期保存的维护会话键。
-///
-/// 该类型只拥有公共协议既有的 UID、运行实例和操作标识。需要发送时调用
-/// [`OperationKeyFields::to_bytes`]，再以 [`OperationKey::new`] 借用该连续表示；线上
-/// 字段顺序仍只在本模块维护。
+/// 可长期保存的具名期望身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct OperationKeyFields {
+pub struct ExpectedIdentityFields {
     /// 固定12字节控制器 UID。
     pub uid: [u8; 12],
     /// 固定16字节运行实例。
     pub run_nonce: [u8; 16],
-    /// 维护操作标识。
-    pub operation_id: u64,
 }
 
-impl OperationKeyFields {
-    /// 按具名字段构造一个自有维护键。
+impl ExpectedIdentityFields {
+    /// 按具名字段构造一个自有期望身份。
     #[must_use]
-    pub const fn new(uid: [u8; 12], run_nonce: [u8; 16], operation_id: u64) -> Self {
-        Self {
-            uid,
-            run_nonce,
-            operation_id,
-        }
+    pub const fn new(uid: [u8; 12], run_nonce: [u8; 16]) -> Self {
+        Self { uid, run_nonce }
     }
 
-    /// 从精确36字节线上表示恢复一个自有维护键。
+    /// 从精确28字节线上表示恢复一个自有期望身份。
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let key = OperationKey::new(bytes)?;
+        let identity = ExpectedIdentity::new(bytes)?;
         let mut uid = [0; 12];
-        uid.copy_from_slice(key.uid());
+        uid.copy_from_slice(identity.uid());
         let mut run_nonce = [0; 16];
-        run_nonce.copy_from_slice(key.run_nonce());
-        Ok(Self::new(uid, run_nonce, key.operation_id()))
+        run_nonce.copy_from_slice(identity.run_nonce());
+        Ok(Self::new(uid, run_nonce))
     }
 
-    /// 编码为公共协议使用的连续36字节表示。
+    /// 编码为公共协议使用的连续28字节表示。
     #[must_use]
-    pub fn to_bytes(self) -> [u8; 36] {
-        let mut bytes = [0; 36];
+    pub fn to_bytes(self) -> [u8; 28] {
+        let mut bytes = [0; 28];
         bytes[..12].copy_from_slice(&self.uid);
         bytes[12..28].copy_from_slice(&self.run_nonce);
-        bytes[28..].copy_from_slice(&self.operation_id.to_le_bytes());
         bytes
     }
 }

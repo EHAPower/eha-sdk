@@ -124,7 +124,7 @@ eha-tool odrive --python /path/to/python --timeout-secs 10 --json status --seria
 | 查询 | `status`、`measurements`、`diagnostics`、`telemetry` | `telemetry` 只读缓存，不发查询；`wait SECONDS` 只本地等待。 |
 | 联系 | `heartbeat-start`、`heartbeat-stop`、`heartbeat-once` | 启停心跳不停止控制。 |
 | 持续目标与普通停止 | `position`、`velocity`、`force`、`impedance`、`stop` | 仍须显式 `stop`。 |
-| 配置与维护 | `config check FILE`、`config validate FILE`、`config-read`、`config-save`、`restore-factory`、`result`、`release`、`reset-application`、`enter-update` | `config check` 不连接；`config validate` 要先连接。其余规则见[配置与维护](#配置与维护)。 |
+| 配置与维护 | `config check FILE`、`config-read`、`save-and-restart`、`restore-factory-and-restart`、`reset-application`、`enter-update` | `config check` 不连接；其余规则见[配置与维护](#配置与维护)。 |
 
 `disconnect`、`reconnect`、`quit` 和关闭 Shell 只管理本地连接，不会发送 Stop、Reset 或重放动作。交互式
 Shell 按 shell 语法分词但不展开环境变量；用 `help`、`help device`、`help config` 查询精确帮助。
@@ -146,9 +146,8 @@ EOF
 #### 配置与维护
 
 `config-check` 完成 SDK 静态配置检查；字段、schema 和换算规则见
-[SDK 配置检查](../../README.md#配置检查)。通过不代替设备身份、通信、写后读回或运行
-条件核对。`config-read --view` 接受 `factory`、`user`、`startup`、`communication`；仅完整 UTF-8 的非
-`communication` 记录可用 `--output` 创建新文件，且工具不覆盖已有文件。Shell 使用 `config-save FILE` 和
+[SDK 配置检查](../../README.md#配置检查)。通过不代替设备身份、通信或运行
+条件核对。`config-read --view` 接受 `factory`、`user`、`startup`；完整 UTF-8 记录可用 `--output` 创建新文件，且工具不覆盖已有文件。Shell 使用 `save-and-restart FILE` 和
 `config-read --view VIEW`，不提供 `--output` 导出。
 
 ```mermaid
@@ -156,31 +155,17 @@ sequenceDiagram
     participant O as 操作者
     participant T as eha-tool
     participant D as 设备
-    O->>T: save / restore / reset / enter-update
+    O->>T: save-and-restart / restore-factory-and-restart / reset / enter-update
     T->>D: 一次维护请求
-    D-->>T: 结果或断连/超时
-    alt 已知结果
-        T-->>O: 维护结果（save/restore 含读回）
-    else 未知结果
-        T-->>O: 保留 operation key
-        O->>T: result 原操作键
-        T->>D: 查询原结果，不重发
-    end
+    T-->>O: 仅本地提交，或本地失败/取消/中断
 ```
 
-`save` 的完成结果含同设备用户记录的读回；保存不会自动复位、采用新 Startup 配置或释放维护结果。
-`restore-factory`、`reset-application` 和 `enter-update` 也返回操作键。超时、断连或未知结果时保留原
-72 位十六进制操作键，用 `result --operation-key KEY` 查询；**绝不自动重发**原维护操作。`release` 只释放
-已结清结果，并在被动遥测表明结果已清除后再次读取确认。Shell/WebUI 同一连接内若释放确认超时，
-再次执行释放只继续确认原键，不重发 Release；确认前的新维护请求会被拒绝。`enter-update` 只请求进入已交付更新入口，不传输镜像；镜像传输、DFU 对象
-核对和新应用启动核对由外部更新流程负责。
+`save-and-restart`、`restore-factory-and-restart`、`reset-application` 与 `enter-update` 都只报告本地提交；本地 Submitted 前可返回当前关联的明确拒绝，但不等待设备完成、断连、复位或读回，也不自动重连、查询或重发。保存和恢复出厂都请求设备重启，后续是否保存、采用 Startup 或进入更新入口须由操作者显式重新连接并读取当前事实。`enter-update` 不传输镜像；镜像传输、DFU 对象核对和新应用启动核对由外部更新流程负责。
 
 ```sh
 eha-tool device --usb "$EHA_USB_SERIAL" config-read --view user --output ./before.json
-eha-tool device --usb "$EHA_USB_SERIAL" save ./candidate.json
-eha-tool device --usb "$EHA_USB_SERIAL" result --operation-key '保存返回的操作键'
-eha-tool device --usb "$EHA_USB_SERIAL" release --operation-key '已结清的操作键'
-eha-tool device --usb "$EHA_USB_SERIAL" restore-factory
+eha-tool device --usb "$EHA_USB_SERIAL" save-and-restart ./candidate.json
+eha-tool device --usb "$EHA_USB_SERIAL" restore-factory-and-restart
 eha-tool device --usb "$EHA_USB_SERIAL" reset-application
 eha-tool device --usb "$EHA_USB_SERIAL" enter-update
 ```
@@ -200,17 +185,17 @@ eha-tool webui --runs-dir /path/to/eha-runs
 
 | 页面或操作 | 行为与边界 |
 | --- | --- |
-| 总览与连接 | USB 刷新只枚举 USB。CAN 可选择已保存的受管 CANable2/SLCAN 档案，或填写高级外部驱动上下文、实际节点、`classic`／`fd` 帧形态和可选 Python 解释器。连接/重连都只核对 Identity；受管档案按唯一稳定 USB 序列号选择，歧义、缺失或 UID 不符即失败。关闭只关闭该通路。USB、CAN 的会话、心跳、草稿和维护操作键分开保存。 |
+| 总览与连接 | USB 刷新只枚举 USB。CAN 可选择已保存的受管 CANable2/SLCAN 档案，或填写高级外部驱动上下文、实际节点、`classic`／`fd` 帧形态和可选 Python 解释器。连接/重连都只核对 Identity；受管档案按唯一稳定 USB 序列号选择，歧义、缺失或 UID 不符即失败。关闭只关闭该通路。USB、CAN 的会话、心跳和草稿分开保存。 |
 | 诊断与遥测 | 状态、测量、诊断和被动遥测均对应当前操作通路。图表的旧数据、缺失值和未知影响不能证明当前输出或实际执行；暂停绘图只影响浏览器展示。 |
 | 普通控制 | 先启用当前通路心跳，再提交已选定的位置、速度、力或阻抗参数。提交只到本地发送边界；停止心跳、关闭页面或断开连接不会停止控制，普通停止须点“停止控制”。 |
-| 配置和维护 | 表单只按当前 Schema 编辑/比较，完整 JSON 原文是唯一完整记录；导入和导出都不访问设备。保存前校验完整 JSON，保存后以读回为准。未知结果保留操作键并查询原结果，不重发；断连不能证明新应用或更新入口已启动。 |
+| 配置和维护 | 表单只按当前 Schema 编辑/比较，完整 JSON 原文是唯一完整记录；导入和导出都不访问设备。保存前校验完整 JSON；“保存并重启”与“恢复出厂并重启”只显示本地提交，随后必须显式重连或查询。断连不能证明新应用或更新入口已启动。 |
 | ODrive USB | 可按需独立发现和读取，不自动轮询；其快照和 H723 所见摘要是独立证据。读取工作者串行执行，忙碌返回忙碌而不阻塞 H723 会话。 |
 
 #### 配置表单、原文与差异
 
 读取设备视图会更新当前草稿；“导入候选”只载入本地文件，“导出原文”只下载当前草稿。字段表单和
-原文互相同步并标示未保存差异，但差异、导入成功或浏览器下载不代表配置已采用。只有“保存并读回”的
-维护结果说明本次设备操作已取得的事实；它仍不自动复位、采用新的启动配置或释放维护结果。
+原文互相同步并标示未保存差异，但差异、导入成功或浏览器下载不代表配置已采用。“保存并重启”只说明
+本地提交，不会更新草稿、清除未保存标记或代替重新连接后的当前记录查询。
 
 #### 曲线、目标与反馈
 

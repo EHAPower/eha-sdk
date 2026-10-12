@@ -5,7 +5,7 @@ use crate::validation::{
     f32_at, payload_len_is_valid, put_f32, put_u16, put_u32, u16_at, u32_at, validate_payload,
 };
 use crate::{
-    Direction, Error, MAX_PAYLOAD_LEN, Message, MessageInfo, MessageKind, OperationKey, Prefix,
+    Direction, Error, ExpectedIdentity, MAX_PAYLOAD_LEN, Message, MessageInfo, MessageKind, Prefix,
     Response,
 };
 
@@ -174,23 +174,18 @@ fn decode_validated(bytes: &[u8], info: MessageInfo) -> Result<Message<'_>, Erro
             query_id: u32_at(p, 0),
             view: p[4],
         },
-        MessageKind::ReadResult => Message::ReadResult {
+        MessageKind::SaveAndRestart => Message::SaveAndRestart {
             query_id: u32_at(p, 0),
-            key: OperationKey { bytes: &p[4..40] },
+            identity: ExpectedIdentity { bytes: &p[4..32] },
+            record: &p[32..],
         },
-        MessageKind::SaveConfig => Message::SaveConfig {
-            key: OperationKey { bytes: &p[..36] },
-            record: &p[36..],
+        MessageKind::ResetApplication => Message::ResetApplication {
+            query_id: u32_at(p, 0),
+            identity: ExpectedIdentity { bytes: &p[4..32] },
         },
-        MessageKind::RestoreFactory | MessageKind::ResetApplication | MessageKind::EnterUpdate => {
-            Message::Maintenance {
-                kind: info.kind,
-                key: OperationKey { bytes: p },
-            }
-        }
-        MessageKind::ReleaseResult => Message::ReleaseResult {
-            key: OperationKey { bytes: &p[..36] },
-            revision: u32_at(p, 36),
+        MessageKind::EnterUpdate => Message::EnterUpdate {
+            query_id: u32_at(p, 0),
+            identity: ExpectedIdentity { bytes: &p[4..32] },
         },
         kind => Message::Response(Response::new(kind, p)?),
     })
@@ -228,18 +223,19 @@ pub fn encode(message: Message<'_>, output: &mut [u8]) -> Result<usize, Error> {
             put_u32(p, 0, query_id);
             p[4] = category;
         }
-        Message::ReadResult { query_id, key } => {
+        Message::SaveAndRestart {
+            query_id,
+            identity,
+            record,
+        } => {
             put_u32(p, 0, query_id);
-            p[4..].copy_from_slice(key.as_bytes());
+            p[4..32].copy_from_slice(identity.as_bytes());
+            p[32..].copy_from_slice(record);
         }
-        Message::SaveConfig { key, record } => {
-            p[..36].copy_from_slice(key.as_bytes());
-            p[36..].copy_from_slice(record);
-        }
-        Message::Maintenance { key, .. } => p.copy_from_slice(key.as_bytes()),
-        Message::ReleaseResult { key, revision } => {
-            p[..36].copy_from_slice(key.as_bytes());
-            put_u32(p, 36, revision);
+        Message::ResetApplication { query_id, identity }
+        | Message::EnterUpdate { query_id, identity } => {
+            put_u32(p, 0, query_id);
+            p[4..].copy_from_slice(identity.as_bytes());
         }
         Message::Response(response) => p.copy_from_slice(response.payload()),
     }
@@ -254,10 +250,8 @@ pub(super) fn payload_len(message: &Message<'_>) -> usize {
         Message::Impedance { .. } => 12,
         Message::Stop | Message::Heartbeat => 0,
         Message::Query { .. } | Message::ReadConfig { .. } => 5,
-        Message::ReadResult { .. } => 40,
-        Message::SaveConfig { record, .. } => 36 + record.len(),
-        Message::Maintenance { .. } => 36,
-        Message::ReleaseResult { .. } => 40,
+        Message::SaveAndRestart { record, .. } => 32 + record.len(),
+        Message::ResetApplication { .. } | Message::EnterUpdate { .. } => 32,
         Message::Response(response) => response.payload().len(),
     }
 }

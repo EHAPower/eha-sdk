@@ -1,10 +1,16 @@
 // Copyright The eha-sdk Contributors
 
-use protocol::{Direction, MAX_MESSAGE_LEN, Message, OperationKey, encode};
+use protocol::{
+    Direction, ExpectedIdentity, MAX_MESSAGE_LEN, Message, SampleData, encode,
+    responses::{
+        ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView, FallbackReason,
+        StartupSource,
+    },
+};
 use transport::usb::{Lane, ReceiveEvent, Receiver, RejectReason, SendEvent, Sender};
 
-pub(super) const HEARTBEAT: [u8; 8] = [2, 6, 0, 0, 0x51, 0x9e, 0xb1, 0x26];
-pub(super) const POSITION: [u8; 12] = [2, 1, 4, 0, 0, 0, 0x20, 0x41, 0xc6, 0x2e, 0x3d, 0x08];
+pub(super) const HEARTBEAT: [u8; 8] = [3, 6, 0, 0, 0xe9, 0x34, 0xf4, 0xfb];
+pub(super) const POSITION: [u8; 12] = [3, 1, 4, 0, 0, 0, 0x20, 0x41, 0xe1, 0x53, 0x01, 0x41];
 
 pub(super) fn drain(sender: &mut Sender<'_>, lane: Lane, now_ms: u64) -> Vec<u8> {
     let mut bytes = Vec::new();
@@ -86,16 +92,16 @@ pub(super) fn assert_bad_crc_starts_receiver_guard(lane: Lane, message: &[u8]) {
     ));
 }
 
-pub(super) fn maximum_host_config() -> [u8; 16_428] {
-    let mut key_bytes = [0; 36];
-    key_bytes[12] = 1;
-    key_bytes[28] = 1;
-    let key = OperationKey::new(&key_bytes).expect("固定维护键有效");
+pub(super) fn maximum_save_and_restart() -> [u8; 16_424] {
+    let mut identity_bytes = [0; 28];
+    identity_bytes[12] = 1;
+    let identity = ExpectedIdentity::new(&identity_bytes).expect("固定期望身份有效");
     let record = [0x5a; 16_384];
-    let mut message = [0; 16_428];
+    let mut message = [0; 16_424];
     let length = encode(
-        Message::SaveConfig {
-            key,
+        Message::SaveAndRestart {
+            query_id: 1,
+            identity,
             record: &record,
         },
         &mut message,
@@ -103,6 +109,27 @@ pub(super) fn maximum_host_config() -> [u8; 16_428] {
     .expect("最大主机配置可编码");
     assert_eq!(length, message.len());
     message
+}
+
+pub(super) fn maximum_config_data(output: &mut [u8; MAX_MESSAGE_LEN]) -> usize {
+    let fields = ConfigDataFields {
+        sample: SampleData {
+            query_id: 7,
+            run_nonce: [1; 16],
+            snapshot_sequence: 2,
+            snapshot_time_us: 3,
+        },
+        view: ConfigView::UserRecord,
+        record_state: ConfigRecordState::Complete,
+        startup_source: StartupSource::User,
+        fallback_reason: FallbackReason::None,
+        data_time_us: 4,
+    };
+    let mut writer = ConfigDataWriter::start(fields, 16_384, output).expect("测试不变量");
+    for (index, byte) in writer.data_mut().iter_mut().enumerate() {
+        *byte = index as u8;
+    }
+    writer.finish().expect("测试不变量")
 }
 
 pub(super) fn first_block_end(stream: &[u8]) -> usize {

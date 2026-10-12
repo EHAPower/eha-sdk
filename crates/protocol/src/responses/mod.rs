@@ -21,6 +21,4 @@ mod diagnostics;
 pub use diagnostics::*;
 mod config;
 pub use config::*;
-mod operation;
-pub use operation::*;
 mod enums;

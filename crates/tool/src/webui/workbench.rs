@@ -472,15 +472,6 @@ impl Workbench {
         Ok(())
     }
 
-    pub(crate) fn refresh_identity(
-        &mut self,
-        transport: Transport,
-        node: Option<u8>,
-    ) -> Result<(), SessionError> {
-        self.session_mut(transport, node)?.refresh_identity()?;
-        Ok(())
-    }
-
     pub(crate) fn execute(
         &mut self,
         transport: Transport,
@@ -511,7 +502,6 @@ impl Workbench {
             return Ok(CommandResult {
                 action: "stop".into(),
                 local_submission: None,
-                operation_key: None,
                 data: value,
                 snapshot: self.usb.snapshot(),
             });
@@ -525,7 +515,6 @@ impl Workbench {
             return Ok(CommandResult {
                 action: "stop".into(),
                 local_submission: None,
-                operation_key: None,
                 data: value,
                 snapshot: session.snapshot(),
             });
@@ -1023,10 +1012,8 @@ fn session_error(message: impl Into<String>) -> SessionError {
         kind: "invalid_input".into(),
         message: message.into().into_boxed_str(),
         local_stage: Some("not_submitted".into()),
-        operation_key: None,
         unknown: false,
         failure: None,
-        last_result: None,
         observed_transport: None,
         transport_raw_hex: None,
     }

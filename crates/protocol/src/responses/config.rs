@@ -13,10 +13,7 @@ pub enum ConfigView {
     UserRecord = 1,
     /// 启动配置。
     Startup = 2,
-    /// 当前通信设置。
-    Communication = 3,
 }
-
 /// 配置记录状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -52,28 +49,6 @@ pub struct ConfigDataFields {
     pub fallback_reason: FallbackReason,
     /// 实际读取或取得时间。
     pub data_time_us: u64,
-}
-
-/// `Communication` 配置视图中固定 20 字节通信设置。
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CommunicationSettingsFields {
-    /// 当前 CAN 节点标识。
-    pub active_can_node: u32,
-    /// 当前 CAN 仲裁和数据相位配置。
-    pub profile: CanProfile,
-    /// 主机心跳频率，单位 Hz。
-    pub host_heartbeat_hz: u32,
-    /// 固件遥测发布频率，单位 Hz。
-    pub telemetry_hz: u32,
-    /// 主机联系允许的最长年龄，单位毫秒。
-    pub host_contact_max_age_ms: u32,
-}
-
-impl CommunicationSettingsFields {
-    /// 包含公共头和 CRC 的完整 `ConfigData` 通信视图长度。
-    pub const fn encoded_len() -> usize {
-        76
-    }
 }
 
 /// 直接写入最终发送缓冲的 ConfigData 构造器。
@@ -124,26 +99,4 @@ impl<'a> ConfigDataWriter<'a> {
     pub fn finish(self) -> Result<usize, Error> {
         encode_in_place(MessageKind::ConfigData, self.payload_length, self.output)
     }
-}
-
-/// 编码当前通信设置的固定 `Communication` 配置视图。
-pub fn encode_communication_settings(
-    fields: ConfigDataFields,
-    settings: CommunicationSettingsFields,
-    output: &mut [u8],
-) -> Result<usize, Error> {
-    if fields.view != ConfigView::Communication
-        || fields.record_state != ConfigRecordState::Complete
-    {
-        return Err(Error::InvalidField);
-    }
-    let mut writer = ConfigDataWriter::start(fields, 20, output)?;
-    let data = writer.data_mut();
-    put_u32(data, 0, settings.active_can_node);
-    data[4] = settings.profile as u8;
-    data[5..8].fill(0);
-    put_u32(data, 8, settings.host_heartbeat_hz);
-    put_u32(data, 12, settings.telemetry_hz);
-    put_u32(data, 16, settings.host_contact_max_age_ms);
-    writer.finish()
 }

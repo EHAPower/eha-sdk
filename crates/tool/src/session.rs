@@ -3,8 +3,7 @@
 //! 持久桌面工具会话。
 //!
 //! 本模块只把 SDK 的单一 `Client` 会话提供给 CLI、Shell 和 WebUI。它不重新实现
-//! 协议、传输或控制规则；关闭和通信恢复都保留 SDK 的编号与维护关联，也绝不发送 Stop
-//! 或重放任何动作。
+//! 协议、传输或控制规则；关闭和通信恢复绝不发送 Stop 或重放任何动作。
 
 use std::{
     collections::VecDeque,
@@ -17,15 +16,11 @@ use eha_sdk::{
     can::{
         CanChannelFactory, CanConnector, CanNodeConnector, CanOptions, python::PythonCanOptions,
     },
-    host::{
-        Client, ClientState, Error as SdkError, Failure, LocalStage, LocalSubmission,
-        OperationSubmission, Reply, Wait,
-    },
+    host::{Client, ClientState, Error as SdkError, Failure, LocalSubmission, Reply, Wait},
     protocol::{
         Response,
         responses::{ConfigView, ValueFields},
     },
-    session::MaintenanceKey,
     usb::UsbConnector,
 };
 use serde::{Deserialize, Serialize};
@@ -124,16 +119,10 @@ pub enum Command {
     ConfigValidate {
         record: String,
     },
-    ConfigSave {
+    ConfigSaveAndRestart {
         record: String,
     },
-    RestoreFactory,
-    MaintenanceResult {
-        operation_key: String,
-    },
-    MaintenanceRelease {
-        operation_key: String,
-    },
+    RestoreFactoryAndRestart,
     ResetApplication,
     EnterUpdate,
 }
@@ -171,16 +160,10 @@ impl Command {
             "config_validate" => Self::ConfigValidate {
                 record: fields.decode_field("record")?,
             },
-            "config_save" => Self::ConfigSave {
+            "config_save_and_restart" => Self::ConfigSaveAndRestart {
                 record: fields.decode_field("record")?,
             },
-            "restore_factory" => Self::RestoreFactory,
-            "maintenance_result" => Self::MaintenanceResult {
-                operation_key: fields.decode_field("operation_key")?,
-            },
-            "maintenance_release" => Self::MaintenanceRelease {
-                operation_key: fields.decode_field("operation_key")?,
-            },
+            "restore_factory_and_restart" => Self::RestoreFactoryAndRestart,
             "reset_application" => Self::ResetApplication,
             "enter_update" => Self::EnterUpdate,
             _ => return Err(format!("未知 action：{action}")),
@@ -202,11 +185,9 @@ pub struct SessionError {
     pub kind: Box<str>,
     pub message: Box<str>,
     pub local_stage: Option<Box<str>>,
-    pub operation_key: Option<Box<str>>,
     pub unknown: bool,
     /// 本次失败携带的完整协议事实；它不等同于本地提交或设备执行结论。
     pub failure: Option<Box<Value>>,
-    pub last_result: Option<Box<Value>>,
     pub observed_transport: Option<Box<Value>>,
     /// 仅本次 `Failure::Transport` 的原始字节，与后续观察到的传输状态分开保留。
     pub transport_raw_hex: Option<Box<str>>,
@@ -228,7 +209,6 @@ impl std::error::Error for SessionError {}
 pub struct CommandResult {
     pub action: String,
     pub local_submission: Option<LocalSubmissionSnapshot>,
-    pub operation_key: Option<String>,
     pub data: Value,
     pub snapshot: Snapshot,
 }
@@ -252,8 +232,6 @@ pub struct Snapshot {
     pub last_status: Option<Value>,
     pub last_measurements: Option<Value>,
     pub last_diagnostics: Option<Value>,
-    pub pending_operation_key: Option<String>,
-    pub last_operation: Option<Value>,
 }
 
 const TELEMETRY_TREND_WINDOW_US: u64 = 30_000_000;
@@ -432,9 +410,7 @@ pub struct ToolSession {
     last_status: Option<Reply>,
     last_measurements: Option<Reply>,
     last_diagnostics: Option<Reply>,
-    last_operation: Option<Value>,
     disconnected_reason: Option<String>,
-    disconnected_pending_operation: Option<String>,
     telemetry_trend: Option<TelemetryTrend>,
     telemetry_queue_capacity: Option<usize>,
     recording: Option<Recording>,
@@ -461,9 +437,7 @@ impl ToolSession {
             last_status: None,
             last_measurements: None,
             last_diagnostics: None,
-            last_operation: None,
             disconnected_reason: None,
-            disconnected_pending_operation: None,
             telemetry_trend: None,
             telemetry_queue_capacity: None,
             recording: None,
@@ -499,7 +473,6 @@ impl ToolSession {
             return self.reconnect();
         }
         self.clear_observations();
-        self.last_operation = None;
         let mut connector = connector_for(&request)?;
         let backend = connector.open().map_err(open_error)?;
         let mut client = Client::new(backend);
@@ -510,7 +483,6 @@ impl ToolSession {
             Ok(identity) => identity,
             Err(error) => {
                 self.disconnected_reason = client.connection_status().disconnected;
-                self.disconnected_pending_operation = client.pending_operation().map(key_hex);
                 self.request = Some(request);
                 self.connector = Some(connector);
                 self.disconnected = Some(client.disconnect());
@@ -526,7 +498,6 @@ impl ToolSession {
         self.client = Some(client);
         self.disconnected = None;
         self.disconnected_reason = None;
-        self.disconnected_pending_operation = None;
         Ok(self.snapshot())
     }
 
@@ -549,7 +520,6 @@ impl ToolSession {
             return Err(invalid("已有活跃会话；先显式 disconnect"));
         }
         self.clear_observations();
-        self.last_operation = None;
         let mut shared = Connector::SharedCan(connector);
         let backend = shared.open().map_err(open_error)?;
         let mut client = Client::new(backend);
@@ -560,7 +530,6 @@ impl ToolSession {
             Ok(identity) => identity,
             Err(error) => {
                 self.disconnected_reason = client.connection_status().disconnected;
-                self.disconnected_pending_operation = client.pending_operation().map(key_hex);
                 self.request = Some(request);
                 self.connector = Some(shared);
                 self.disconnected = Some(client.disconnect());
@@ -576,7 +545,6 @@ impl ToolSession {
         self.client = Some(client);
         self.disconnected = None;
         self.disconnected_reason = None;
-        self.disconnected_pending_operation = None;
         Ok(self.snapshot())
     }
 
@@ -594,7 +562,6 @@ impl ToolSession {
             .ok_or_else(|| invalid("当前没有活跃会话"))?;
         self.capture_telemetry(&client);
         self.disconnected_reason = client.connection_status().disconnected;
-        self.disconnected_pending_operation = client.pending_operation().map(key_hex);
         self.disconnected = Some(client.disconnect());
         Ok(self.snapshot())
     }
@@ -614,7 +581,6 @@ impl ToolSession {
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
             self.disconnected_reason = client.connection_status().disconnected;
-            self.disconnected_pending_operation = client.pending_operation().map(key_hex);
             self.disconnected = Some(client.disconnect());
         }
         let previous = self.identity.as_ref().and_then(identity_facts);
@@ -670,7 +636,6 @@ impl ToolSession {
         self.reconcile_interrupted_trial();
         self.client = Some(client);
         self.disconnected_reason = None;
-        self.disconnected_pending_operation = None;
         Ok(self.snapshot())
     }
 
@@ -691,90 +656,14 @@ impl ToolSession {
         Ok(())
     }
 
-    /// 在当前已连接通路上重新读取 Identity，供 WebUI 在新建维护键前刷新操作高水位。
-    ///
-    /// 同一 UID 与运行实例只更新 SDK 的维护编号下界，连续遥测历史保持不变；同一 UID
-    /// 的新运行实例会清除旧运行的观测和趋势。刷新失败时主动把未核对的 `Client` 转为
-    /// 可恢复的断开状态：它不再能执行业务操作，调用方可显式 `reconnect` 后重新核对。
-    /// 若已核对 Client 的 ReleaseResult fence 在本地零发送地拒绝刷新，则保留该 Client，
-    /// 使调用方仍可用同一原键完成确认。
-    /// 此入口不由普通 CLI/Shell 的 [`Self::execute`] 隐式调用。
-    pub fn refresh_identity(&mut self) -> Result<Snapshot, SessionError> {
-        let mut client = self
-            .client
-            .take()
-            .ok_or_else(|| invalid("请先 connect 并核对 Identity"))?;
-        let previous = self.identity.as_ref().and_then(identity_facts);
-        let identity = match client.identify(None, &self.wait()) {
-            Ok(identity) => identity,
-            Err(error) => {
-                if matches!(&error.failure, Failure::PendingOperation)
-                    && error.local == LocalStage::NotSubmitted
-                {
-                    self.client = Some(client);
-                    return Err(sdk_error(error));
-                }
-                self.disconnected_reason = Some(format!("维护前身份刷新失败：{error}"));
-                self.disconnected_pending_operation = client.pending_operation().map(key_hex);
-                self.disconnected = Some(client.disconnect());
-                self.clear_observations();
-                return Err(sdk_error(error));
-            }
-        };
-        if let Err(error) = expected_uid_matches(
-            self.request
-                .as_ref()
-                .ok_or_else(|| invalid("没有连接请求"))?,
-            &identity,
-        ) {
-            self.disconnected_reason = Some("维护前 Identity 与受管连接档案不匹配".into());
-            self.disconnected_pending_operation = client.pending_operation().map(key_hex);
-            self.disconnected = Some(client.disconnect());
-            self.identity = None;
-            self.clear_observations();
-            return Err(error);
-        }
-        let current = identity_facts(&identity).ok_or_else(|| invalid("Identity 回复无效"))?;
-        if previous.is_some_and(|previous| {
-            previous.uid != current.uid || previous.run_nonce != current.run_nonce
-        }) {
-            self.interrupt_trial_unknown("identity_changed");
-            self.finish_recording_boundary("identity_changed");
-            self.clear_observations();
-        }
-        self.identity = Some(identity);
-        self.reconcile_interrupted_trial();
-        self.client = Some(client);
-        self.disconnected = None;
-        self.disconnected_reason = None;
-        self.disconnected_pending_operation = None;
-        let pending = self.client.as_ref().and_then(Client::pending_operation);
-        if let Some(key) = pending
-            && key.uid == current.uid
-            && key.run_nonce == current.run_nonce
-            && current.retained_operation_id == 0
-        {
-            // 另一通路可能已经释放该键。只接受固件对同一键返回的 0x0306；任何其他
-            // 读取结果或错误都保留 SDK 的 pending 门禁，绝不据 Identity 猜测清除。
-            let wait = self.wait();
-            self.client
-                .as_mut()
-                .expect("connected Client was just stored")
-                .confirm_released(key, &wait)
-                .map_err(sdk_error)?;
-        }
-        Ok(self.snapshot())
-    }
-
     pub fn snapshot(&mut self) -> Snapshot {
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
-            let (heartbeat, transport, adapter, connection_status, pending_operation_key) = (
+            let (heartbeat, transport, adapter, connection_status) = (
                 client.heartbeat_status(),
                 client.transport_status(),
                 client.adapter_status(),
                 client.connection_status(),
-                client.pending_operation().map(key_hex),
             );
             let snapshot = Snapshot {
                 connected: true,
@@ -807,8 +696,6 @@ impl ToolSession {
                     .last_diagnostics
                     .as_ref()
                     .and_then(|reply| reply_json(reply).ok()),
-                pending_operation_key,
-                last_operation: self.last_operation.clone(),
             };
             self.client = Some(client);
             return snapshot;
@@ -839,8 +726,6 @@ impl ToolSession {
                 .last_diagnostics
                 .as_ref()
                 .and_then(|reply| reply_json(reply).ok()),
-            pending_operation_key: self.disconnected_pending_operation.clone(),
-            last_operation: self.last_operation.clone(),
         }
     }
 
@@ -863,7 +748,10 @@ impl ToolSession {
             Ok(value) => {
                 if matches!(
                     value.action.as_str(),
-                    "config_save" | "restore_factory" | "reset_application" | "enter_update"
+                    "config_save_and_restart"
+                        | "restore_factory"
+                        | "reset_application"
+                        | "enter_update"
                 ) {
                     self.trial.prepared = None;
                 }
@@ -872,7 +760,6 @@ impl ToolSession {
                     json!({
                         "action": value.action,
                         "local_submission": value.local_submission,
-                        "operation_key": value.operation_key,
                         "data": value.data,
                     }),
                 );
@@ -890,7 +777,6 @@ impl ToolSession {
             return Ok(CommandResult {
                 action: "config_validate".into(),
                 local_submission: None,
-                operation_key: None,
                 data: json!({"valid": true}),
                 snapshot,
             });
@@ -899,7 +785,6 @@ impl ToolSession {
         let action = command_name(&command).to_owned();
         let wait = self.wait();
         let mut local_submission = None;
-        let mut operation_key = None;
         let data = {
             let client = self
                 .client
@@ -972,64 +857,25 @@ impl ToolSession {
                         .read_config(parse_view(&view)?, &wait)
                         .map_err(sdk_error)?,
                 )?,
-                Command::ConfigSave { record } => {
-                    let saved = client
-                        .save_and_readback(record.as_bytes(), &wait)
-                        .map_err(sdk_error)?;
-                    local_submission = Some(local_submission_json(saved.submission.local));
-                    let key = key_hex(saved.submission.key);
-                    operation_key = Some(key.clone());
-                    let value = json!({"result": operation_fields_json(saved.result), "readback": reply_json(&saved.readback)?, "readback_matches_requested": true});
-                    self.last_operation = Some(value.clone());
-                    value
-                }
-                Command::RestoreFactory => {
-                    let saved = client.restore_factory(&wait).map_err(sdk_error)?;
-                    local_submission = Some(local_submission_json(saved.submission.local));
-                    let key = key_hex(saved.submission.key);
-                    operation_key = Some(key.clone());
-                    let value = json!({"result": operation_fields_json(saved.result), "readback": reply_json(&saved.readback)?, "readback_matches_factory": true});
-                    self.last_operation = Some(value.clone());
-                    value
-                }
-                Command::MaintenanceResult { operation_key: key } => {
-                    let key = parse_key(&key)?;
-                    client.track_operation(key).map_err(sdk_error)?;
-                    let value = reply_json(&client.read_result(key, &wait).map_err(sdk_error)?)?;
-                    self.last_operation = Some(value.clone());
-                    value
-                }
-                Command::MaintenanceRelease { operation_key: key } => {
-                    let key = parse_key(&key)?;
-                    client.track_operation(key).map_err(sdk_error)?;
-                    match client.read_result(key, &wait) {
-                        Ok(reply) => {
-                            let before = reply_json(&reply)?;
-                            let local = client.release_result(&wait).map_err(sdk_error)?;
-                            local_submission = Some(local_submission_json(local));
-                            client.confirm_released(key, &wait).map_err(sdk_error)?;
-                            json!({"before_release": before, "released": true})
-                        }
-                        Err(error)
-                            if matches!(&error.failure, Failure::PendingOperation)
-                                && error.local == LocalStage::NotSubmitted
-                                && client.pending_operation() == Some(key) =>
-                        {
-                            client.confirm_released(key, &wait).map_err(sdk_error)?;
-                            json!({"released": true})
-                        }
-                        Err(error) => return Err(sdk_error(error)),
-                    }
-                }
-                Command::ResetApplication => operation_submission_data(
+                Command::ConfigSaveAndRestart { record } => submission_data(
+                    client
+                        .save_and_restart(record.as_bytes(), &wait)
+                        .map_err(sdk_error)?,
+                    &mut local_submission,
+                ),
+                Command::RestoreFactoryAndRestart => submission_data(
+                    client
+                        .restore_factory_and_restart(&wait)
+                        .map_err(sdk_error)?,
+                    &mut local_submission,
+                ),
+                Command::ResetApplication => submission_data(
                     client.reset_application(&wait).map_err(sdk_error)?,
                     &mut local_submission,
-                    &mut operation_key,
                 ),
-                Command::EnterUpdate => operation_submission_data(
+                Command::EnterUpdate => submission_data(
                     client.enter_update(&wait).map_err(sdk_error)?,
                     &mut local_submission,
-                    &mut operation_key,
                 ),
                 Command::ConfigValidate { .. } => {
                     return Err(invalid("配置校验已在本地完成"));
@@ -1040,7 +886,6 @@ impl ToolSession {
         Ok(CommandResult {
             action,
             local_submission,
-            operation_key,
             data,
             snapshot,
         })
@@ -1366,8 +1211,7 @@ impl ToolSession {
             Some(time) if time > active.started_sample_time_us => time,
             _ => return None,
         };
-        if telemetry["facts"]["retained_result"].as_bool() != Some(false)
-            || telemetry["facts"]["unknown_effect"].as_bool() != Some(false)
+        if telemetry["facts"]["unknown_effect"].as_bool() != Some(false)
             || telemetry["driver_state"]["qualified"].as_bool() != Some(true)
             || telemetry["driver_state"]["stale"].as_bool() != Some(false)
             || telemetry["driver_state"]["faulted"].as_bool() != Some(false)
@@ -1551,7 +1395,6 @@ impl ToolSession {
             && telemetry["driver_state"]["stale"].as_bool() == Some(false)
             && telemetry["driver_state"]["faulted"].as_bool() == Some(false);
         let clear_facts = telemetry["facts"]["device_operation_pending"].as_bool() == Some(false)
-            && telemetry["facts"]["retained_result"].as_bool() == Some(false)
             && telemetry["facts"]["unknown_effect"].as_bool() == Some(false);
         let same_identity = self
             .identity
@@ -1822,10 +1665,8 @@ fn recording_error(message: impl Into<String>) -> SessionError {
         kind: "recording".into(),
         message: message.into().into_boxed_str(),
         local_stage: None,
-        operation_key: None,
         unknown: false,
         failure: None,
-        last_result: None,
         observed_transport: None,
         transport_raw_hex: None,
     }
@@ -1956,7 +1797,6 @@ fn validate_trial_facts(
     let facts = &status["facts"];
     let driver = &status["driver_state"];
     if facts["device_operation_pending"].as_bool() != Some(false)
-        || facts["retained_result"].as_bool() != Some(false)
         || facts["unknown_effect"].as_bool() != Some(false)
         || driver["has_status"].as_bool() != Some(true)
         || driver["qualified"].as_bool() != Some(true)
@@ -2112,10 +1952,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Stop => "stop",
         Command::ConfigRead { .. } => "config_read",
         Command::ConfigValidate { .. } => "config_validate",
-        Command::ConfigSave { .. } => "config_save",
-        Command::RestoreFactory => "restore_factory",
-        Command::MaintenanceResult { .. } => "maintenance_result",
-        Command::MaintenanceRelease { .. } => "maintenance_release",
+        Command::ConfigSaveAndRestart { .. } => "config_save_and_restart",
+        Command::RestoreFactoryAndRestart => "restore_factory_and_restart",
         Command::ResetApplication => "reset_application",
         Command::EnterUpdate => "enter_update",
     }
@@ -2130,16 +1968,6 @@ fn local_submission_json(local: LocalSubmission) -> LocalSubmissionSnapshot {
 fn submission_data(local: LocalSubmission, slot: &mut Option<LocalSubmissionSnapshot>) -> Value {
     *slot = Some(local_submission_json(local));
     json!({"local_submission": true, "device_execution": "unconfirmed"})
-}
-fn operation_submission_data(
-    submission: OperationSubmission,
-    slot: &mut Option<LocalSubmissionSnapshot>,
-    key: &mut Option<String>,
-) -> Value {
-    *slot = Some(local_submission_json(submission.local));
-    let value = key_hex(submission.key);
-    *key = Some(value.clone());
-    json!({"local_submission": true, "operation_key": value, "device_execution": "unconfirmed"})
 }
 
 pub(crate) fn parse_can_mode(value: &str) -> Result<eha_sdk::transport::can::Mode, SessionError> {
@@ -2186,29 +2014,13 @@ fn parse_view(value: &str) -> Result<ConfigView, SessionError> {
         "factory" => Ok(ConfigView::Factory),
         "user" => Ok(ConfigView::UserRecord),
         "startup" => Ok(ConfigView::Startup),
-        "communication" => Ok(ConfigView::Communication),
         _ => Err(invalid("未知配置视图")),
     }
-}
-fn parse_key(value: &str) -> Result<MaintenanceKey, SessionError> {
-    let mut bytes = [0_u8; 36];
-    if value.len() != 72 || !value.is_ascii() {
-        return Err(invalid("操作键必须为 72 个 ASCII 十六进制字符"));
-    }
-    for (index, output) in bytes.iter_mut().enumerate() {
-        *output = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
-            .map_err(|_| invalid("操作键必须只包含十六进制字符"))?;
-    }
-    MaintenanceKey::from_bytes(&bytes).map_err(|_| invalid("操作键无效"))
-}
-fn key_hex(key: MaintenanceKey) -> String {
-    hex(&key.to_bytes())
 }
 #[derive(Clone, Copy, Eq, PartialEq)]
 struct IdentityFacts {
     uid: [u8; 12],
     run_nonce: [u8; 16],
-    retained_operation_id: u64,
 }
 
 fn same_trial_instance(left: IdentityFacts, right: IdentityFacts) -> bool {
@@ -2222,7 +2034,6 @@ fn identity_facts(reply: &Reply) -> Option<IdentityFacts> {
     Some(IdentityFacts {
         uid: fields.uid,
         run_nonce: fields.sample.run_nonce,
-        retained_operation_id: fields.retained_operation_id,
     })
 }
 fn hex(bytes: &[u8]) -> String {
@@ -2233,10 +2044,8 @@ fn invalid(message: impl Into<String>) -> SessionError {
         kind: "invalid_input".into(),
         message: message.into().into_boxed_str(),
         local_stage: Some("not_submitted".into()),
-        operation_key: None,
         unknown: false,
         failure: None,
-        last_result: None,
         observed_transport: None,
         transport_raw_hex: None,
     }
@@ -2246,10 +2055,8 @@ fn open_error(message: String) -> SessionError {
         kind: "connection".into(),
         message: message.into_boxed_str(),
         local_stage: None,
-        operation_key: None,
         unknown: false,
         failure: None,
-        last_result: None,
         observed_transport: None,
         transport_raw_hex: None,
     }
@@ -2258,16 +2065,8 @@ fn sdk_error(error: SdkError) -> SessionError {
     let SdkError {
         failure,
         local,
-        operation,
-        last_result,
         observed_transport,
     } = error;
-    let operation_key = operation
-        .as_deref()
-        .copied()
-        .map(key_hex)
-        .map(String::into_boxed_str);
-    let last_result = last_result.map(|fields| Box::new(operation_fields_json(*fields)));
     let observed_transport =
         observed_transport.map(|transport| Box::new(transport_json(&transport, None)));
     let (kind, message, unknown, failure, transport_raw_hex) = match failure {
@@ -2297,37 +2096,6 @@ fn sdk_error(error: SdkError) -> SessionError {
             )
         }
         Failure::ResultUnknown(message) => ("result_unknown", message, true, None, None),
-        Failure::PendingOperation => (
-            "pending_operation",
-            "已有未结清维护操作".into(),
-            false,
-            None,
-            None,
-        ),
-        Failure::ReadbackMismatch => (
-            "readback_mismatch",
-            "实际读回与请求记录不一致".into(),
-            false,
-            None,
-            None,
-        ),
-        Failure::ReadbackUnavailable(state) => (
-            "readback_unavailable",
-            format!("实际读回不可用：{}", state as u8),
-            false,
-            None,
-            None,
-        ),
-        Failure::DeviceResult(fields) => (
-            "device_result",
-            format!(
-                "固件返回维护结果：{}；这只是读取到的设备结果，不表示本地提交成功",
-                eha_sdk::diagnostics::operation_state_label(fields.state)
-            ),
-            fields.state == eha_sdk::protocol::responses::MaintenanceState::ResultUnknown,
-            Some(Box::new(operation_fields_json(*fields))),
-            None,
-        ),
     };
     SessionError {
         kind: kind.into(),
@@ -2340,10 +2108,8 @@ fn sdk_error(error: SdkError) -> SessionError {
             }
             .into(),
         ),
-        operation_key,
         unknown,
         failure,
-        last_result,
         observed_transport,
         transport_raw_hex,
     }
@@ -2384,44 +2150,9 @@ fn value_json(value: ValueFields) -> Value {
         "stale": value.state.is_stale(),
     })
 }
-fn operation_fields_json(fields: eha_sdk::protocol::responses::OperationResultFields) -> Value {
-    json!({
-        "sample": sample_json(fields.sample),
-        "operation_id": fields.operation_id,
-        "operation": fields.operation as u8,
-        "operation_label": eha_sdk::diagnostics::maintenance_operation_label(fields.operation),
-        "state": fields.state as u8,
-        "state_label": eha_sdk::diagnostics::operation_state_label(fields.state),
-        "phase": fields.phase as u8,
-        "phase_label": eha_sdk::diagnostics::phase_label(fields.phase),
-        "reason": fields.reason,
-        "reason_label": eha_sdk::diagnostics::reason_label(fields.reason),
-        "next_actions": fields.next_actions,
-        "next_action_labels": eha_sdk::diagnostics::next_actions_labels(fields.next_actions),
-        "evidence": {
-            "not_started": fields.evidence.not_started,
-            "storage_replace_succeeded": fields.evidence.storage_replace_succeeded,
-            "actual_storage_read": fields.evidence.actual_storage_read,
-            "effect_may_have_occurred": fields.evidence.effect_may_have_occurred,
-            "original_result_missing": fields.evidence.original_result_missing,
-            "settled": fields.evidence.settled,
-        },
-        "constraints": constraints_json(fields.constraints),
-        "started_time_us": fields.started_time_us,
-        "deadline_us": fields.deadline_us,
-        "finished_time_us": fields.finished_time_us,
-        "content_length": fields.content_length,
-        "content_crc32c": fields.content_crc32c,
-        "revision": fields.revision,
-    })
-}
-
 fn constraints_json(constraints: eha_sdk::protocol::responses::Constraints) -> Value {
     json!({
-        "user_storage": constraints.user_storage,
         "driver_transition": constraints.driver_transition,
-        "application_handoff": constraints.application_handoff,
-        "result_slot": constraints.result_slot,
     })
 }
 
@@ -2440,7 +2171,6 @@ fn diagnostic_entry_json(entry: eha_sdk::protocol::responses::DiagnosticFields) 
         "event_time_us": entry.event_time_us,
         "started_time_us": entry.started_time_us,
         "deadline_us": entry.deadline_us,
-        "operation_id": entry.operation_id,
         "native_code": entry.native_code,
         "native_domain": entry.native_domain as u8,
         "native_domain_label": eha_sdk::diagnostics::native_domain_label(entry.native_domain),
@@ -2449,8 +2179,6 @@ fn diagnostic_entry_json(entry: eha_sdk::protocol::responses::DiagnosticFields) 
             "not_started": entry.evidence.not_started,
             "send_submitted": entry.evidence.send_submitted,
             "matched_feedback": entry.evidence.matched_feedback,
-            "storage_replaced": entry.evidence.storage_replaced,
-            "actual_readback": entry.evidence.actual_readback,
             "missing_original_result": entry.evidence.missing_original_result,
         },
         "detail": value_json(entry.detail_value),
@@ -2461,10 +2189,6 @@ fn diagnostic_entry_json(entry: eha_sdk::protocol::responses::DiagnosticFields) 
         "missing_evidence": {
             "call_result": entry.missing_evidence.call_result,
             "device_feedback": entry.missing_evidence.device_feedback,
-            "actual_readback": entry.missing_evidence.actual_readback,
-            "same_device_comparison": entry.missing_evidence.same_device_comparison,
-            "update_route_identity": entry.missing_evidence.update_route_identity,
-            "new_application_start": entry.missing_evidence.new_application_start,
         },
         "impact": {
             "blocks_adoption": entry.impact.blocks_adoption,
@@ -2490,8 +2214,6 @@ fn data_unavailable_fields_json(
         "reason_label": eha_sdk::diagnostics::reason_label(fields.reason),
         "next_actions": fields.next_actions,
         "next_action_labels": eha_sdk::diagnostics::next_actions_labels(fields.next_actions),
-        "retained": fields.retained,
-        "operation_id": fields.operation_id,
     })
 }
 
@@ -2548,7 +2270,7 @@ fn reply_json(reply: &Reply) -> Result<Value, SessionError> {
     let value = match reply.response().map_err(sdk_error)? {
         Response::Identity(response) => {
             let fields = response.fields();
-            json!({"kind":"identity", "received_age_ms": age_ms, "sample": sample_json(fields.sample), "uid": hex(&fields.uid), "config_source": fields.config_source as u8, "config_source_label": eha_sdk::diagnostics::startup_source_label(fields.config_source), "fallback_reason": fields.fallback_reason as u8, "fallback_reason_label": eha_sdk::diagnostics::fallback_reason_label(fields.fallback_reason), "run_identity": fields.run_identity as u8, "run_identity_label": eha_sdk::diagnostics::run_identity_label(fields.run_identity), "update_route": fields.update_route as u8, "update_route_label": eha_sdk::diagnostics::update_route_label(fields.update_route), "active_can_node": fields.active_can_node, "active_can_profile": fields.active_can_profile as u8, "active_can_profile_label": eha_sdk::diagnostics::can_profile_label(fields.active_can_profile), "host_heartbeat_hz": fields.host_heartbeat_hz, "telemetry_hz": fields.telemetry_hz, "host_contact_max_age_ms": fields.host_contact_max_age_ms, "config_format_version": fields.config_format_version, "high_water_operation_id": fields.high_water_operation_id, "retained_operation_id": fields.retained_operation_id, "text": {"version":fields.text.version, "source_revision":fields.text.source_revision, "build_information":fields.text.build_information, "odrive_binding":fields.text.odrive_binding, "odrive_observed_version":fields.text.odrive_observed_version, "brt27_binding":fields.text.brt27_binding, "brt27_observed_version":fields.text.brt27_observed_version, "update_binding":fields.text.update_binding}})
+            json!({"kind":"identity", "received_age_ms": age_ms, "sample": sample_json(fields.sample), "uid": hex(&fields.uid), "config_source": fields.config_source as u8, "config_source_label": eha_sdk::diagnostics::startup_source_label(fields.config_source), "fallback_reason": fields.fallback_reason as u8, "fallback_reason_label": eha_sdk::diagnostics::fallback_reason_label(fields.fallback_reason), "run_identity": fields.run_identity as u8, "run_identity_label": eha_sdk::diagnostics::run_identity_label(fields.run_identity), "update_route": fields.update_route as u8, "update_route_label": eha_sdk::diagnostics::update_route_label(fields.update_route), "active_can_node": fields.active_can_node, "active_can_profile": fields.active_can_profile as u8, "active_can_profile_label": eha_sdk::diagnostics::can_profile_label(fields.active_can_profile), "host_heartbeat_hz": fields.host_heartbeat_hz, "telemetry_hz": fields.telemetry_hz, "host_contact_max_age_ms": fields.host_contact_max_age_ms, "config_format_version": fields.config_format_version, "text": {"version":fields.text.version, "source_revision":fields.text.source_revision, "build_information":fields.text.build_information, "odrive_binding":fields.text.odrive_binding, "odrive_observed_version":fields.text.odrive_observed_version, "brt27_binding":fields.text.brt27_binding, "brt27_observed_version":fields.text.brt27_observed_version, "update_binding":fields.text.update_binding}})
         }
         Response::Telemetry(response) | Response::Status(response) => {
             let fields = response.fields();
@@ -2609,7 +2331,7 @@ fn reply_json(reply: &Reply) -> Result<Value, SessionError> {
                 "last_end_reason_label".into(),
                 json!(eha_sdk::diagnostics::reason_label(fields.last_end_reason)),
             );
-            output.insert("facts".into(), json!({"output_allowed":fields.facts.output_allowed,"reference_limited":fields.facts.reference_limited,"candidate_limited":fields.facts.candidate_limited,"position_direction_inhibited":fields.facts.position_direction_inhibited,"device_operation_pending":fields.facts.device_operation_pending,"retained_result":fields.facts.retained_result,"unknown_effect":fields.facts.unknown_effect}));
+            output.insert("facts".into(), json!({"output_allowed":fields.facts.output_allowed,"reference_limited":fields.facts.reference_limited,"candidate_limited":fields.facts.candidate_limited,"position_direction_inhibited":fields.facts.position_direction_inhibited,"device_operation_pending":fields.facts.device_operation_pending,"unknown_effect":fields.facts.unknown_effect}));
             output.insert("limits".into(), limits_json(fields.limits));
             output.insert(
                 "main_values".into(),
@@ -2694,9 +2416,6 @@ fn reply_json(reply: &Reply) -> Result<Value, SessionError> {
             let fields = response.fields();
             json!({"kind":"config_data","received_age_ms":age_ms,"sample":sample_json(fields.sample),"view":fields.view as u8,"view_label":eha_sdk::diagnostics::config_view_label(fields.view),"record_state":fields.record_state as u8,"record_state_label":eha_sdk::diagnostics::config_record_state_label(fields.record_state),"startup_source":fields.startup_source as u8,"startup_source_label":eha_sdk::diagnostics::startup_source_label(fields.startup_source),"fallback_reason":fields.fallback_reason as u8,"fallback_reason_label":eha_sdk::diagnostics::fallback_reason_label(fields.fallback_reason),"data_time_us":fields.data_time_us,"data_utf8":std::str::from_utf8(response.data()).ok(),"data_hex":hex(response.data())})
         }
-        Response::OperationResult(response) => {
-            json!({"kind":"operation_result","received_age_ms":age_ms,"fields":operation_fields_json(response.fields())})
-        }
         Response::DataUnavailable(response) => {
             let fields = response.fields();
             json!({"kind":"data_unavailable","received_age_ms":age_ms,"fields":data_unavailable_fields_json(fields)})
@@ -2709,26 +2428,14 @@ fn reply_json(reply: &Reply) -> Result<Value, SessionError> {
 #[allow(clippy::panic)]
 mod tests {
     use super::{
-        Command, TelemetryTrend, TelemetryTrendPoint, ToolSession, data_unavailable_fields_json,
+        Command, TelemetryTrend, TelemetryTrendPoint, data_unavailable_fields_json,
         diagnostic_entry_json, driver_summary_json, sdk_error,
     };
     use eha_sdk::{
-        host::{
-            Client, Error, Failure, LocalStage, Wait,
-            backend::{Backend, Pump},
-        },
-        protocol::{self, Direction, Message, SampleData, responses::*},
-        session::MaintenanceKey,
+        host::{Error, Failure, LocalStage},
+        protocol::{SampleData, responses::*},
     };
     use serde_json::json;
-    use std::{
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        },
-        thread,
-        time::Duration,
-    };
 
     fn sample() -> SampleData {
         SampleData {
@@ -2746,6 +2453,25 @@ mod tests {
         )
     }
 
+    #[test]
+    fn maintenance_actions_accept_only_restart_submission_names() {
+        let save = crate::RawFields::parse(r#"{"action":"config_save_and_restart","record":"{}"}"#)
+            .expect("new save action parses");
+        assert!(matches!(
+            Command::from_fields(&save),
+            Ok(Command::ConfigSaveAndRestart { .. })
+        ));
+        let restore = crate::RawFields::parse(r#"{"action":"restore_factory_and_restart"}"#)
+            .expect("new restore action parses");
+        assert!(matches!(
+            Command::from_fields(&restore),
+            Ok(Command::RestoreFactoryAndRestart)
+        ));
+        let old = crate::RawFields::parse(r#"{"action":"maintenance_result"}"#)
+            .expect("legacy action remains valid JSON");
+        assert!(Command::from_fields(&old).is_err());
+    }
+
     fn trend_point(cursor: u64, time_us: u64) -> TelemetryTrendPoint {
         TelemetryTrendPoint {
             cursor,
@@ -2758,412 +2484,6 @@ mod tests {
             target_values: [cursor as f32, 0.0, 0.0],
             gap: false,
         }
-    }
-
-    fn identity_bytes(
-        query_id: u32,
-        high_water_operation_id: u64,
-        retained_operation_id: u64,
-    ) -> Vec<u8> {
-        let fields = IdentityFields {
-            sample: SampleData {
-                query_id,
-                run_nonce: [9; 16],
-                snapshot_sequence: 1,
-                snapshot_time_us: 10,
-            },
-            uid: [7; 12],
-            config_source: StartupSource::User,
-            fallback_reason: FallbackReason::None,
-            run_identity: RunIdentity::Random,
-            update_route: UpdateRoute::Absent,
-            active_can_node: 1,
-            active_can_profile: CanProfile::Fd1m2m,
-            host_heartbeat_hz: 100,
-            telemetry_hz: 20,
-            host_contact_max_age_ms: 300,
-            config_format_version: 1,
-            build_evidence: EvidenceState::Available,
-            odrive_evidence: EvidenceState::Unavailable,
-            brt27_evidence: EvidenceState::Unavailable,
-            high_water_operation_id,
-            retained_operation_id,
-            text: IdentityText {
-                version: "test",
-                source_revision: "",
-                build_information: "",
-                odrive_binding: "",
-                odrive_observed_version: "",
-                brt27_binding: "",
-                brt27_observed_version: "",
-                update_binding: "",
-            },
-        };
-        let mut bytes = vec![0; fields.encoded_len().expect("identity length")];
-        let length = encode_identity(&fields, &mut bytes).expect("identity encodes");
-        bytes.truncate(length);
-        bytes
-    }
-
-    fn maintenance_backend(
-        high_water: Arc<AtomicU64>,
-        retained_operation: Arc<AtomicU64>,
-        reply_identity: Arc<AtomicBool>,
-        operations: Arc<Mutex<Vec<u64>>>,
-    ) -> Backend {
-        let identity_queries = Arc::new(AtomicUsize::new(0));
-        Backend::spawn("eha-tool-session-test", move |commands, sink| {
-            let mut pump = Pump::new(commands, sink);
-            while pump.poll() {
-                for lane in 0..3 {
-                    while let Some(request) = pump.take(lane) {
-                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
-                            .expect("tool emits a contract-valid request");
-                        match message {
-                            Message::Query {
-                                query_id,
-                                category: 0,
-                            } => {
-                                pump.sink.submitted(request.id);
-                                let index = identity_queries.fetch_add(1, Ordering::AcqRel);
-                                if index == 0 || reply_identity.load(Ordering::Acquire) {
-                                    pump.sink.received(identity_bytes(
-                                        query_id,
-                                        high_water.load(Ordering::Acquire),
-                                        retained_operation.load(Ordering::Acquire),
-                                    ));
-                                }
-                            }
-                            Message::ReadResult { query_id, key } => {
-                                pump.sink.submitted(request.id);
-                                pump.sink
-                                    .received(released_result_bytes(query_id, key.operation_id()));
-                            }
-                            Message::Maintenance { key, .. } => {
-                                operations
-                                    .lock()
-                                    .expect("operation list lock")
-                                    .push(key.operation_id());
-                                pump.sink.submitted(request.id);
-                            }
-                            _ => panic!("unexpected SDK request in maintenance test"),
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        })
-        .expect("memory backend starts")
-    }
-
-    fn released_result_bytes(query_id: u32, operation_id: u64) -> Vec<u8> {
-        let fields = DataUnavailableFields {
-            sample: SampleData {
-                query_id,
-                run_nonce: [9; 16],
-                snapshot_sequence: 2,
-                snapshot_time_us: 20,
-            },
-            subject: UnavailableSubject::OperationResult,
-            reason: 0x0306,
-            next_actions: 0,
-            retained: false,
-            operation_id,
-        };
-        let mut bytes = [0; DataUnavailableFields::encoded_len()];
-        let length =
-            encode_data_unavailable(&fields, &mut bytes).expect("released-result response encodes");
-        bytes[..length].to_vec()
-    }
-
-    fn settled_result_bytes(query_id: u32, operation_id: u64) -> Vec<u8> {
-        let fields = OperationResultFields {
-            sample: SampleData {
-                query_id,
-                run_nonce: [9; 16],
-                snapshot_sequence: 2,
-                snapshot_time_us: 20,
-            },
-            operation_id,
-            operation: MaintenanceOperation::SaveConfig,
-            state: MaintenanceState::FirmwareStepComplete,
-            phase: OperationPhase::StorageReplacement,
-            evidence: OperationEvidence {
-                storage_replace_succeeded: true,
-                settled: true,
-                ..Default::default()
-            },
-            reason: 0,
-            next_actions: 0,
-            constraints: Constraints {
-                result_slot: true,
-                ..Default::default()
-            },
-            started_time_us: 1,
-            deadline_us: 2,
-            finished_time_us: 2,
-            content_length: 0,
-            content_crc32c: 0,
-            revision: 1,
-        };
-        let mut bytes = [0; OperationResultFields::encoded_len()];
-        let length = encode_operation_result(&fields, &mut bytes).expect("settled result encodes");
-        bytes[..length].to_vec()
-    }
-
-    fn release_fence_clear_telemetry() -> Vec<u8> {
-        let unavailable = ValueFields::new(
-            0.0,
-            ValueState::new(ValueResult::Never, SourceQuality::Unknown, false),
-        );
-        let fields = TelemetryFields {
-            sample: SampleData {
-                query_id: 0,
-                run_nonce: [9; 16],
-                snapshot_sequence: 3,
-                snapshot_time_us: 30,
-            },
-            decision_age_us: 0,
-            target_mode: TargetMode::None,
-            target_ingress: TargetIngress::None,
-            facts: TelemetryFacts {
-                retained_result: false,
-                ..Default::default()
-            },
-            target_values: [0.0; 3],
-            can_adoption_blockers: 0,
-            usb_adoption_blockers: 0,
-            output_blockers: 0,
-            last_end_reason: 0,
-            limits: Default::default(),
-            main_values: [value(); 5],
-            position_age_us: 0,
-            velocity_age_us: 0,
-            pressure_pair_age_us: 0,
-            reference: unavailable,
-            reference_kind: ReferenceKind::None,
-            candidate_rpm: value(),
-            last_submitted_rpm: value(),
-            submitted_age_us: 0,
-            axis_state_raw: 0,
-            axis_error_raw: 0,
-            driver_age_us: u32::MAX,
-            driver_state: Default::default(),
-            desired_axis: DesiredAxis::Idle,
-            can_heartbeat_age_us: 0,
-            usb_heartbeat_age_us: 0,
-            can_contact: ContactState::Expired,
-            usb_contact: ContactState::Expired,
-        };
-        let mut bytes = vec![0; TelemetryFields::encoded_len()];
-        let length =
-            encode_telemetry(&fields, &mut bytes).expect("release clear telemetry encodes");
-        bytes.truncate(length);
-        bytes
-    }
-
-    fn release_recovery_backend(
-        clear_release: Arc<AtomicBool>,
-        reply_release: Arc<AtomicBool>,
-        releases: Arc<AtomicUsize>,
-        read_keys: Arc<Mutex<Vec<u64>>>,
-    ) -> Backend {
-        let clear_sent = Arc::new(AtomicBool::new(false));
-        Backend::spawn("eha-tool-release-recovery-test", move |commands, sink| {
-            let mut pump = Pump::new(commands, sink);
-            while pump.poll() {
-                if clear_release.load(Ordering::Acquire)
-                    && releases.load(Ordering::Acquire) != 0
-                    && !clear_sent.swap(true, Ordering::AcqRel)
-                {
-                    pump.sink.received(release_fence_clear_telemetry());
-                }
-                for lane in 0..3 {
-                    while let Some(request) = pump.take(lane) {
-                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
-                            .expect("tool emits a contract-valid request");
-                        match message {
-                            Message::Query {
-                                query_id,
-                                category: 0,
-                            } => {
-                                pump.sink.submitted(request.id);
-                                pump.sink.received(identity_bytes(query_id, 4, 0));
-                            }
-                            Message::ReadResult { query_id, key } => {
-                                read_keys
-                                    .lock()
-                                    .expect("read key list lock")
-                                    .push(key.operation_id());
-                                pump.sink.submitted(request.id);
-                                let reply = if releases.load(Ordering::Acquire) == 0 {
-                                    settled_result_bytes(query_id, key.operation_id())
-                                } else if reply_release.load(Ordering::Acquire) {
-                                    released_result_bytes(query_id, key.operation_id())
-                                } else {
-                                    continue;
-                                };
-                                pump.sink.received(reply);
-                            }
-                            Message::ReleaseResult { .. } => {
-                                releases.fetch_add(1, Ordering::AcqRel);
-                                pump.sink.submitted(request.id);
-                            }
-                            _ => panic!("unexpected SDK request in release recovery test"),
-                        }
-                    }
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        })
-        .expect("release recovery backend starts")
-    }
-
-    fn identified_tool_session(backend: Backend, timeout: Duration) -> ToolSession {
-        let mut client = Client::new(backend);
-        let identity = client
-            .identify(None, &Wait::new(timeout))
-            .expect("initial Identity succeeds");
-        let mut session = ToolSession::new().with_timeout(timeout);
-        // 夹具直接注入 backend，仍须给 refresh 建立与真实会话等价的连接身份。
-        session.request = Some(super::ConnectionRequest::Can {
-            channel: "fixture-maintenance".into(),
-            node: 1,
-            mode: "fd".into(),
-            python: Some("fixture-python".into()),
-        });
-        session.client = Some(client);
-        session.identity = Some(identity);
-        session
-    }
-
-    #[test]
-    fn webui_identity_refresh_advances_maintenance_key_to_latest_high_water() {
-        let high_water = Arc::new(AtomicU64::new(4));
-        let retained_operation = Arc::new(AtomicU64::new(0));
-        let reply_identity = Arc::new(AtomicBool::new(true));
-        let operations = Arc::new(Mutex::new(Vec::new()));
-        let backend = maintenance_backend(
-            Arc::clone(&high_water),
-            Arc::clone(&retained_operation),
-            Arc::clone(&reply_identity),
-            Arc::clone(&operations),
-        );
-        let mut session = identified_tool_session(backend, Duration::from_millis(100));
-
-        high_water.store(9, Ordering::Release);
-        session
-            .refresh_identity()
-            .expect("Identity refresh succeeds");
-        session
-            .execute(Command::ResetApplication)
-            .expect("maintenance request submits after refresh");
-
-        assert_eq!(*operations.lock().expect("operation list lock"), vec![10]);
-    }
-
-    #[test]
-    fn failed_webui_identity_refresh_disconnects_and_blocks_new_maintenance() {
-        let high_water = Arc::new(AtomicU64::new(4));
-        let retained_operation = Arc::new(AtomicU64::new(0));
-        let reply_identity = Arc::new(AtomicBool::new(true));
-        let operations = Arc::new(Mutex::new(Vec::new()));
-        let backend = maintenance_backend(
-            Arc::clone(&high_water),
-            Arc::clone(&retained_operation),
-            Arc::clone(&reply_identity),
-            Arc::clone(&operations),
-        );
-        let mut session = identified_tool_session(backend, Duration::from_millis(30));
-
-        reply_identity.store(false, Ordering::Release);
-        let error = session
-            .refresh_identity()
-            .expect_err("missing refreshed Identity must fail");
-        assert_eq!(error.kind.as_ref(), "timeout");
-        let snapshot = session.snapshot();
-        assert!(!snapshot.connected);
-        assert!(snapshot.identity.is_none());
-        assert!(session.execute(Command::ResetApplication).is_err());
-        assert!(operations.lock().expect("operation list lock").is_empty());
-    }
-
-    #[test]
-    fn identity_refresh_confirms_a_released_other_transport_key_before_new_maintenance() {
-        let high_water = Arc::new(AtomicU64::new(5));
-        let retained_operation = Arc::new(AtomicU64::new(5));
-        let reply_identity = Arc::new(AtomicBool::new(true));
-        let operations = Arc::new(Mutex::new(Vec::new()));
-        let backend = maintenance_backend(
-            Arc::clone(&high_water),
-            Arc::clone(&retained_operation),
-            Arc::clone(&reply_identity),
-            Arc::clone(&operations),
-        );
-        let mut session = identified_tool_session(backend, Duration::from_millis(100));
-
-        // 同一控制器上的另一通路已释放此前留存键；本通路只能通过其精确 0x0306
-        // ReadResult 确认后清除本地 pending，而不能只根据新的 Identity 猜测。
-        retained_operation.store(0, Ordering::Release);
-        session
-            .refresh_identity()
-            .expect("exact released result clears the old pending key");
-        session
-            .execute(Command::ResetApplication)
-            .expect("new maintenance key submits only after release confirmation");
-
-        assert_eq!(*operations.lock().expect("operation list lock"), vec![6]);
-    }
-
-    #[test]
-    fn maintenance_release_retries_only_confirmation_after_timeouts() {
-        let clear_release = Arc::new(AtomicBool::new(false));
-        let reply_release = Arc::new(AtomicBool::new(false));
-        let releases = Arc::new(AtomicUsize::new(0));
-        let read_keys = Arc::new(Mutex::new(Vec::new()));
-        let backend = release_recovery_backend(
-            Arc::clone(&clear_release),
-            Arc::clone(&reply_release),
-            Arc::clone(&releases),
-            Arc::clone(&read_keys),
-        );
-        let mut session = identified_tool_session(backend, Duration::from_millis(30));
-        let key = MaintenanceKey {
-            uid: [7; 12],
-            run_nonce: [9; 16],
-            operation_id: 4,
-        };
-        let command = Command::MaintenanceRelease {
-            operation_key: super::key_hex(key),
-        };
-
-        session
-            .execute(command.clone())
-            .expect_err("missing passive clear leaves ReleaseResult unknown");
-        assert_eq!(releases.load(Ordering::Acquire), 1);
-        let refresh = session
-            .refresh_identity()
-            .expect_err("fenced release rejects a zero-send identity refresh");
-        assert_eq!(refresh.kind.as_ref(), "pending_operation");
-        assert!(session.snapshot().connected);
-
-        clear_release.store(true, Ordering::Release);
-        session
-            .execute(command.clone())
-            .expect_err("missing confirmation reply keeps the original release pending");
-        assert_eq!(releases.load(Ordering::Acquire), 1);
-        assert_eq!(*read_keys.lock().expect("read key list lock"), vec![4, 4]);
-
-        reply_release.store(true, Ordering::Release);
-        let completed = session
-            .execute(command)
-            .expect("same maintenance_release confirms the original key after clear");
-        assert_eq!(completed.data["released"], true);
-        assert_eq!(releases.load(Ordering::Acquire), 1);
-        assert_eq!(
-            *read_keys.lock().expect("read key list lock"),
-            vec![4, 4, 4]
-        );
     }
 
     #[test]
@@ -3235,7 +2555,6 @@ mod tests {
             event_time_us: 101,
             started_time_us: 99,
             deadline_us: 120,
-            operation_id: 17,
             native_code: 0x0802,
             native_domain: NativeDomain::OdriveAxisError,
             evidence: DiagnosticEvidence {
@@ -3246,7 +2565,6 @@ mod tests {
             detail_unit: DetailUnit::None,
             constraints: Constraints {
                 driver_transition: true,
-                ..Constraints::default()
             },
             occurrences: 2,
             missing_evidence: MissingEvidence {
@@ -3273,20 +2591,16 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_error_preserves_the_full_firmware_reply() {
+    fn unavailable_error_preserves_current_reply_without_legacy_result_metadata() {
         let fields = DataUnavailableFields {
             sample: sample(),
             subject: UnavailableSubject::Diagnostics,
             reason: 0x0307,
             next_actions: (1 << 0) | (1 << 9),
-            retained: true,
-            operation_id: 41,
         };
         let error = sdk_error(Error {
             failure: Failure::DataUnavailable(fields),
             local: LocalStage::FullySubmitted,
-            operation: None,
-            last_result: None,
             observed_transport: None,
         });
 
@@ -3294,19 +2608,17 @@ mod tests {
             error.failure.as_deref(),
             Some(&data_unavailable_fields_json(fields))
         );
-        assert_eq!(
+        assert!(
             error
                 .failure
                 .as_deref()
-                .and_then(|value| value["retained"].as_bool()),
-            Some(true)
+                .is_some_and(|value| value.get("retained").is_none())
         );
-        assert_eq!(
+        assert!(
             error
                 .failure
                 .as_deref()
-                .and_then(|value| value["operation_id"].as_u64()),
-            Some(41)
+                .is_some_and(|value| value.get("operation_id").is_none())
         );
     }
 

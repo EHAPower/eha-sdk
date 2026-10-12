@@ -4,7 +4,7 @@
 pub const MAX_MESSAGE_LEN: usize = 16_440;
 /// 公共载荷的最大字节数。
 pub const MAX_PAYLOAD_LEN: usize = MAX_MESSAGE_LEN - 8;
-pub(super) const VERSION: u8 = 2;
+pub(super) const VERSION: u8 = 3;
 
 /// 公共消息所在的应用方向。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -53,18 +53,12 @@ message_kind_enum! {
     Query = 0x10,
     /// 读取配置。
     ReadConfig = 0x11,
-    /// 读取维护结果。
-    ReadResult = 0x12,
-    /// 保存完整配置。
-    SaveConfig = 0x20,
-    /// 恢复出厂配置。
-    RestoreFactory = 0x21,
+    /// 保存完整配置并结束当前应用。
+    SaveAndRestart = 0x20,
     /// 请求应用复位。
     ResetApplication = 0x22,
     /// 请求更新入口。
     EnterUpdate = 0x23,
-    /// 释放已结清结果。
-    ReleaseResult = 0x24,
     /// 周期遥测。
     Telemetry = 0x80,
     /// 身份及适用性。
@@ -77,9 +71,7 @@ message_kind_enum! {
     Diagnostics = 0x93,
     /// 完整配置数据。
     ConfigData = 0x94,
-    /// 维护进展或结果。
-    OperationResult = 0x95,
-    /// 数据或结果不可取得的事实。
+    /// 数据不可取得或本次变异请求被前置拒绝的事实。
     DataUnavailable = 0x96,
 }
 
@@ -99,12 +91,9 @@ impl MessageKind {
             | Self::Heartbeat
             | Self::Query
             | Self::ReadConfig
-            | Self::ReadResult
-            | Self::SaveConfig
-            | Self::RestoreFactory
+            | Self::SaveAndRestart
             | Self::ResetApplication
-            | Self::EnterUpdate
-            | Self::ReleaseResult => Direction::HostToFirmware,
+            | Self::EnterUpdate => Direction::HostToFirmware,
             _ => Direction::FirmwareToHost,
         }
     }

@@ -265,12 +265,13 @@ fn main() -> Result<(), &'static str> {
         let buffer = can_sender
             .buffer_mut(can::Lane::Large)
             .map_err(|_| "CAN large lane is busy")?;
-        buffer[4..40].fill(1);
-        for (index, byte) in buffer[40..40 + 16_384].iter_mut().enumerate() {
+        buffer[4..8].copy_from_slice(&1u32.to_le_bytes());
+        buffer[8..36].fill(1);
+        for (index, byte) in buffer[36..36 + 16_384].iter_mut().enumerate() {
             *byte = index as u8;
         }
-        encode_in_place(MessageKind::SaveConfig, 16_420, buffer)
-            .map_err(|_| "encode first SaveConfig")?
+        encode_in_place(MessageKind::SaveAndRestart, 16_416, buffer)
+            .map_err(|_| "encode first SaveAndRestart")?
     };
     deliver_can(
         &mut can_sender,
@@ -280,7 +281,7 @@ fn main() -> Result<(), &'static str> {
     )?;
     let first_completed = can_receiver
         .take_completed(can::Lane::Large)
-        .ok_or("first SaveConfig was not complete")?;
+        .ok_or("first SaveAndRestart was not complete")?;
     // 零复制的大消息交接：返回的旧应用缓存补回 CAN lane，完成的 CAN 缓冲成为唯一最新缓存。
     let replacement = application.accept_large(Ingress::Can, first_completed);
     can_receiver
@@ -308,17 +309,18 @@ fn main() -> Result<(), &'static str> {
     )?;
     can_receiver.discard_completed(can::Lane::Short);
     if application.latest != Some((Ingress::Can, stop_len)) {
-        return Err("later Stop did not cover SaveConfig");
+        return Err("later Stop did not cover SaveAndRestart");
     }
 
     let second_save_len = {
         let buffer = can_sender
             .buffer_mut(can::Lane::Large)
-            .map_err(|_| "CAN large lane is busy after first SaveConfig")?;
-        buffer[4..40].fill(2);
-        buffer[40..40 + 16_384].fill(0x5a);
-        encode_in_place(MessageKind::SaveConfig, 16_420, buffer)
-            .map_err(|_| "encode second SaveConfig")?
+            .map_err(|_| "CAN large lane is busy after first SaveAndRestart")?;
+        buffer[4..8].copy_from_slice(&2u32.to_le_bytes());
+        buffer[8..36].fill(2);
+        buffer[36..36 + 16_384].fill(0x5a);
+        encode_in_place(MessageKind::SaveAndRestart, 16_416, buffer)
+            .map_err(|_| "encode second SaveAndRestart")?
     };
     deliver_can(
         &mut can_sender,
@@ -328,7 +330,7 @@ fn main() -> Result<(), &'static str> {
     )?;
     let second_completed = can_receiver
         .take_completed(can::Lane::Large)
-        .ok_or("second SaveConfig was not complete")?;
+        .ok_or("second SaveAndRestart was not complete")?;
     // 同一交换在第二次大配置重复：上一轮接收缓冲已经经由应用缓存回到 CAN lane，可继续复用。
     let replacement = application.accept_large(Ingress::Can, second_completed);
     can_receiver
@@ -336,13 +338,13 @@ fn main() -> Result<(), &'static str> {
         .map_err(|_| "recycled application cache must fit the CAN large lane")?;
 
     if application.latest != Some((Ingress::Can, second_save_len)) {
-        return Err("second SaveConfig did not cover Stop");
+        return Err("second SaveAndRestart did not cover Stop");
     }
     if !application.can_contact || application.usb_contact {
         return Err("only the actual CAN heartbeat may refresh CAN contact");
     }
     println!(
-        "latest non-heartbeat: SaveConfig {second_save_len} B from CAN; CAN contact={}, USB contact={}",
+        "latest non-heartbeat: SaveAndRestart {second_save_len} B from CAN; CAN contact={}, USB contact={}",
         application.can_contact, application.usb_contact
     );
     Ok(())

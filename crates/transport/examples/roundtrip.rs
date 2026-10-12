@@ -3,7 +3,7 @@
 //! 仅在宿主内存中运行：同一公共字节经 Classic、FD、USB 恢复。
 //! 本例的“本地提交”由软件管道推进，不提供真实驱动或设备证据。
 
-use protocol::{Direction, MAX_MESSAGE_LEN, Message, OperationKey, decode, encode};
+use protocol::{Direction, ExpectedIdentity, MAX_MESSAGE_LEN, Message, decode, encode};
 use transport::{can, usb};
 
 fn through_can(bytes: &[u8], direction: Direction, mode: can::Mode) -> Result<usize, String> {
@@ -169,14 +169,24 @@ fn main() {
         let n = encode(message, &mut wire).expect("完整具名输入");
         compare(name, &wire[..n], Direction::HostToFirmware);
     }
-    let key_bytes = [1; 36]; // 仅离线向量，实际键必须来自已核对设备和当前应用会话。
-    let key = OperationKey::new(&key_bytes).expect("完整键");
+    let identity_bytes = [1; 28]; // 仅离线向量，实际身份必须来自已核对设备和当前应用会话。
+    let identity = ExpectedIdentity::new(&identity_bytes).expect("完整期望身份");
     // 只验证透明传输，不构造设备配置或读取产品出厂参数。
     let record = br#"{"example":"transport-only"}"#;
-    let n = encode(Message::SaveConfig { key, record }, &mut wire).expect("完整原始记录");
-    compare("保存请求软件向量", &wire[..n], Direction::HostToFirmware);
-    let n = encode(Message::ReadResult { query_id: 9, key }, &mut wire).expect("只读结果查询");
-    compare("查询维护结果", &wire[..n], Direction::HostToFirmware);
+    let n = encode(
+        Message::SaveAndRestart {
+            query_id: 9,
+            identity,
+            record,
+        },
+        &mut wire,
+    )
+    .expect("完整原始记录");
+    compare(
+        "保存并重启请求软件向量",
+        &wire[..n],
+        Direction::HostToFirmware,
+    );
 
     use protocol::{
         SampleData,

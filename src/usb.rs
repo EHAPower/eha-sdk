@@ -969,19 +969,21 @@ mod tests {
             &mut tx_short,
             &mut tx_long,
         );
-        let key_bytes = protocol::OperationKeyFields::new([0; 12], [1; 16], 1).to_bytes();
-        let key = protocol::OperationKey::new(&key_bytes).expect("valid test key");
+        let identity_bytes = protocol::ExpectedIdentityFields::new([0; 12], [1; 16]).to_bytes();
+        let identity =
+            protocol::ExpectedIdentity::new(&identity_bytes).expect("valid test identity");
         let record = [b'x'; 300];
         let length = protocol::encode(
-            protocol::Message::SaveConfig {
-                key,
+            protocol::Message::SaveAndRestart {
+                query_id: 1,
+                identity,
                 record: &record,
             },
             sender
                 .buffer_mut(transport::usb::Lane::Long)
                 .expect("long lane is idle"),
         )
-        .expect("valid test SaveConfig");
+        .expect("valid test SaveAndRestart");
         sender
             .begin_buffer(transport::usb::Lane::Long, length, 0)
             .expect("long message starts");

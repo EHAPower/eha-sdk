@@ -7,10 +7,9 @@
 
 use crate::protocol::responses::{
     CanProfile, ConfigRecordState, ConfigView, ContactState, DesiredAxis, DetailUnit,
-    DiagnosticDomain, DiagnosticObject, DriverState, FallbackReason, MaintenanceOperation,
-    MaintenanceState, ModelState, NativeDomain, OperationPhase, PositiveForceChannel,
-    ReferenceKind, RunIdentity, SourceQuality, StartupSource, TargetIngress, TargetMode,
-    UnavailableSubject, UpdateRoute, ValueResult,
+    DiagnosticDomain, DiagnosticObject, DriverState, FallbackReason, ModelState, NativeDomain,
+    OperationPhase, PositiveForceChannel, ReferenceKind, RunIdentity, SourceQuality, StartupSource,
+    TargetIngress, TargetMode, UnavailableSubject, UpdateRoute, ValueResult,
 };
 
 const ODRIVE_AXIS_ERROR_BITS: &[(u32, &str)] = &[
@@ -72,7 +71,6 @@ pub fn reason_label(reason: u16) -> &'static str {
         0x000d => "等待本次进入证据",
         0x000e => "等待本次退出结清",
         0x000f => "已开始副作用未明",
-        0x0010 => "维护资源占用",
         0x0011 => "操作输入无效",
         0x0012 => "目标超允许域",
         0x0013 => "控制计算失败",
@@ -83,7 +81,6 @@ pub fn reason_label(reason: u16) -> &'static str {
         0x0018 => "启动参数派生失败",
         0x0019 => "当前目标属于另一入口",
         0x001a => "没有当前目标",
-        0x001b => "维护结果容量占用",
         0x001c => "无应用更新路由",
         0x001d => "运行实例来源不可取得",
         0x001e => "测量参考不适用",
@@ -101,15 +98,8 @@ pub fn reason_label(reason: u16) -> &'static str {
         0x0202 => "配置格式版本不支持",
         0x0203 => "目标类型不能表示",
         0x0204 => "存储读取失败",
-        0x0205 => "存储替换失败",
-        0x0206 => "读回不一致",
-        0x0300 => "结果未留存",
-        0x0301 => "操作标识已使用",
         0x0302 => "设备不匹配",
         0x0303 => "应用会话不匹配",
-        0x0304 => "结果尚未结清",
-        0x0305 => "结果版本已变化",
-        0x0306 => "结果已释放",
         0x0307 => "所需信息不可取得",
         0x0400 => "使用者主动停止",
         _ => "未知原因",
@@ -126,29 +116,29 @@ pub fn reason_bitmap_labels(blockers: u32) -> Vec<&'static str> {
 
 /// 设备给出的必要后续操作说明。该结果不授权工具自动执行任何操作。
 pub fn next_actions_labels(actions: u16) -> Vec<&'static str> {
-    const LABELS: [&str; 11] = [
-        "重新查询事实",
-        "维持或重建所选入口心跳",
-        "满足条件后提交新目标",
-        "使用者明确停止",
-        "实际读取用户记录",
-        "主机核对完整配置",
-        "另行请求应用复位",
-        "采用外部更新或恢复路径",
-        "处理外部设备条件",
-        "取得并释放已结清维护结果",
-        "等待已开始操作的事实",
+    const LABELS: [Option<&str>; 11] = [
+        Some("重新查询事实"),
+        Some("维持或重建所选入口心跳"),
+        Some("满足条件后提交新目标"),
+        Some("使用者明确停止"),
+        Some("实际读取用户记录"),
+        Some("主机核对完整配置"),
+        Some("另行请求应用复位"),
+        Some("采用外部更新或恢复路径"),
+        Some("处理外部设备条件"),
+        None,
+        Some("等待已开始操作的事实"),
     ];
     LABELS
         .iter()
         .enumerate()
-        .filter_map(|(bit, label)| (actions & (1 << bit) != 0).then_some(*label))
+        .filter_map(|(bit, label)| (actions & (1 << bit) != 0).then_some(*label).flatten())
         .collect()
 }
 
 /// `next_actions` 中未在当前协议定义的位，调用方应以原始位图报告。
 pub const fn unknown_next_action_bits(actions: u16) -> u16 {
-    actions & !0x07ff
+    actions & !0x05ff
 }
 
 /// 当前目标模式。
@@ -267,7 +257,6 @@ pub const fn diagnostic_domain_label(domain: DiagnosticDomain) -> &'static str {
         DiagnosticDomain::Pressure => "压力",
         DiagnosticDomain::ConfigStore => "配置存储",
         DiagnosticDomain::Platform => "本地平台",
-        DiagnosticDomain::Maintenance => "维护",
     }
 }
 
@@ -299,11 +288,6 @@ pub const fn phase_label(phase: OperationPhase) -> &'static str {
         OperationPhase::SendCalled => "已调用发送",
         OperationPhase::WaitingFeedback => "等待新反馈",
         OperationPhase::WaitingExit => "等待退出",
-        OperationPhase::FormatParse => "格式解析",
-        OperationPhase::StorageReplacement => "存储替换",
-        OperationPhase::ActualReadback => "实际读回",
-        OperationPhase::ResultDelivery => "结果交付",
-        OperationPhase::ApplicationHandoff => "应用移交",
         OperationPhase::ResourceRecovery => "资源恢复",
     }
 }
@@ -320,20 +304,6 @@ pub const fn native_domain_label(domain: NativeDomain) -> &'static str {
         NativeDomain::Flash => "Flash 公开错误",
         NativeDomain::OdriveSensorlessError => "ODrive 无感估算器错误位",
         NativeDomain::OdriveMotorError => "ODrive 电机错误位",
-    }
-}
-
-/// 维护结果状态。
-pub const fn operation_state_label(state: MaintenanceState) -> &'static str {
-    match state {
-        MaintenanceState::NotStarted => "未开始",
-        MaintenanceState::Started => "已开始",
-        MaintenanceState::InProgress => "进行中",
-        MaintenanceState::FirmwareStepComplete => "固件步骤完成",
-        MaintenanceState::Failed => "已失败",
-        MaintenanceState::WaitingDeadline => "等待到期",
-        MaintenanceState::ResultUnknown => "结果未明",
-        MaintenanceState::ApplicationHandoffStarted => "应用移交已开始",
     }
 }
 
@@ -365,7 +335,6 @@ pub const fn config_view_label(view: ConfigView) -> &'static str {
         ConfigView::Factory => "出厂记录",
         ConfigView::UserRecord => "用户记录",
         ConfigView::Startup => "启动配置",
-        ConfigView::Communication => "当前通信设置",
     }
 }
 
@@ -379,16 +348,6 @@ pub const fn config_record_state_label(state: ConfigRecordState) -> &'static str
         ConfigRecordState::NumericRepresentationFailed => "数值表示失败",
         ConfigRecordState::ReadFailed => "读取失败",
         ConfigRecordState::ViewUnavailable => "所需视图不可取得",
-    }
-}
-
-/// 维护操作类型。
-pub const fn maintenance_operation_label(operation: MaintenanceOperation) -> &'static str {
-    match operation {
-        MaintenanceOperation::SaveConfig => "保存配置",
-        MaintenanceOperation::RestoreFactory => "恢复出厂配置",
-        MaintenanceOperation::ResetApplication => "应用复位",
-        MaintenanceOperation::EnterUpdate => "切换更新入口",
     }
 }
 
@@ -414,8 +373,9 @@ pub const fn unavailable_subject_label(subject: UnavailableSubject) -> &'static 
         UnavailableSubject::Measurements => "测量",
         UnavailableSubject::Diagnostics => "诊断",
         UnavailableSubject::Config => "配置",
-        UnavailableSubject::OperationResult => "维护结果",
-        UnavailableSubject::ResultRelease => "结果释放",
+        UnavailableSubject::SaveAndRestart => "保存并重启",
+        UnavailableSubject::ResetApplication => "应用复位",
+        UnavailableSubject::EnterUpdate => "切换更新入口",
     }
 }
 

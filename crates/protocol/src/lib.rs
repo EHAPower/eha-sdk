@@ -4,7 +4,7 @@
 //!
 //! 线上字节、方向和字段约束由《公共应用通信协议》唯一维护。本库不决定控制
 //! 准入、维护许可、配置保存、结果槽或设备执行。`Message` 借用输入；特别是
-//! `SaveConfig` 和 `ConfigData` 的记录不会复制到枚举或临时大数组中。
+//! `SaveAndRestart` 和 `ConfigData` 的记录不会复制到枚举或临时大数组中。
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -27,7 +27,6 @@ pub use protocol::{
     Direction, Error, MAX_MESSAGE_LEN, MAX_PAYLOAD_LEN, MessageInfo, MessageKind, Prefix,
 };
 pub use response_views::{
-    ConfigData, DataUnavailable, DiagnosticEntries, DiagnosticEntry, Diagnostics, Identity,
-    Measurements, OperationKey, OperationKeyFields, OperationResult, Response, Sample, SampleData,
-    Telemetry,
+    ConfigData, DataUnavailable, DiagnosticEntries, DiagnosticEntry, Diagnostics, ExpectedIdentity,
+    ExpectedIdentityFields, Identity, Measurements, Response, Sample, SampleData, Telemetry,
 };

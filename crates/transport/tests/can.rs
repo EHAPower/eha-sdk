@@ -1,7 +1,7 @@
 // Copyright The eha-sdk Contributors
 
 use protocol::{
-    Direction, MAX_MESSAGE_LEN, Message, OperationKey, SampleData, encode,
+    Direction, ExpectedIdentity, MAX_MESSAGE_LEN, Message, SampleData, encode,
     responses::{
         ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView, FallbackReason,
         StartupSource,
@@ -16,11 +16,11 @@ mod common {
     use super::*;
 
     pub(super) const POSITION: [u8; 12] = [
-        0x02, 0x01, 0x04, 0x00, 0x00, 0x00, 0x20, 0x41, 0xc6, 0x2e, 0x3d, 0x08,
+        0x03, 0x01, 0x04, 0x00, 0x00, 0x00, 0x20, 0x41, 0xe1, 0x53, 0x01, 0x41,
     ];
-    pub(super) const HEARTBEAT: [u8; 8] = [0x02, 0x06, 0x00, 0x00, 0x51, 0x9e, 0xb1, 0x26];
+    pub(super) const HEARTBEAT: [u8; 8] = [0x03, 0x06, 0x00, 0x00, 0xe9, 0x34, 0xf4, 0xfb];
     pub(super) const READ_USER: [u8; 13] = [
-        0x02, 0x11, 0x05, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0xda, 0xa7, 0xd1, 0x61,
+        0x03, 0x11, 0x05, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x92, 0x71, 0xef, 0x95,
     ];
 
     pub(super) fn can_id(
@@ -61,16 +61,17 @@ mod common {
         writer.finish().expect("test invariant")
     }
 
-    pub(super) fn long_save_config(output: &mut [u8; MAX_MESSAGE_LEN]) -> usize {
-        let key = [1; 36];
-        let key = OperationKey::new(&key).expect("test invariant");
+    pub(super) fn long_save_and_restart(output: &mut [u8; MAX_MESSAGE_LEN]) -> usize {
+        let identity = [1; 28];
+        let identity = ExpectedIdentity::new(&identity).expect("test invariant");
         let mut record = [0; 16_384];
         for (index, byte) in record.iter_mut().enumerate() {
             *byte = index as u8;
         }
         encode(
-            Message::SaveConfig {
-                key,
+            Message::SaveAndRestart {
+                query_id: 1,
+                identity,
                 record: &record,
             },
             output,

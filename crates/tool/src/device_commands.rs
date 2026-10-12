@@ -16,14 +16,13 @@ use clap::{Args, Subcommand};
 use eha_sdk::{
     can::{CanOptions, open as open_can_backend},
     config::Config,
-    host::{Client, Failure, Reply, Wait},
+    host::{Client, Reply, Wait},
     protocol::{
         Response,
         responses::{
             ConfigRecordState, ConfigView, ContactState, DesiredAxis, TargetMode, TelemetryFields,
         },
     },
-    session::MaintenanceKey,
     usb,
 };
 
@@ -129,10 +128,10 @@ enum Action {
     Diagnostics,
     /// 读取指定配置视图，默认实际用户记录。
     ConfigRead {
-        /// `factory`、`user`、`startup` 或 `communication`。
+        /// `factory`、`user` 或 `startup`。
         #[arg(long, default_value = "user")]
         view: String,
-        /// 将完整配置原始字节写入新文件；不支持 communication 视图，不覆盖已有文件。
+        /// 将完整配置原始字节写入新文件，不覆盖已有文件。
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -186,25 +185,13 @@ enum Action {
     ResetApplication,
     /// 显式请求进入已交付的更新入口；返回仅表示本地 I/O 完整提交。
     EnterUpdate,
-    /// 保存完整本地 JSON，并等待维护终态和实际用户记录逐字节读回。
-    Save {
+    /// 提交完整本地 JSON，请求设备保存并重启；只报告本地提交。
+    SaveAndRestart {
         /// 待保存的完整配置 JSON 文件。
         file: PathBuf,
     },
-    /// 读取同设备出厂记录、请求恢复并以实际用户记录逐字节读回核对。
-    RestoreFactory,
-    /// 使用已有的 36-byte 操作键读取维护结果；不会重发原维护操作。
-    Result {
-        /// 72 个十六进制字符的操作键（UID 12 B + run nonce 16 B + operation id 8 B）。
-        #[arg(long)]
-        operation_key: String,
-    },
-    /// 读取已结清结果、请求释放，并再次读取确认释放；不会重发原维护操作。
-    Release {
-        /// 72 个十六进制字符的操作键（UID 12 B + run nonce 16 B + operation id 8 B）。
-        #[arg(long)]
-        operation_key: String,
-    },
+    /// 读取当前设备出厂记录后提交保存并重启；只报告本地提交。
+    RestoreFactoryAndRestart,
 }
 
 pub fn run(command: DeviceCommand) -> Result<(), String> {
@@ -304,13 +291,11 @@ fn run_session(command: DeviceCommand) -> Result<(), String> {
         Action::Stop => SessionCommand::Stop,
         Action::ResetApplication => SessionCommand::ResetApplication,
         Action::EnterUpdate => SessionCommand::EnterUpdate,
-        Action::Save { file } => SessionCommand::ConfigSave {
+        Action::SaveAndRestart { file } => SessionCommand::ConfigSaveAndRestart {
             record: std::fs::read_to_string(&file)
                 .map_err(|error| format!("配置文件读取失败 `{}`: {error}", file.display()))?,
         },
-        Action::RestoreFactory => SessionCommand::RestoreFactory,
-        Action::Result { operation_key } => SessionCommand::MaintenanceResult { operation_key },
-        Action::Release { operation_key } => SessionCommand::MaintenanceRelease { operation_key },
+        Action::RestoreFactoryAndRestart => SessionCommand::RestoreFactoryAndRestart,
         Action::Inspect { .. } | Action::VelocityTest { .. } => {
             return Err("该动作未进入持久工具会话分发".into());
         }
@@ -326,9 +311,6 @@ fn run_session(command: DeviceCommand) -> Result<(), String> {
             != Some(0)
         {
             return Err("固件配置记录不完整，未创建文件".into());
-        }
-        if result.data.get("view").and_then(serde_json::Value::as_u64) == Some(3) {
-            return Err("communication 是通信设置视图，不能导出为配置文件".into());
         }
         let data = result
             .data
@@ -831,7 +813,6 @@ fn print_reply(label: &str, reply: &Reply) -> Result<(), String> {
             );
         }
         Response::ConfigData(value) => print_config_data(value),
-        Response::OperationResult(value) => println!("{:#?}", value.fields()),
         Response::DataUnavailable(value) => println!("{:#?}", value.fields()),
     }
     Ok(())
@@ -841,34 +822,14 @@ fn print_config_data(value: eha_sdk::protocol::ConfigData<'_>) {
     let fields = value.fields();
     println!("字段：{fields:#?}");
     let data = value.data();
-    if fields.view == ConfigView::Communication {
-        println!("通信设置：{:#?}", value.communication_settings());
-        println!("通信视图原始字节（hex）：{}", hex_bytes(data));
-    } else {
-        match std::str::from_utf8(data) {
-            Ok(text) => println!("实际配置原文：\n{text}"),
-            Err(_) => println!("实际配置不是 UTF-8；原始字节（hex）：{}", hex_bytes(data)),
-        }
+    match std::str::from_utf8(data) {
+        Ok(text) => println!("实际配置原文：\n{text}"),
+        Err(_) => println!("实际配置不是 UTF-8；原始字节（hex）：{}", hex_bytes(data)),
     }
 }
 
 fn format_sdk_error(error: eha_sdk::host::Error) -> String {
-    let mut output = format!("SDK 操作失败证据：{error:#?}");
-    if let Some(key) = error.operation.as_deref() {
-        let key = key_hex(*key);
-        output.push_str(&format!(
-            "\n关联维护键：{}。可使用 `device … result --operation-key {}` 只读追踪，不能重发原维护操作。",
-            key, key
-        ));
-        if matches!(&error.failure, Failure::ResultUnknown(_)) {
-            output.push_str("\n本次副作用结果未知；以上操作键用于读取实际结果。");
-        }
-    }
-    output
-}
-
-fn key_hex(key: MaintenanceKey) -> String {
-    hex_bytes(&key.to_bytes())
+    format!("SDK 操作失败证据：{error:#?}")
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

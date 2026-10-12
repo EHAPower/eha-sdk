@@ -43,8 +43,6 @@ pub struct TelemetryFacts {
     pub position_direction_inhibited: bool,
     /// 存在未结清设备操作。
     pub device_operation_pending: bool,
-    /// 存在留存维护结果。
-    pub retained_result: bool,
     /// 存在未明影响。
     pub unknown_effect: bool,
 }
@@ -56,8 +54,7 @@ impl TelemetryFacts {
             | ((self.candidate_limited as u16) << 2)
             | ((self.position_direction_inhibited as u16) << 3)
             | ((self.device_operation_pending as u16) << 4)
-            | ((self.retained_result as u16) << 5)
-            | ((self.unknown_effect as u16) << 6)
+            | ((self.unknown_effect as u16) << 5)
     }
 }
 

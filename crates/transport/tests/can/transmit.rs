@@ -77,7 +77,7 @@ fn old_completion_cannot_match_after_transfer_id_wrap() {
 #[test]
 fn large_tx_snapshot_allows_heartbeat_and_short_before_its_next_fragment() {
     let mut message = [0; MAX_MESSAGE_LEN];
-    let length = long_save_config(&mut message);
+    let length = long_save_and_restart(&mut message);
     let mut heartbeat = [0; 8];
     let mut short = [0; 256];
     let mut large = [0; MAX_MESSAGE_LEN];

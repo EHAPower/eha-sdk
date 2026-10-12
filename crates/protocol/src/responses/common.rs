@@ -1,5 +1,67 @@
 // Copyright The eha-sdk Contributors
 
+use super::*;
+
+/// 不可取得数据的主题。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum UnavailableSubject {
+    /// 身份。
+    Identity = 0,
+    /// 当前状态。
+    Status = 1,
+    /// 测量。
+    Measurements = 2,
+    /// 诊断。
+    Diagnostics = 3,
+    /// 配置。
+    Config = 4,
+    /// 保存并重启请求。
+    SaveAndRestart = 5,
+    /// 应用复位请求。
+    ResetApplication = 6,
+    /// 更新入口请求。
+    EnterUpdate = 7,
+}
+
+/// DataUnavailable 的完整具名字段。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DataUnavailableFields {
+    /// 共同回复快照。
+    pub sample: SampleData,
+    /// 不可取得的主题。
+    pub subject: UnavailableSubject,
+    /// 合同原因码。
+    pub reason: u16,
+    /// 必要操作位图。
+    pub next_actions: u16,
+}
+
+impl DataUnavailableFields {
+    /// `DataUnavailable` 的完整线上长度。
+    pub const fn encoded_len() -> usize {
+        48
+    }
+}
+
+/// 编码数据不可取得或本次变异请求被前置拒绝的事实。
+pub fn encode_data_unavailable(
+    fields: &DataUnavailableFields,
+    output: &mut [u8],
+) -> Result<usize, Error> {
+    let p = payload(output, DataUnavailableFields::encoded_len() - 8)?;
+    write_sample(p, fields.sample);
+    p[32] = fields.subject as u8;
+    put_u16(p, 33, fields.reason);
+    put_u16(p, 35, fields.next_actions);
+    p[37..40].fill(0);
+    encode_in_place(
+        MessageKind::DataUnavailable,
+        DataUnavailableFields::encoded_len() - 8,
+        output,
+    )
+}
+
 /// 观测数值结果状态。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]

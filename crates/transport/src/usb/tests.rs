@@ -1,6 +1,6 @@
 // Copyright The eha-sdk Contributors
 
-use protocol::{Direction, Message, OperationKey, encode};
+use protocol::{Direction, ExpectedIdentity, Message, encode};
 
 use super::cobs::{CobsCursor, cobs_decode, cobs_decode_in_place, cobs_encode, next_cobs_byte};
 use super::{
@@ -93,7 +93,7 @@ fn long_first_fragment_replacement_validates_before_abandoning() {
     let replacement = long_config_message(0x42);
     let complete = ReceiveEvent::Complete(ReceivedMessage {
         lane: Lane::Long,
-        length: 344,
+        length: 340,
     });
     for (transfer, first_len, first_event, completed_transfer) in [
         (
@@ -187,14 +187,15 @@ fn invalid_new_first_fragment_preserves_original_absolute_deadline() {
     );
 }
 
-fn long_config_message(record_byte: u8) -> [u8; 344] {
-    let key_bytes = [1; 36];
-    let key = OperationKey::new(&key_bytes).expect("固定维护键有效");
+fn long_config_message(record_byte: u8) -> [u8; 340] {
+    let identity_bytes = [1; 28];
+    let identity = ExpectedIdentity::new(&identity_bytes).expect("固定期望身份有效");
     let record = [record_byte; 300];
-    let mut message = [0; 344];
+    let mut message = [0; 340];
     let length = encode(
-        Message::SaveConfig {
-            key,
+        Message::SaveAndRestart {
+            query_id: 1,
+            identity,
             record: &record,
         },
         &mut message,

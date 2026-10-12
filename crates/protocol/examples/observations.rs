@@ -1,12 +1,11 @@
 // Copyright The eha-sdk Contributors
 
 use protocol::{
-    Direction, Error, Message, Response, SampleData, decode,
+    Direction, Error, ExpectedIdentity, ExpectedIdentityFields, Message, Response, SampleData,
+    decode, encode,
     responses::{
-        Constraints, MaintenanceOperation, MaintenanceState, MeasurementFields, MeasurementValues,
-        ModelState, OperationEvidence, OperationPhase, OperationResultFields, PositiveForceChannel,
-        SourceQuality, ValueFields, ValueResult, ValueState, encode_measurements,
-        encode_operation_result,
+        MeasurementFields, MeasurementValues, ModelState, PositiveForceChannel, SourceQuality,
+        ValueFields, ValueResult, ValueState, encode_measurements,
     },
 };
 
@@ -114,43 +113,16 @@ fn main() -> Result<(), Error> {
         );
     }
 
-    let result = OperationResultFields {
-        sample,
-        operation_id: 9,
-        operation: MaintenanceOperation::SaveConfig,
-        state: MaintenanceState::FirmwareStepComplete,
-        phase: OperationPhase::StorageReplacement,
-        evidence: OperationEvidence {
-            storage_replace_succeeded: true,
-            settled: true,
-            ..Default::default()
+    let identity_bytes = ExpectedIdentityFields::new([1; 12], [2; 16]).to_bytes();
+    let identity = ExpectedIdentity::new(&identity_bytes).expect("固定28字节期望身份");
+    let mut wire = [0u8; 64];
+    let _length = encode(
+        Message::SaveAndRestart {
+            query_id: 1,
+            identity,
+            record: br#"{"format_version":1}"#,
         },
-        reason: 0,
-        next_actions: 0,
-        constraints: Constraints {
-            result_slot: true,
-            ..Default::default()
-        },
-        started_time_us: 50,
-        deadline_us: u64::MAX,
-        finished_time_us: 80,
-        content_length: 0,
-        content_crc32c: 0,
-        revision: 1,
-    };
-    let mut result_bytes = [0u8; 96];
-    encode_operation_result(&result, &mut result_bytes)?;
-    if let Message::Response(Response::OperationResult(view)) =
-        decode(&result_bytes, Direction::FirmwareToHost)?
-    {
-        let result = view.fields();
-        assert_eq!(result.state, MaintenanceState::FirmwareStepComplete);
-        assert!(result.evidence.storage_replace_succeeded);
-        assert!(result.evidence.settled);
-        println!(
-            "operation state={:?}: firmware step is complete; host readback remains a separate fact",
-            result.state
-        );
-    }
+        &mut wire,
+    )?;
     Ok(())
 }

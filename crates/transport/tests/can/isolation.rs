@@ -5,8 +5,8 @@ use super::{common::*, *};
 #[test]
 fn large_assembly_does_not_hold_heartbeat_or_short_lane_buffers() {
     let mut message = [0; MAX_MESSAGE_LEN];
-    let length = long_save_config(&mut message);
-    assert_eq!(length, 16_428);
+    let length = long_save_and_restart(&mut message);
+    assert_eq!(length, 16_424);
     let mut heartbeat = [0; 8];
     let mut short = [0; 256];
     let mut large = [0; MAX_MESSAGE_LEN];
@@ -87,7 +87,7 @@ fn large_assembly_does_not_hold_heartbeat_or_short_lane_buffers() {
     rx.replace_buffer(Lane::Short, completed.into_buffer())
         .expect("test invariant");
 
-    for fragment in 1..2054_u16 {
+    for fragment in 1..2053_u16 {
         let at = usize::from(fragment) * 8;
         let end = (at + 8).min(length);
         let result = rx.receive(
@@ -100,7 +100,7 @@ fn large_assembly_does_not_hold_heartbeat_or_short_lane_buffers() {
             4,
             0,
         );
-        if fragment == 2053 {
+        if fragment == 2052 {
             assert!(matches!(
                 result,
                 ReceiveResult::Complete {
@@ -118,7 +118,7 @@ fn large_assembly_does_not_hold_heartbeat_or_short_lane_buffers() {
 #[test]
 fn large_lane_deadline_is_absolute_despite_fragment_progress() {
     let mut message = [0; MAX_MESSAGE_LEN];
-    let length = long_save_config(&mut message);
+    let length = long_save_and_restart(&mut message);
     let mut heartbeat = [0; 8];
     let mut short = [0; 256];
     let mut large = [0; MAX_MESSAGE_LEN];
@@ -173,7 +173,7 @@ fn large_lane_deadline_is_absolute_despite_fragment_progress() {
             reason: RejectReason::TransferProtected
         }
     );
-    assert_eq!(length, 16_428);
+    assert_eq!(length, 16_424);
 }
 
 #[test]
@@ -207,7 +207,7 @@ fn first_fragment_replacement_and_invalid_frames_preserve_or_guard_the_right_gro
                     can_id(1, Direction::HostToFirmware, Lane::Short, 1, 0),
                     false,
                     8,
-                    &[3, 1, 4, 0, 0, 0, 0, 0],
+                    &[3, 1, 0, 0, 0, 0, 0, 0],
                 ),
                 1,
                 0,

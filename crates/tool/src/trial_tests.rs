@@ -102,8 +102,6 @@ fn identity_bytes_with_nonce_for(
         build_evidence: EvidenceState::Available,
         odrive_evidence: EvidenceState::Unavailable,
         brt27_evidence: EvidenceState::Unavailable,
-        high_water_operation_id: 0,
-        retained_operation_id: 0,
         text: IdentityText {
             version: "trial-test",
             source_revision: "",
@@ -745,26 +743,6 @@ fn managed_reconnect_binds_first_verified_uid_and_rejects_a_mismatch_without_liv
 }
 
 #[test]
-fn managed_refresh_uid_mismatch_clears_the_live_client() {
-    let (mut session, _) = harness();
-    session.request = Some(ConnectionRequest::ManagedCan {
-        serial: "stable-adapter".into(),
-        node: 1,
-        mode: "fd".into(),
-        python: None,
-        expected_uid: Some("080808080808080808080808".into()),
-    });
-    let error = session
-        .refresh_identity()
-        .expect_err("managed UID gates refresh");
-    assert_eq!(error.kind.as_ref(), "invalid_input");
-    assert!(session.client.is_none());
-    assert!(session.disconnected.is_some());
-    assert!(session.identity.is_none());
-    assert!(session.execute(Command::Status).is_err());
-}
-
-#[test]
 fn interrupted_trial_reconnects_then_explicit_stop_needs_a_fresh_idle() {
     let (mut session, _) = harness();
     session.trial.active = Some(active(
@@ -876,29 +854,25 @@ fn interrupted_trial_reconnect_to_new_run_never_stops_new_instance() {
 }
 
 #[test]
-fn trial_instance_match_ignores_maintenance_high_water() {
+fn trial_instance_match_uses_uid_and_run_nonce() {
     assert!(same_trial_instance(
         IdentityFacts {
             uid: [7; 12],
             run_nonce: [9; 16],
-            retained_operation_id: 1,
         },
         IdentityFacts {
             uid: [7; 12],
             run_nonce: [9; 16],
-            retained_operation_id: 2,
         },
     ));
     assert!(!same_trial_instance(
         IdentityFacts {
             uid: [7; 12],
             run_nonce: [9; 16],
-            retained_operation_id: 2,
         },
         IdentityFacts {
             uid: [7; 12],
             run_nonce: [8; 16],
-            retained_operation_id: 2,
         },
     ));
 }

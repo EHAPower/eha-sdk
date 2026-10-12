@@ -4,7 +4,7 @@
 
 use std::{hint::black_box, mem::size_of, time::Instant};
 
-use protocol::{Direction, MAX_MESSAGE_LEN, Message, OperationKey, crc32c, encode, validate};
+use protocol::{Direction, ExpectedIdentity, MAX_MESSAGE_LEN, Message, crc32c, encode, validate};
 use transport::{can, usb};
 
 fn median_ns(mut work: impl FnMut()) -> u128 {
@@ -41,10 +41,6 @@ fn main() {
             "ConfigDataFields",
             size_of::<protocol::responses::ConfigDataFields>(),
         ),
-        (
-            "OperationResultFields",
-            size_of::<protocol::responses::OperationResultFields>(),
-        ),
         ("CAN Receiver", size_of::<can::Receiver<'_>>()),
         ("CAN Transmitter", size_of::<can::Transmitter<'_>>()),
         ("CAN Frame", size_of::<can::Frame>()),
@@ -66,14 +62,15 @@ fn main() {
     let mut record = [b' '; 16_384];
     record[..2].copy_from_slice(b"{}");
     let mut wire = [0; MAX_MESSAGE_LEN];
-    let key_bytes = [1; 36]; // 仅软件向量，不作为设备会话生成方法。
-    let key = OperationKey::new(&key_bytes).expect("固定测试键");
-    let message = Message::SaveConfig {
-        key,
+    let identity_bytes = [1; 28]; // 仅软件向量，不作为设备会话生成方法。
+    let identity = ExpectedIdentity::new(&identity_bytes).expect("固定期望身份");
+    let message = Message::SaveAndRestart {
+        query_id: 1,
+        identity,
         record: &record,
     };
     let length = encode(message, &mut wire).expect("有界最大记录编码");
-    println!("最大 SaveConfig 完整长度：{length}");
+    println!("最大 SaveAndRestart 完整长度：{length}");
     let encode_ns = median_ns(|| {
         black_box(encode(black_box(message), black_box(&mut wire)).expect("合法固定输入"));
     });

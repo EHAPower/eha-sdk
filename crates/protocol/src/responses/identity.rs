@@ -142,10 +142,6 @@ pub struct IdentityFields<'a> {
     pub odrive_evidence: EvidenceState,
     /// BRT27 实际版本证据。
     pub brt27_evidence: EvidenceState,
-    /// 已处理维护标识上界。
-    pub high_water_operation_id: u64,
-    /// 当前留存维护标识。
-    pub retained_operation_id: u64,
     /// 八个有界文本字段。
     pub text: IdentityText<'a>,
 }
@@ -164,7 +160,7 @@ impl IdentityFields<'_> {
             self.text.update_binding,
         ];
         let limits = [32, 40, 96, 64, 64, 64, 32, 28];
-        let mut payload_length = 92usize;
+        let mut payload_length = 76usize;
         for (text, limit) in strings.into_iter().zip(limits) {
             if text.len() > limit {
                 return Err(Error::InvalidPayloadLength);
@@ -215,9 +211,7 @@ pub fn encode_identity(fields: &IdentityFields<'_>, output: &mut [u8]) -> Result
     p[73] = fields.odrive_evidence as u8;
     p[74] = fields.brt27_evidence as u8;
     p[75] = 0;
-    put_u64(p, 76, fields.high_water_operation_id);
-    put_u64(p, 84, fields.retained_operation_id);
-    let mut at = 92;
+    let mut at = 76;
     for text in strings {
         p[at] = text.len() as u8;
         at += 1;

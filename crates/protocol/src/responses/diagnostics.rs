@@ -22,8 +22,6 @@ pub enum DiagnosticDomain {
     ConfigStore = 6,
     /// 本地平台。
     Platform = 7,
-    /// 维护。
-    Maintenance = 8,
 }
 
 /// 诊断对象。
@@ -74,16 +72,6 @@ pub enum OperationPhase {
     WaitingFeedback = 4,
     /// 等待退出。
     WaitingExit = 5,
-    /// 格式解析。
-    FormatParse = 6,
-    /// 存储替换。
-    StorageReplacement = 7,
-    /// 实际读回。
-    ActualReadback = 8,
-    /// 结果交付。
-    ResultDelivery = 9,
-    /// 应用移交。
-    ApplicationHandoff = 10,
     /// 资源恢复。
     ResourceRecovery = 11,
 }
@@ -154,10 +142,6 @@ pub struct DiagnosticEvidence {
     pub send_submitted: bool,
     /// 已取得相符新设备反馈。
     pub matched_feedback: bool,
-    /// 存储替换返回。
-    pub storage_replaced: bool,
-    /// 实际存储读回。
-    pub actual_readback: bool,
     /// 缺原结果证据。
     pub missing_original_result: bool,
 }
@@ -166,8 +150,6 @@ impl DiagnosticEvidence {
         (self.not_started as u8)
             | ((self.send_submitted as u8) << 1)
             | ((self.matched_feedback as u8) << 2)
-            | ((self.storage_replaced as u8) << 3)
-            | ((self.actual_readback as u8) << 4)
             | ((self.missing_original_result as u8) << 5)
     }
 }
@@ -197,21 +179,12 @@ pub enum DetailUnit {
 /// 仍受约束的资源位。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Constraints {
-    /// 用户存储。
-    pub user_storage: bool,
     /// 驱动进入或退出。
     pub driver_transition: bool,
-    /// 应用移交。
-    pub application_handoff: bool,
-    /// 结果留存容量。
-    pub result_slot: bool,
 }
 impl Constraints {
     pub(super) fn bits(self) -> u32 {
-        (self.user_storage as u32)
-            | ((self.driver_transition as u32) << 1)
-            | ((self.application_handoff as u32) << 2)
-            | ((self.result_slot as u32) << 3)
+        (self.driver_transition as u32) << 1
     }
 }
 
@@ -222,23 +195,10 @@ pub struct MissingEvidence {
     pub call_result: bool,
     /// 设备反馈。
     pub device_feedback: bool,
-    /// 实际读回。
-    pub actual_readback: bool,
-    /// 同设备内容核对。
-    pub same_device_comparison: bool,
-    /// 更新入口身份。
-    pub update_route_identity: bool,
-    /// 新应用启动。
-    pub new_application_start: bool,
 }
 impl MissingEvidence {
     fn bits(self) -> u32 {
-        (self.call_result as u32)
-            | ((self.device_feedback as u32) << 1)
-            | ((self.actual_readback as u32) << 2)
-            | ((self.same_device_comparison as u32) << 3)
-            | ((self.update_route_identity as u32) << 4)
-            | ((self.new_application_start as u32) << 5)
+        (self.call_result as u32) | ((self.device_feedback as u32) << 1)
     }
 }
 
@@ -263,8 +223,6 @@ pub struct DiagnosticFields {
     pub started_time_us: u64,
     /// 原业务期限。
     pub deadline_us: u64,
-    /// 维护操作标识；非维护诊断为零。
-    pub operation_id: u64,
     /// 已取得的原始错误码。
     pub native_code: u32,
     /// 原始错误码域。
@@ -308,7 +266,7 @@ impl DiagnosticsFields<'_> {
             .checked_add(
                 self.entries
                     .len()
-                    .checked_mul(64)
+                    .checked_mul(56)
                     .ok_or(Error::InvalidPayloadLength)?,
             )
             .ok_or(Error::InvalidPayloadLength)?;
@@ -330,7 +288,7 @@ pub fn encode_diagnostics(
     p[42] = fields.overflow as u8;
     p[43] = 0;
     for (index, entry) in fields.entries.iter().enumerate() {
-        write_diagnostic(&mut p[44 + index * 64..108 + index * 64], entry);
+        write_diagnostic(&mut p[44 + index * 56..100 + index * 56], entry);
     }
     encode_in_place(MessageKind::Diagnostics, length - 8, output)
 }
@@ -345,14 +303,13 @@ fn write_diagnostic(out: &mut [u8], field: &DiagnosticFields) {
     put_u64(out, 8, field.event_time_us);
     put_u64(out, 16, field.started_time_us);
     put_u64(out, 24, field.deadline_us);
-    put_u64(out, 32, field.operation_id);
-    put_u32(out, 40, field.native_code);
-    out[44] = field.native_domain as u8;
-    out[45] = field.evidence.bits();
-    out[46..48].fill(0);
-    put_value(out, 48, 52, field.detail_value);
-    out[53] = field.detail_unit as u8;
-    put_u16(out, 54, field.constraints.bits() as u16);
-    put_u32(out, 56, field.occurrences);
-    put_u32(out, 60, field.missing_evidence.bits());
+    put_u32(out, 32, field.native_code);
+    out[36] = field.native_domain as u8;
+    out[37] = field.evidence.bits();
+    out[38..40].fill(0);
+    put_value(out, 40, 44, field.detail_value);
+    out[45] = field.detail_unit as u8;
+    put_u16(out, 46, field.constraints.bits() as u16);
+    put_u32(out, 48, field.occurrences);
+    put_u32(out, 52, field.missing_evidence.bits());
 }

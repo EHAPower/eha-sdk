@@ -2,7 +2,7 @@
 
 use super::common::{Sample, decoded_value_fields, sample_data};
 use crate::responses;
-use crate::validation::{f32_at, u16_at, u32_at, u64_at};
+use crate::validation::{f32_at, u16_at, u32_at};
 
 fn telemetry_facts(bits: u16) -> responses::TelemetryFacts {
     responses::TelemetryFacts {
@@ -11,8 +11,7 @@ fn telemetry_facts(bits: u16) -> responses::TelemetryFacts {
         candidate_limited: bits & 4 != 0,
         position_direction_inhibited: bits & 8 != 0,
         device_operation_pending: bits & 16 != 0,
-        retained_result: bits & 32 != 0,
-        unknown_effect: bits & 64 != 0,
+        unknown_effect: bits & 32 != 0,
     }
 }
 
@@ -160,13 +159,11 @@ impl<'a> Identity<'a> {
                 .expect("payload was validated"),
             brt27_evidence: responses::EvidenceState::from_u8(self.payload[74])
                 .expect("payload was validated"),
-            high_water_operation_id: u64_at(self.payload, 76),
-            retained_operation_id: u64_at(self.payload, 84),
             text,
         }
     }
     fn string_at(self, index: usize) -> Option<&'a str> {
-        let mut at = 92;
+        let mut at = 76;
         for i in 0..8 {
             let n = usize::from(self.payload[at]);
             at += 1;

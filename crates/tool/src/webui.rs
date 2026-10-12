@@ -950,18 +950,6 @@ fn handle_request_with_scan_body(
                                 json!({"ok":false,"message":"试验进行中；只允许被动快照、记录、显式 Stop 或合并位置目标。"}),
                             );
                         }
-                        if command_needs_identity_refresh(&command)
-                            && let Err(error) = workbench.refresh_identity(transport, node)
-                        {
-                            return session_structured_error(
-                                request,
-                                workbench,
-                                transport,
-                                node,
-                                odrive.last_read.as_ref(),
-                                error,
-                            );
-                        }
                         match workbench.execute(transport, node, command) {
                             Ok(result) => session_response(
                                 request,
@@ -971,7 +959,7 @@ fn handle_request_with_scan_body(
                                 node,
                                 None,
                                 odrive.last_read.as_ref(),
-                                json!({"ok":true,"message":if result.local_submission.is_some() { "请求已本地提交；设备采用与执行请查看状态。" } else { "已取得操作结果；设备状态单独展示。" },"result":result}),
+                                json!({"ok":true,"message":if result.local_submission.is_some() { "请求已本地提交；设备效果需显式重连并读取当前事实。" } else { "已取得操作结果；设备状态单独展示。" },"result":result}),
                             ),
                             Err(error) => session_structured_error(
                                 request,
@@ -1425,15 +1413,6 @@ fn parse_transport_value(value: &str) -> Result<WebTransport, &'static str> {
         _ => Err("transport 必须为 usb 或 can"),
     }
 }
-fn command_needs_identity_refresh(command: &Command) -> bool {
-    matches!(
-        command,
-        Command::ConfigSave { .. }
-            | Command::RestoreFactory
-            | Command::ResetApplication
-            | Command::EnterUpdate
-    )
-}
 #[allow(clippy::too_many_arguments)] // transport/node/trend/ODrive are one snapshot projection.
 fn session_response(
     request: tiny_http::Request,
@@ -1466,7 +1445,6 @@ fn session_structured_error(
 ) -> Result<(), String> {
     let message = error.message.clone();
     let unknown = error.unknown;
-    let operation_key = error.operation_key.clone();
     session_response(
         request,
         409,
@@ -1475,7 +1453,7 @@ fn session_structured_error(
         node,
         None,
         odrive,
-        json!({"ok":false,"message":message,"unknown":unknown,"operation_key":operation_key,"error":error}),
+        json!({"ok":false,"message":message,"unknown":unknown,"error":error}),
     )
 }
 fn header<'a>(request: &'a tiny_http::Request, name: &'static str) -> Option<&'a str> {

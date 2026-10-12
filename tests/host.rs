@@ -1,59 +1,48 @@
 // Copyright The eha-sdk Contributors
-
 //! Host API 的端到端边界：夹具只收取 SDK 实际编码的公共消息，并回送协议编码回复。
 #![cfg(feature = "desktop")]
 #![allow(clippy::panic)]
 
 use std::{
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use eha_sdk::{
     host::{
-        Client, Failure, LocalStage, Wait,
-        backend::{Backend, EventSink, Pump},
+        Cancellation, Client, Failure, LocalStage, Wait,
+        backend::{Backend, Event, EventSink, Pump},
     },
     protocol::{
         self, Direction, Message, MessageKind, SampleData,
         responses::{
-            self, ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView, ContactState,
-            DesiredAxis, FallbackReason, IdentityFields, IdentityText, MaintenanceOperation,
-            MaintenanceState, OperationEvidence, OperationPhase, OperationResultFields,
-            ReferenceKind, StartupSource, TargetIngress, TargetMode, TelemetryFacts,
-            TelemetryFields, UnavailableSubject, ValueFields, ValueResult, ValueState,
+            self, ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView,
+            FallbackReason, IdentityFields, IdentityText, StartupSource, UnavailableSubject,
         },
     },
-    session::MaintenanceKey,
 };
 
 const UID: [u8; 12] = [7; 12];
 const NONCE: [u8; 16] = [9; 16];
-// 人工合法记录，仅用于软件验证，不代表产品出厂值或设备标定。
 const VALID_CONFIG: &[u8] = include_bytes!("fixtures/config.json");
 
 #[derive(Clone, Default)]
 struct Seen(Arc<Mutex<Vec<MessageKind>>>);
-
 impl Seen {
-    fn record(&self, message: MessageKind) {
-        self.0.lock().expect("seen lock").push(message);
+    fn record(&self, kind: MessageKind) {
+        self.0.lock().expect("seen lock").push(kind);
     }
-
+    fn count(&self, kind: MessageKind) -> usize {
+        self.0
+            .lock()
+            .expect("seen lock")
+            .iter()
+            .filter(|seen| **seen == kind)
+            .count()
+    }
     fn snapshot(&self) -> Vec<MessageKind> {
         self.0.lock().expect("seen lock").clone()
-    }
-
-    fn count(&self, message: MessageKind) -> usize {
-        self.snapshot()
-            .into_iter()
-            .filter(|observed| *observed == message)
-            .count()
     }
 }
 
@@ -78,22 +67,27 @@ where
     .expect("test backend starts")
 }
 
-fn sample(query_id: u32) -> SampleData {
+fn sample_with_nonce(query_id: u32, run_nonce: [u8; 16]) -> SampleData {
     SampleData {
         query_id,
-        run_nonce: NONCE,
+        run_nonce,
         snapshot_sequence: 1,
         snapshot_time_us: 10,
     }
 }
 
 fn identity(query_id: u32) -> Vec<u8> {
-    identity_with_uid(query_id, UID)
+    identity_with(query_id, UID, NONCE, 1)
 }
 
-fn identity_with_uid(query_id: u32, uid: [u8; 12]) -> Vec<u8> {
+fn identity_with(
+    query_id: u32,
+    uid: [u8; 12],
+    run_nonce: [u8; 16],
+    config_format_version: u32,
+) -> Vec<u8> {
     let fields = IdentityFields {
-        sample: sample(query_id),
+        sample: sample_with_nonce(query_id, run_nonce),
         uid,
         config_source: StartupSource::User,
         fallback_reason: FallbackReason::None,
@@ -104,12 +98,10 @@ fn identity_with_uid(query_id: u32, uid: [u8; 12]) -> Vec<u8> {
         host_heartbeat_hz: 100,
         telemetry_hz: 20,
         host_contact_max_age_ms: 300,
-        config_format_version: 1,
+        config_format_version,
         build_evidence: responses::EvidenceState::Available,
         odrive_evidence: responses::EvidenceState::Unavailable,
         brt27_evidence: responses::EvidenceState::Unavailable,
-        high_water_operation_id: 0,
-        retained_operation_id: 0,
         text: IdentityText {
             version: "test",
             source_revision: "",
@@ -127,23 +119,21 @@ fn identity_with_uid(query_id: u32, uid: [u8; 12]) -> Vec<u8> {
     bytes
 }
 
-fn unavailable(query_id: u32, subject: UnavailableSubject, reason: u16) -> Vec<u8> {
-    unavailable_result(query_id, subject, reason, 0)
+fn unavailable(query_id: u32, subject: UnavailableSubject) -> Vec<u8> {
+    unavailable_with(query_id, NONCE, subject, 0x0101)
 }
 
-fn unavailable_result(
+fn unavailable_with(
     query_id: u32,
+    run_nonce: [u8; 16],
     subject: UnavailableSubject,
     reason: u16,
-    operation_id: u64,
 ) -> Vec<u8> {
     let fields = responses::DataUnavailableFields {
-        sample: sample(query_id),
+        sample: sample_with_nonce(query_id, run_nonce),
         subject,
         reason,
         next_actions: 0,
-        retained: false,
-        operation_id,
     };
     let mut bytes = [0; responses::DataUnavailableFields::encoded_len()];
     let length =
@@ -151,128 +141,25 @@ fn unavailable_result(
     bytes[..length].to_vec()
 }
 
-fn operation_result(query_id: u32, operation_id: u64) -> Vec<u8> {
-    let fields = OperationResultFields {
-        sample: sample(query_id),
-        operation_id,
-        operation: MaintenanceOperation::SaveConfig,
-        state: MaintenanceState::FirmwareStepComplete,
-        phase: OperationPhase::StorageReplacement,
-        evidence: OperationEvidence {
-            storage_replace_succeeded: true,
-            settled: true,
-            ..Default::default()
-        },
-        reason: 0,
-        next_actions: 0,
-        constraints: responses::Constraints {
-            result_slot: true,
-            ..Default::default()
-        },
-        started_time_us: 1,
-        deadline_us: 2,
-        finished_time_us: 2,
-        content_length: VALID_CONFIG.len() as u32,
-        content_crc32c: 0,
-        revision: 1,
-    };
-    let mut bytes = [0; OperationResultFields::encoded_len()];
-    let length =
-        responses::encode_operation_result(&fields, &mut bytes).expect("operation result encodes");
-    bytes[..length].to_vec()
+fn config(query_id: u32, view: ConfigView, record: &[u8]) -> Vec<u8> {
+    config_with_nonce(query_id, NONCE, view, record)
 }
 
-fn available(value: f32) -> ValueFields {
-    ValueFields::new(
-        value,
-        ValueState::new(
-            ValueResult::Available,
-            responses::SourceQuality::Qualified,
-            false,
-        ),
-    )
-}
-
-fn never() -> ValueFields {
-    ValueFields::new(
-        0.0,
-        ValueState::new(ValueResult::Never, responses::SourceQuality::Unknown, false),
-    )
-}
-
-fn telemetry(run_nonce: [u8; 16], sequence: u32, retained_result: bool) -> Vec<u8> {
-    let fields = TelemetryFields {
-        sample: SampleData {
-            query_id: 0,
-            run_nonce,
-            snapshot_sequence: sequence,
-            snapshot_time_us: u64::from(sequence) * 1_000,
-        },
-        decision_age_us: 0,
-        target_mode: TargetMode::None,
-        target_ingress: TargetIngress::None,
-        facts: TelemetryFacts {
-            retained_result,
-            ..Default::default()
-        },
-        target_values: [0.0; 3],
-        can_adoption_blockers: 0,
-        usb_adoption_blockers: 0,
-        output_blockers: 0,
-        last_end_reason: 0,
-        limits: Default::default(),
-        main_values: [available(1.0); 5],
-        position_age_us: 0,
-        velocity_age_us: 0,
-        pressure_pair_age_us: 0,
-        reference: never(),
-        reference_kind: ReferenceKind::None,
-        candidate_rpm: available(0.0),
-        last_submitted_rpm: available(0.0),
-        submitted_age_us: 0,
-        axis_state_raw: 0,
-        axis_error_raw: 0,
-        driver_age_us: u32::MAX,
-        driver_state: Default::default(),
-        desired_axis: DesiredAxis::Idle,
-        can_heartbeat_age_us: 0,
-        usb_heartbeat_age_us: 0,
-        can_contact: ContactState::Expired,
-        usb_contact: ContactState::Expired,
-    };
-    let mut bytes = vec![0; TelemetryFields::encoded_len()];
-    let length = responses::encode_telemetry(&fields, &mut bytes).expect("telemetry encodes");
-    bytes.truncate(length);
-    bytes
-}
-
-fn read_failed_config(query_id: u32) -> Vec<u8> {
+fn config_with_nonce(
+    query_id: u32,
+    run_nonce: [u8; 16],
+    view: ConfigView,
+    record: &[u8],
+) -> Vec<u8> {
     let fields = ConfigDataFields {
-        sample: sample(query_id),
-        view: ConfigView::UserRecord,
-        record_state: ConfigRecordState::ReadFailed,
-        startup_source: StartupSource::User,
-        fallback_reason: FallbackReason::ReadFailed,
-        data_time_us: u64::MAX,
-    };
-    let mut bytes = vec![0; ConfigDataWriter::required_len(0).expect("empty config length")];
-    let writer = ConfigDataWriter::start(fields, 0, &mut bytes).expect("config starts");
-    let length = writer.finish().expect("config encodes");
-    bytes.truncate(length);
-    bytes
-}
-
-fn complete_config(query_id: u32, record: &[u8]) -> Vec<u8> {
-    let fields = ConfigDataFields {
-        sample: sample(query_id),
-        view: ConfigView::UserRecord,
+        sample: sample_with_nonce(query_id, run_nonce),
+        view,
         record_state: ConfigRecordState::Complete,
         startup_source: StartupSource::User,
         fallback_reason: FallbackReason::None,
         data_time_us: 10,
     };
-    let mut bytes =
-        vec![0; ConfigDataWriter::required_len(record.len()).expect("complete config length")];
+    let mut bytes = vec![0; ConfigDataWriter::required_len(record.len()).expect("config length")];
     let mut writer =
         ConfigDataWriter::start(fields, record.len(), &mut bytes).expect("config starts");
     writer.data_mut().copy_from_slice(record);
@@ -281,10 +168,10 @@ fn complete_config(query_id: u32, record: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn identify(client: &mut Client) {
+fn identify_client(client: &mut Client) {
     client
-        .identify(Some(UID), &Wait::new(Duration::from_millis(200)))
-        .expect("identity query succeeds");
+        .identify(Some(UID), &Wait::new(Duration::from_millis(100)))
+        .expect("identity succeeds");
 }
 
 #[test]
@@ -303,41 +190,44 @@ fn query_ignores_late_and_wrong_subject_replies_before_the_matching_reply() {
             category: 1,
         } => {
             sink.submitted(request_id);
-            sink.received(unavailable(
-                query_id - 1,
+            sink.received(unavailable_with(
+                query_id.wrapping_sub(1),
+                NONCE,
                 UnavailableSubject::Status,
                 0x0101,
             ));
-            sink.received(unavailable(
+            sink.received(unavailable_with(
                 query_id,
+                NONCE,
                 UnavailableSubject::Measurements,
                 0x0102,
             ));
-            sink.received(unavailable(query_id, UnavailableSubject::Status, 0x0103));
+            sink.received(unavailable_with(
+                query_id,
+                NONCE,
+                UnavailableSubject::Status,
+                0x0103,
+            ));
         }
         other => panic!("unexpected request: {other:?}"),
     });
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
 
     let error = client
-        .status(&Wait::new(Duration::from_millis(200)))
+        .status(&Wait::new(Duration::from_millis(100)))
         .expect_err("only the matching status reply may finish the query");
-    match error.failure {
-        Failure::DataUnavailable(fields) => assert_eq!(fields.reason, 0x0103),
-        other => panic!("unexpected failure: {other:?}"),
-    }
+    assert!(matches!(error.failure, Failure::DataUnavailable(fields) if fields.reason == 0x0103));
     assert_eq!(seen.count(MessageKind::Query), 2);
 }
 
 #[test]
-fn query_keeps_a_matching_reply_that_arrives_before_local_submission() {
+fn matching_reply_before_local_submission_is_preserved() {
     let backend = backend_with(Seen::default(), |message, sink, request_id| match message {
         Message::Query {
             query_id,
             category: 0,
         } => {
-            // USB IN may complete before the final OUT completion that establishes local submit.
             sink.received(identity(query_id));
             sink.submitted(request_id);
         }
@@ -345,25 +235,28 @@ fn query_keeps_a_matching_reply_that_arrives_before_local_submission() {
             query_id,
             category: 1,
         } => {
-            sink.received(unavailable(query_id, UnavailableSubject::Status, 0x0105));
+            sink.received(unavailable_with(
+                query_id,
+                NONCE,
+                UnavailableSubject::Status,
+                0x0105,
+            ));
             sink.submitted(request_id);
         }
         other => panic!("unexpected request: {other:?}"),
     });
     let mut client = Client::new(backend);
+    identify_client(&mut client);
 
-    client
-        .identify(Some(UID), &Wait::new(Duration::from_millis(100)))
-        .expect("an early valid Identity reply remains available after local submission");
     let error = client
         .status(&Wait::new(Duration::from_millis(100)))
-        .expect_err("an early matching Status result must retain its query error");
+        .expect_err("early matching response remains associated with this query");
     assert!(matches!(error.failure, Failure::DataUnavailable(fields) if fields.reason == 0x0105));
     assert_eq!(error.local, LocalStage::FullySubmitted);
 }
 
 #[test]
-fn unmatched_events_cannot_extend_a_query_past_its_deadline() {
+fn unmatched_events_do_not_extend_deadline() {
     let backend = Backend::spawn("eha-sdk-deadline-test", move |commands, sink| {
         let mut pump = Pump::new(commands, sink);
         let mut flood = None;
@@ -397,32 +290,26 @@ fn unmatched_events_cannot_extend_a_query_past_its_deadline() {
             if let Some((wrong_query_id, until)) = flood
                 && Instant::now() < until
             {
-                pump.sink.received(unavailable(
-                    wrong_query_id,
-                    UnavailableSubject::Status,
-                    0x0104,
-                ));
+                pump.sink
+                    .received(unavailable(wrong_query_id, UnavailableSubject::Status));
             }
             thread::sleep(Duration::from_millis(1));
         }
     })
     .expect("test backend starts");
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
 
     let started = Instant::now();
     let error = client
         .status(&Wait::new(Duration::from_millis(25)))
         .expect_err("unmatched replies must not keep this query alive");
     assert!(matches!(error.failure, Failure::Timeout));
-    assert!(
-        started.elapsed() < Duration::from_millis(100),
-        "the 150ms unmatched-event flood must not extend a 25ms wait"
-    );
+    assert!(started.elapsed() < Duration::from_millis(100));
 }
 
 #[test]
-fn submitted_save_disconnect_is_unknown_and_remains_pending_without_a_retry() {
+fn matching_pre_submit_rejection_is_returned_without_sending_a_second_request() {
     let seen = Seen::default();
     let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
         Message::Query {
@@ -432,39 +319,26 @@ fn submitted_save_disconnect_is_unknown_and_remains_pending_without_a_retry() {
             sink.submitted(request_id);
             sink.received(identity(query_id));
         }
-        Message::SaveConfig { .. } => {
-            sink.submitted(request_id);
-            sink.disconnected("test link lost after local submission");
+        Message::SaveAndRestart { query_id, .. } => {
+            sink.received(unavailable(query_id, UnavailableSubject::SaveAndRestart));
         }
-        Message::ReadResult { .. } => sink.submitted(request_id),
         other => panic!("unexpected request: {other:?}"),
     });
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
 
     let error = client
-        .save_and_readback(VALID_CONFIG, &Wait::new(Duration::from_millis(200)))
-        .expect_err("a disconnect after submission leaves the maintenance result unknown");
-    assert!(matches!(error.failure, Failure::ResultUnknown(_)));
-    assert_eq!(
-        client.connection_status().disconnected.as_deref(),
-        Some("test link lost after local submission"),
-        "the locally observed disconnect remains available after the operation error"
+        .save_and_restart(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
+        .expect_err("matching rejection before Submitted is observable");
+    assert!(
+        matches!(error.failure, Failure::DataUnavailable(fields) if fields.subject == UnavailableSubject::SaveAndRestart)
     );
-    assert!(error.operation.is_some());
-    assert_eq!(
-        client.pending_operation(),
-        error.operation.as_deref().copied()
-    );
-    assert!(matches!(
-        client.begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(20))),
-        Err(e) if matches!(e.failure, Failure::PendingOperation)
-    ));
-    assert_eq!(seen.count(MessageKind::SaveConfig), 1);
+    assert_eq!(error.local, LocalStage::MayHaveBeenSubmitted);
+    assert_eq!(seen.count(MessageKind::SaveAndRestart), 1);
 }
 
 #[test]
-fn foreign_key_cannot_send_read_or_occupy_an_empty_maintenance_slot() {
+fn late_mutation_rejection_does_not_pollute_the_next_query_or_mutation() {
     let seen = Seen::default();
     let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
         Message::Query {
@@ -474,497 +348,91 @@ fn foreign_key_cannot_send_read_or_occupy_an_empty_maintenance_slot() {
             sink.submitted(request_id);
             sink.received(identity(query_id));
         }
-        Message::ReadResult { query_id, .. } => {
+        Message::SaveAndRestart { query_id, .. } => {
             sink.submitted(request_id);
-            sink.received(unavailable(
+            sink.received(unavailable(query_id, UnavailableSubject::SaveAndRestart));
+        }
+        Message::Query {
+            query_id,
+            category: 1,
+        } => {
+            sink.submitted(request_id);
+            sink.received(unavailable_with(
                 query_id,
-                UnavailableSubject::OperationResult,
-                0x0302,
+                NONCE,
+                UnavailableSubject::Status,
+                0x0101,
             ));
         }
-        Message::SaveConfig { .. } => sink.submitted(request_id),
-        other => panic!("unexpected message: {other:?}"),
-    });
-    let mut client = Client::new(backend);
-    identify(&mut client);
-    let foreign = MaintenanceKey {
-        uid: [8; 12],
-        run_nonce: NONCE,
-        operation_id: 37,
-    };
-
-    let read = client
-        .read_result(foreign, &Wait::new(Duration::from_millis(20)))
-        .expect_err("foreign key must be rejected before reading");
-    assert!(matches!(read.failure, Failure::Session(_)));
-    assert_eq!(read.local, LocalStage::NotSubmitted);
-
-    let track = client
-        .track_operation(foreign)
-        .expect_err("foreign key must be rejected before tracking");
-    assert!(matches!(track.failure, Failure::Session(_)));
-    assert_eq!(track.local, LocalStage::NotSubmitted);
-    assert!(client.pending_operation().is_none());
-    assert_eq!(seen.count(MessageKind::ReadResult), 0);
-
-    let started = client
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(20)))
-        .expect("foreign key must not occupy the local maintenance slot");
-    assert_eq!(client.pending_operation(), Some(started.key));
-    assert_eq!(seen.count(MessageKind::SaveConfig), 1);
-}
-
-#[test]
-fn foreign_key_cannot_replace_the_tracked_maintenance_operation() {
-    let seen = Seen::default();
-    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
-        Message::Query {
-            query_id,
-            category: 0,
-        } => {
-            sink.submitted(request_id);
-            sink.received(identity(query_id));
-        }
-        Message::SaveConfig { .. } => sink.submitted(request_id),
-        other => panic!("unexpected message: {other:?}"),
-    });
-    let mut client = Client::new(backend);
-    identify(&mut client);
-    let started = client
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(20)))
-        .expect("save is accepted");
-    let foreign = MaintenanceKey {
-        uid: [8; 12],
-        run_nonce: NONCE,
-        operation_id: 38,
-    };
-
-    let error = client
-        .track_operation(foreign)
-        .expect_err("foreign key must not replace the tracked operation");
-    assert!(matches!(error.failure, Failure::Session(_)));
-    assert_eq!(error.local, LocalStage::NotSubmitted);
-    assert_eq!(client.pending_operation(), Some(started.key));
-    assert_eq!(seen.count(MessageKind::SaveConfig), 1);
-}
-
-#[test]
-fn same_uid_key_from_previous_run_remains_readable() {
-    let seen = Seen::default();
-    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
-        Message::Query {
-            query_id,
-            category: 0,
-        } => {
-            sink.submitted(request_id);
-            sink.received(identity(query_id));
-        }
-        Message::ReadResult { query_id, .. } => {
-            sink.submitted(request_id);
-            sink.received(unavailable_result(
-                query_id,
-                UnavailableSubject::OperationResult,
-                0x0300,
-                39,
-            ));
-        }
-        other => panic!("unexpected message: {other:?}"),
-    });
-    let mut client = Client::new(backend);
-    identify(&mut client);
-    let old_key = MaintenanceKey {
-        uid: UID,
-        run_nonce: [4; 16],
-        operation_id: 39,
-    };
-
-    client
-        .track_operation(old_key)
-        .expect("same device key remains trackable after a reboot");
-    let error = client
-        .read_result(old_key, &Wait::new(Duration::from_millis(20)))
-        .expect_err("the device reports the prior-run result unavailable");
-    assert!(matches!(
-        error.failure,
-        Failure::DataUnavailable(fields)
-            if fields.subject == UnavailableSubject::OperationResult && fields.reason == 0x0300
-    ));
-    assert_eq!(client.pending_operation(), Some(old_key));
-    assert_eq!(seen.count(MessageKind::ReadResult), 1);
-}
-
-#[test]
-fn tracking_the_same_key_keeps_the_observed_result_for_release() {
-    let seen = Seen::default();
-    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
-        Message::Query {
-            query_id,
-            category: 0,
-        } => {
-            sink.submitted(request_id);
-            sink.received(identity(query_id));
-        }
-        Message::SaveConfig { key, .. } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(0, key.operation_id()));
-        }
-        Message::ReadResult { query_id, key } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(query_id, key.operation_id()));
-        }
-        Message::ReleaseResult { .. } => sink.submitted(request_id),
+        Message::ResetApplication { .. } => sink.submitted(request_id),
         other => panic!("unexpected request: {other:?}"),
     });
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
 
-    let submission = client
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
-        .expect("save is locally submitted");
     client
-        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
-        .expect("result is observed before explicit re-tracking");
+        .save_and_restart(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
+        .expect("Submitted wins over a later device rejection");
+    let status = client
+        .status(&Wait::new(Duration::from_millis(100)))
+        .expect_err("late mutation rejection is not reused as a status reply");
+    assert!(matches!(status.failure, Failure::DataUnavailable(fields) if fields.reason == 0x0101));
     client
-        .track_operation(submission.key)
-        .expect("the same key remains tracked without clearing its result");
-    client
-        .release_result(&Wait::new(Duration::from_millis(100)))
-        .expect("the retained result remains releasable");
-    assert_eq!(seen.count(MessageKind::ReleaseResult), 1);
+        .reset_application(&Wait::new(Duration::from_millis(100)))
+        .expect("late rejection is not cached or used to block the next explicit request");
+    assert_eq!(seen.count(MessageKind::SaveAndRestart), 1);
+    assert_eq!(seen.count(MessageKind::Query), 2);
+    assert_eq!(seen.count(MessageKind::ResetApplication), 1);
 }
 
 #[test]
-fn release_waits_for_a_new_passive_clear_before_reading_its_result() {
+fn restore_factory_reuses_the_read_factory_bytes_for_one_save_and_restart() {
     let seen = Seen::default();
-    let release_started = Arc::new(AtomicBool::new(false));
-    let fresh_clear_sent = Arc::new(AtomicBool::new(false));
-    let read_before_clear = Arc::new(AtomicBool::new(false));
-    let backend = Backend::spawn("eha-sdk-release-fence-test", {
-        let seen = seen.clone();
-        let release_started = release_started.clone();
-        let fresh_clear_sent = fresh_clear_sent.clone();
-        let read_before_clear = read_before_clear.clone();
-        move |commands, sink| {
-            let mut pump = Pump::new(commands, sink);
-            let mut early_clear_due = None;
-            let mut release_submission_due = None;
-            let mut fresh_clear_due = None;
-            while pump.poll() {
-                for lane in 0..3 {
-                    while let Some(request) = pump.take(lane) {
-                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
-                            .expect("SDK emits a contract-valid host request");
-                        seen.record(message.kind());
-                        match message {
-                            Message::Query {
-                                query_id,
-                                category: 0,
-                            } => {
-                                pump.sink.submitted(request.id);
-                                pump.sink.received(identity(query_id));
-                            }
-                            Message::SaveConfig { key, .. } => {
-                                pump.sink.submitted(request.id);
-                                pump.sink.received(operation_result(0, key.operation_id()));
-                            }
-                            Message::ReadResult { query_id, key } => {
-                                if release_started.load(Ordering::Acquire) {
-                                    if !fresh_clear_sent.load(Ordering::Acquire) {
-                                        read_before_clear.store(true, Ordering::Release);
-                                    }
-                                    pump.sink.submitted(request.id);
-                                    if fresh_clear_sent.load(Ordering::Acquire) {
-                                        pump.sink.received(unavailable_result(
-                                            query_id,
-                                            UnavailableSubject::OperationResult,
-                                            0x0306,
-                                            key.operation_id(),
-                                        ));
-                                    }
-                                } else {
-                                    pump.sink.submitted(request.id);
-                                    pump.sink
-                                        .received(operation_result(query_id, key.operation_id()));
-                                    // Release 前的留存事实和其后的同一快照均不能跨越 fence。
-                                    pump.sink.received(telemetry(NONCE, 10, true));
-                                }
-                            }
-                            Message::ReleaseResult { .. } => {
-                                release_started.store(true, Ordering::Release);
-                                // 发送排队后的 clear 不能越过尚未到达的本地 Submitted 边界。
-                                early_clear_due = Some(Instant::now() + Duration::from_millis(10));
-                                release_submission_due =
-                                    Some((request.id, Instant::now() + Duration::from_millis(35)));
-                            }
-                            other => panic!("unexpected request: {other:?}"),
-                        }
-                    }
-                }
-                if early_clear_due.is_some_and(|due| Instant::now() >= due) {
-                    pump.sink.received(telemetry(NONCE, 11, false));
-                    early_clear_due = None;
-                }
-                if let Some((request_id, due)) = release_submission_due
-                    && Instant::now() >= due
-                {
-                    pump.sink.submitted(request_id);
-                    fresh_clear_due = Some(Instant::now() + Duration::from_millis(35));
-                    release_submission_due = None;
-                }
-                if fresh_clear_due.is_some_and(|due| Instant::now() >= due) {
-                    pump.sink.received(telemetry(NONCE, 12, false));
-                    fresh_clear_sent.store(true, Ordering::Release);
-                    fresh_clear_due = None;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-    })
-    .expect("test backend starts");
-    let mut client = Client::new(backend);
-    identify(&mut client);
-
-    let submission = client
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
-        .expect("save is locally submitted");
-    client
-        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
-        .expect("the retained result is observed before release");
-    client
-        .release_result(&Wait::new(Duration::from_millis(100)))
-        .expect("release is locally submitted");
-
-    let blocked_identity = client
-        .identify(Some(UID), &Wait::new(Duration::from_millis(20)))
-        .expect_err(
-            "Identity must not overwrite ReleaseResult before its passive consumption evidence",
-        );
-    assert!(matches!(
-        blocked_identity.failure,
-        Failure::PendingOperation
-    ));
-    let blocked = client
-        .status(&Wait::new(Duration::from_millis(20)))
-        .expect_err("a later ordinary request cannot overwrite the ReleaseResult slot");
-    assert!(matches!(blocked.failure, Failure::PendingOperation));
-    assert_eq!(
-        seen.count(MessageKind::Query),
-        1,
-        "the timed-out Identity and blocked Status sent no later ordinary request"
-    );
-
-    client
-        .confirm_released(submission.key, &Wait::new(Duration::from_millis(150)))
-        .expect("only a fresh passive clear permits the 0x0306 confirmation");
-    assert!(fresh_clear_sent.load(Ordering::Acquire));
-    assert!(
-        !read_before_clear.load(Ordering::Acquire),
-        "ReadResult must not overwrite the unconsumed ReleaseResult"
-    );
-    assert_eq!(seen.count(MessageKind::ReleaseResult), 1);
-    assert_eq!(seen.count(MessageKind::ReadResult), 2);
-    assert!(client.pending_operation().is_none());
-}
-
-#[test]
-fn wrong_run_telemetry_cannot_confirm_or_replay_a_locally_submitted_release() {
-    let seen = Seen::default();
-    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
-        Message::Query {
-            query_id,
-            category: 0,
-        } => {
-            sink.submitted(request_id);
-            sink.received(identity(query_id));
-        }
-        Message::SaveConfig { key, .. } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(0, key.operation_id()));
-        }
-        Message::ReadResult { query_id, key } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(query_id, key.operation_id()));
-        }
-        Message::ReleaseResult { .. } => {
-            sink.submitted(request_id);
-            sink.received(telemetry([8; 16], 11, false));
-        }
-        Message::Heartbeat | Message::Stop => sink.submitted(request_id),
-        other => panic!("unexpected request: {other:?}"),
-    });
-    let mut client = Client::new(backend);
-    identify(&mut client);
-
-    let submission = client
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
-        .expect("save is locally submitted");
-    client
-        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
-        .expect("the retained result is observed before release");
-    client
-        .release_result(&Wait::new(Duration::from_millis(100)))
-        .expect("release is locally submitted");
-
-    let error = client
-        .confirm_released(submission.key, &Wait::new(Duration::from_millis(30)))
-        .expect_err("a different run's telemetry cannot clear this release fence");
-    assert!(matches!(error.failure, Failure::ResultUnknown(_)));
-    assert_eq!(client.pending_operation(), Some(submission.key));
-    assert_eq!(
-        seen.count(MessageKind::ReadResult),
-        1,
-        "timeout sends no confirmation query"
-    );
-
-    client
-        .heartbeat(&Wait::new(Duration::from_millis(20)))
-        .expect("a heartbeat uses its independent lane during release isolation");
-    client
-        .stop_control(&Wait::new(Duration::from_millis(20)))
-        .expect("explicit Stop remains available during release isolation");
-    let blocked = client
-        .status(&Wait::new(Duration::from_millis(20)))
-        .expect_err("ordinary requests remain isolated after Stop");
-    assert!(matches!(blocked.failure, Failure::PendingOperation));
-    assert_eq!(seen.count(MessageKind::Heartbeat), 1);
-    assert_eq!(seen.count(MessageKind::Stop), 1);
-
-    let repeat = client
-        .release_result(&Wait::new(Duration::from_millis(20)))
-        .expect_err("unknown local submission must not be replayed");
-    assert!(matches!(repeat.failure, Failure::PendingOperation));
-    assert_eq!(seen.count(MessageKind::ReleaseResult), 1);
-}
-
-#[test]
-fn resumed_client_cannot_use_a_new_backend_to_cross_an_unknown_release_fence() {
-    let original = backend_with(Seen::default(), |message, sink, request_id| match message {
-        Message::Query {
-            query_id,
-            category: 0,
-        } => {
-            sink.submitted(request_id);
-            sink.received(identity(query_id));
-        }
-        Message::SaveConfig { key, .. } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(0, key.operation_id()));
-        }
-        Message::ReadResult { query_id, key } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(query_id, key.operation_id()));
-        }
-        Message::ReleaseResult { .. } => sink.submitted(request_id),
-        other => panic!("unexpected request: {other:?}"),
-    });
-    let mut first = Client::new(original);
-    identify(&mut first);
-    let submission = first
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
-        .expect("save is locally submitted");
-    first
-        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
-        .expect("the retained result is observed before release");
-    first
-        .release_result(&Wait::new(Duration::from_millis(100)))
-        .expect("release is locally submitted before disconnect");
-    let state = first.disconnect();
-
-    let seen = Seen::default();
-    let (clear_ready, clear_observed) = mpsc::sync_channel(1);
-    let resumed_backend = Backend::spawn("eha-sdk-release-resume-test", {
-        let seen = seen.clone();
-        move |commands, sink| {
-            // 即便新 backend 立即出现相同 nonce 的 clear，也不能为旧连接的 Release 背书。
-            sink.received(telemetry(NONCE, 99, false));
-            clear_ready.send(()).expect("test observes preloaded clear");
-            let mut pump = Pump::new(commands, sink);
-            while pump.poll() {
-                for lane in 0..3 {
-                    if let Some(request) = pump.take(lane) {
-                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
-                            .expect("SDK emits a contract-valid host request");
-                        seen.record(message.kind());
-                        panic!(
-                            "resume must not send {message:?} before old ReleaseResult is confirmed"
-                        );
-                    }
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-    })
-    .expect("test backend starts");
-    clear_observed
-        .recv_timeout(Duration::from_millis(100))
-        .expect("new backend preloads its same-nonce telemetry");
-    let mut resumed = Client::resume(resumed_backend, state);
-    let error = resumed
-        .identify(Some(UID), &Wait::new(Duration::from_millis(20)))
-        .expect_err("a new backend cannot prove the old release was consumed");
-    assert!(matches!(error.failure, Failure::ResultUnknown(_)));
-    let confirm = resumed
-        .confirm_released(submission.key, &Wait::new(Duration::from_millis(20)))
-        .expect_err("an unverified new backend cannot confirm the old release either");
-    assert!(matches!(confirm.failure, Failure::ResultUnknown(_)));
-    assert_eq!(resumed.pending_operation(), Some(submission.key));
-    assert!(seen.snapshot().is_empty());
-}
-
-#[test]
-fn identity_change_cannot_release_a_pending_result_from_another_device() {
-    let seen = Seen::default();
-    let mut identity_count = 0;
-    let uid_b = [8; 12];
-    let backend = backend_with(
-        seen.clone(),
+    let sent_record = Arc::new(Mutex::new(None));
+    let expected_record = VALID_CONFIG.to_vec();
+    let backend = backend_with(seen.clone(), {
+        let sent_record = sent_record.clone();
+        let expected_record = expected_record.clone();
         move |message, sink, request_id| match message {
             Message::Query {
                 query_id,
                 category: 0,
             } => {
-                identity_count += 1;
                 sink.submitted(request_id);
-                sink.received(identity_with_uid(
-                    query_id,
-                    if identity_count == 1 { UID } else { uid_b },
-                ));
+                sink.received(identity(query_id));
             }
-            Message::SaveConfig { key, .. } => {
+            Message::ReadConfig { query_id, view } if view == ConfigView::Factory as u8 => {
                 sink.submitted(request_id);
-                sink.received(operation_result(0, key.operation_id()));
+                sink.received(config(query_id, ConfigView::Factory, &expected_record));
             }
-            Message::ReadResult { query_id, key } => {
+            Message::SaveAndRestart {
+                identity, record, ..
+            } => {
+                let identity = identity.fields();
+                assert_eq!(identity.uid, UID);
+                assert_eq!(identity.run_nonce, NONCE);
+                *sent_record.lock().expect("record lock") = Some(record.to_vec());
                 sink.submitted(request_id);
-                sink.received(operation_result(query_id, key.operation_id()));
             }
-            Message::ReleaseResult { .. } => sink.submitted(request_id),
             other => panic!("unexpected request: {other:?}"),
-        },
-    );
+        }
+    });
     let mut client = Client::new(backend);
-    identify(&mut client);
-    let submission = client
-        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
-        .expect("A save is locally submitted");
-    client
-        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
-        .expect("A result is observed before switching identity");
-    client
-        .identify(Some(uid_b), &Wait::new(Duration::from_millis(100)))
-        .expect("B identity is explicitly verified");
+    identify_client(&mut client);
 
-    let error = client
-        .release_result(&Wait::new(Duration::from_millis(100)))
-        .expect_err("B must not receive A's release key");
-    assert!(matches!(error.failure, Failure::Session(_)));
-    assert_eq!(error.local, LocalStage::NotSubmitted);
-    assert_eq!(client.pending_operation(), Some(submission.key));
-    assert_eq!(seen.count(MessageKind::ReleaseResult), 0);
+    client
+        .restore_factory_and_restart(&Wait::new(Duration::from_millis(100)))
+        .expect("factory bytes are submitted locally");
+    assert_eq!(
+        *sent_record.lock().expect("record lock"),
+        Some(expected_record)
+    );
+    assert_eq!(seen.count(MessageKind::ReadConfig), 1);
+    assert_eq!(seen.count(MessageKind::SaveAndRestart), 1);
 }
 
 #[test]
-fn cancellation_after_save_submission_keeps_the_original_operation_pending() {
+fn invalid_save_is_rejected_before_the_write_side_effect() {
     let seen = Seen::default();
     let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
         Message::Query {
@@ -974,129 +442,17 @@ fn cancellation_after_save_submission_keeps_the_original_operation_pending() {
             sink.submitted(request_id);
             sink.received(identity(query_id));
         }
-        Message::SaveConfig { .. } | Message::ReadResult { .. } => sink.submitted(request_id),
-        other => panic!("unexpected request: {other:?}"),
+        other => panic!("invalid config must not send {other:?}"),
     });
     let mut client = Client::new(backend);
-    identify(&mut client);
-    let wait = Wait::new(Duration::from_secs(1));
-    let cancellation = wait.cancellation.clone();
-    let canceller = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(30));
-        cancellation.cancel();
-    });
+    identify_client(&mut client);
 
     let error = client
-        .save_and_readback(VALID_CONFIG, &wait)
-        .expect_err("cancelling a result wait cannot revoke a submitted save");
-    canceller.join().expect("canceller joins");
-    assert!(matches!(error.failure, Failure::ResultUnknown(_)));
-    assert!(client.pending_operation().is_some());
-    assert!(matches!(
-        client.begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(20))),
-        Err(e) if matches!(e.failure, Failure::PendingOperation)
-    ));
-    assert_eq!(seen.count(MessageKind::SaveConfig), 1);
-}
-
-#[test]
-fn save_waits_for_its_original_notice_before_reading_the_retained_result() {
-    let seen = Seen::default();
-    let notice_sent = Arc::new(AtomicBool::new(false));
-    let early_read = Arc::new(AtomicBool::new(false));
-    let backend = Backend::spawn("eha-sdk-save-notice-test", {
-        let seen = seen.clone();
-        let notice_sent = notice_sent.clone();
-        let early_read = early_read.clone();
-        move |commands, sink| {
-            let mut pump = Pump::new(commands, sink);
-            let mut delayed_notice = None;
-            while pump.poll() {
-                for lane in 0..3 {
-                    while let Some(request) = pump.take(lane) {
-                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
-                            .expect("SDK emits a contract-valid host request");
-                        seen.record(message.kind());
-                        match message {
-                            Message::Query {
-                                query_id,
-                                category: 0,
-                            } => {
-                                pump.sink.submitted(request.id);
-                                pump.sink.received(identity(query_id));
-                            }
-                            Message::SaveConfig { key, .. } => {
-                                pump.sink.submitted(request.id);
-                                delayed_notice = Some((
-                                    key.operation_id(),
-                                    Instant::now() + Duration::from_millis(45),
-                                ));
-                            }
-                            Message::ReadResult { query_id, key } => {
-                                if !notice_sent.load(Ordering::Acquire) {
-                                    early_read.store(true, Ordering::Release);
-                                }
-                                pump.sink.submitted(request.id);
-                                if notice_sent.load(Ordering::Acquire) {
-                                    pump.sink
-                                        .received(operation_result(query_id, key.operation_id()));
-                                }
-                            }
-                            Message::ReadConfig { query_id, .. } => {
-                                pump.sink.submitted(request.id);
-                                pump.sink.received(complete_config(query_id, VALID_CONFIG));
-                            }
-                            other => panic!("unexpected request: {other:?}"),
-                        }
-                    }
-                }
-                if let Some((operation_id, due)) = delayed_notice
-                    && Instant::now() >= due
-                {
-                    pump.sink.received(operation_result(0, operation_id));
-                    notice_sent.store(true, Ordering::Release);
-                    delayed_notice = None;
-                }
-                thread::sleep(Duration::from_millis(1));
-            }
-        }
-    })
-    .expect("test backend starts");
-    let mut client = Client::new(backend);
-    identify(&mut client);
-
-    client
-        .save_and_readback(VALID_CONFIG, &Wait::new(Duration::from_millis(300)))
-        .expect("the delayed original notice enables the subsequent result readback");
-    assert!(notice_sent.load(Ordering::Acquire));
-    assert!(
-        !early_read.load(Ordering::Acquire),
-        "ReadResult must not overwrite the still-unconsumed original operation notice"
-    );
-    assert_eq!(seen.count(MessageKind::ReadResult), 1);
-}
-
-#[test]
-fn invalid_configuration_is_rejected_before_the_save_side_effect() {
-    let seen = Seen::default();
-    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
-        Message::Query {
-            query_id,
-            category: 0,
-        } => {
-            sink.submitted(request_id);
-            sink.received(identity(query_id));
-        }
-        other => panic!("invalid configuration must not send {other:?}"),
-    });
-    let mut client = Client::new(backend);
-    identify(&mut client);
-
-    let error = client
-        .begin_save(b"{not json", &Wait::new(Duration::from_millis(50)))
-        .expect_err("malformed configuration is a local failure");
+        .save_and_restart(b"{not json", &Wait::new(Duration::from_millis(100)))
+        .expect_err("invalid record is local input failure");
     assert!(matches!(error.failure, Failure::InvalidInput(_)));
-    assert_eq!(seen.snapshot(), vec![MessageKind::Query]);
+    assert_eq!(error.local, LocalStage::NotSubmitted);
+    assert_eq!(seen.count(MessageKind::SaveAndRestart), 0);
 }
 
 #[test]
@@ -1114,7 +470,7 @@ fn close_and_drop_only_release_the_local_backend() {
             other => panic!("close/drop must not send {other:?}"),
         });
         let mut client = Client::new(backend);
-        identify(&mut client);
+        identify_client(&mut client);
         if explicit_close {
             client.close();
         } else {
@@ -1125,7 +481,7 @@ fn close_and_drop_only_release_the_local_backend() {
 }
 
 #[test]
-fn resumed_client_requires_a_fresh_identity_before_control_can_resume() {
+fn resumed_client_requires_fresh_identity_before_control_can_resume() {
     let original = backend_with(Seen::default(), |message, sink, request_id| match message {
         Message::Query {
             query_id,
@@ -1137,7 +493,7 @@ fn resumed_client_requires_a_fresh_identity_before_control_can_resume() {
         other => panic!("unexpected request: {other:?}"),
     });
     let mut first = Client::new(original);
-    identify(&mut first);
+    identify_client(&mut first);
     let state = first.disconnect();
 
     let seen = Seen::default();
@@ -1156,15 +512,10 @@ fn resumed_client_requires_a_fresh_identity_before_control_can_resume() {
 
     assert!(matches!(
         resumed.velocity(0.0, &Wait::new(Duration::from_millis(50))),
-        Err(e) if matches!(e.failure, Failure::Session(_))
+        Err(error) if matches!(error.failure, Failure::Session(_))
     ));
     assert_eq!(seen.count(MessageKind::Velocity), 0);
-    assert!(matches!(
-        resumed.release_result(&Wait::new(Duration::from_millis(50))),
-        Err(e) if matches!(e.failure, Failure::Session(_))
-    ));
-    assert_eq!(seen.count(MessageKind::ReleaseResult), 0);
-    identify(&mut resumed);
+    identify_client(&mut resumed);
     resumed
         .velocity(0.0, &Wait::new(Duration::from_millis(50)))
         .expect("fresh identity permits a new explicit control request");
@@ -1209,8 +560,12 @@ fn explicit_background_heartbeat_progresses_while_a_query_waits() {
                 if let Some((query_id, due)) = delayed_status
                     && Instant::now() >= due
                 {
-                    pump.sink
-                        .received(unavailable(query_id, UnavailableSubject::Status, 0x0201));
+                    pump.sink.received(unavailable_with(
+                        query_id,
+                        NONCE,
+                        UnavailableSubject::Status,
+                        0x0201,
+                    ));
                     delayed_status = None;
                 }
                 thread::sleep(Duration::from_millis(1));
@@ -1219,7 +574,7 @@ fn explicit_background_heartbeat_progresses_while_a_query_waits() {
     })
     .expect("test backend starts");
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
     client
         .start_heartbeat()
         .expect("identity enables heartbeat");
@@ -1228,19 +583,14 @@ fn explicit_background_heartbeat_progresses_while_a_query_waits() {
         .status(&Wait::new(Duration::from_millis(200)))
         .expect_err("fixture returns a status-unavailable reply after waiting");
     assert!(matches!(error.failure, Failure::DataUnavailable(_)));
-    let heartbeat = client.heartbeat_status();
-    assert!(
-        heartbeat.submitted >= 2,
-        "heartbeat advances during the status wait"
-    );
+    assert!(client.heartbeat_status().submitted >= 2);
     assert!(seen.count(MessageKind::Heartbeat) >= 2);
     client.stop_heartbeat().expect("explicitly stop scheduler");
 }
 
 #[test]
-fn completed_firmware_save_with_failed_readback_is_not_reported_as_success() {
-    let seen = Seen::default();
-    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
+fn ordinary_transport_error_propagates_without_becoming_a_device_reply() {
+    let backend = backend_with(Seen::default(), |message, sink, request_id| match message {
         Message::Query {
             query_id,
             category: 0,
@@ -1248,41 +598,92 @@ fn completed_firmware_save_with_failed_readback_is_not_reported_as_success() {
             sink.submitted(request_id);
             sink.received(identity(query_id));
         }
-        Message::SaveConfig { key, .. } => {
+        Message::Query { category: 1, .. } => {
             sink.submitted(request_id);
-            sink.received(operation_result(0, key.operation_id()));
-        }
-        Message::ReadResult { query_id, key } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(query_id, key.operation_id()));
-        }
-        Message::ReadConfig { query_id, .. } => {
-            sink.submitted(request_id);
-            sink.received(read_failed_config(query_id));
+            sink.event(Event::TransportError {
+                detail: "test transport failure".into(),
+                raw: vec![1, 2, 3],
+            });
         }
         other => panic!("unexpected request: {other:?}"),
     });
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
 
     let error = client
-        .save_and_readback(VALID_CONFIG, &Wait::new(Duration::from_millis(300)))
-        .expect_err("a completed firmware step still needs a usable matching readback");
-    assert!(matches!(
-        error.failure,
-        Failure::ReadbackUnavailable(ConfigRecordState::ReadFailed)
-    ));
-    assert!(matches!(
-        error.last_result.as_deref(),
-        Some(result) if result.state == MaintenanceState::FirmwareStepComplete
-    ));
-    assert_eq!(seen.count(MessageKind::SaveConfig), 1);
-    assert_eq!(seen.count(MessageKind::ReadResult), 1);
-    assert_eq!(seen.count(MessageKind::ReadConfig), 1);
+        .status(&Wait::new(Duration::from_millis(100)))
+        .expect_err("transport failure is surfaced to the caller");
+    assert!(
+        matches!(
+            error.failure,
+        Failure::Transport { ref detail, ref raw } if detail == "test transport failure" && raw.as_slice() == [1, 2, 3]
+        ),
+        "unexpected transport boundary: {error:?}"
+    );
+    assert_eq!(error.local, LocalStage::FullySubmitted);
 }
 
 #[test]
-fn completed_firmware_save_with_different_readback_is_a_mismatch() {
+fn timeout_cancel_and_disconnect_do_not_retry_mutations_or_leave_a_local_fence() {
+    #[derive(Clone, Copy)]
+    enum FailureCase {
+        Timeout,
+        Cancel,
+        Disconnect,
+    }
+
+    for case in [
+        FailureCase::Timeout,
+        FailureCase::Cancel,
+        FailureCase::Disconnect,
+    ] {
+        let seen = Seen::default();
+        let cancellation = Cancellation::default();
+        let backend = backend_with(seen.clone(), {
+            let cancellation = cancellation.clone();
+            move |message, sink, request_id| match message {
+                Message::Query {
+                    query_id,
+                    category: 0,
+                } => {
+                    sink.submitted(request_id);
+                    sink.received(identity(query_id));
+                }
+                Message::SaveAndRestart { .. } => match case {
+                    FailureCase::Cancel => cancellation.cancel(),
+                    FailureCase::Disconnect => sink.disconnected("test disconnect"),
+                    FailureCase::Timeout => {}
+                },
+                Message::ResetApplication { .. } if !matches!(case, FailureCase::Disconnect) => {
+                    sink.submitted(request_id)
+                }
+                other => panic!("unexpected request: {other:?}"),
+            }
+        });
+        let mut client = Client::new(backend);
+        identify_client(&mut client);
+        let wait = Wait {
+            timeout: Duration::from_millis(25),
+            cancellation,
+        };
+
+        let error = client
+            .save_and_restart(VALID_CONFIG, &wait)
+            .expect_err("locally uncertain mutation cannot be retried by the SDK");
+        assert!(matches!(error.failure, Failure::ResultUnknown(_)));
+        assert_eq!(seen.count(MessageKind::SaveAndRestart), 1);
+
+        if !matches!(case, FailureCase::Disconnect) {
+            client
+                .reset_application(&Wait::new(Duration::from_millis(50)))
+                .expect("a later explicit mutation is not blocked by hidden host state");
+            assert_eq!(seen.count(MessageKind::ResetApplication), 1);
+        }
+    }
+}
+
+#[test]
+fn restore_factory_timeout_does_not_submit_a_save() {
     let seen = Seen::default();
     let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
         Message::Query {
@@ -1292,34 +693,60 @@ fn completed_firmware_save_with_different_readback_is_a_mismatch() {
             sink.submitted(request_id);
             sink.received(identity(query_id));
         }
-        Message::SaveConfig { key, .. } => {
+        Message::ReadConfig { view, .. } if view == ConfigView::Factory as u8 => {
             sink.submitted(request_id);
-            sink.received(operation_result(0, key.operation_id()));
         }
-        Message::ReadResult { query_id, key } => {
-            sink.submitted(request_id);
-            sink.received(operation_result(query_id, key.operation_id()));
-        }
-        Message::ReadConfig { query_id, .. } => {
-            sink.submitted(request_id);
-            let mut different = VALID_CONFIG.to_vec();
-            different[0] = b' ';
-            sink.received(complete_config(query_id, &different));
-        }
-        other => panic!("unexpected request: {other:?}"),
+        other => panic!("factory timeout must not send {other:?}"),
     });
     let mut client = Client::new(backend);
-    identify(&mut client);
+    identify_client(&mut client);
 
     let error = client
-        .save_and_readback(VALID_CONFIG, &Wait::new(Duration::from_millis(300)))
-        .expect_err("a byte-different readback cannot be accepted as the submitted record");
-    assert!(matches!(error.failure, Failure::ReadbackMismatch));
-    assert!(matches!(
-        error.last_result.as_deref(),
-        Some(result) if result.state == MaintenanceState::FirmwareStepComplete
-    ));
-    assert_eq!(seen.count(MessageKind::SaveConfig), 1);
-    assert_eq!(seen.count(MessageKind::ReadResult), 1);
+        .restore_factory_and_restart(&Wait::new(Duration::from_millis(25)))
+        .expect_err("unavailable factory read ends this call before save");
+    assert!(matches!(error.failure, Failure::Timeout));
     assert_eq!(seen.count(MessageKind::ReadConfig), 1);
+    assert_eq!(seen.count(MessageKind::SaveAndRestart), 0);
+}
+
+#[test]
+fn restore_factory_rejects_wrong_run_or_format_before_save() {
+    for case in ["wrong-run", "wrong-format"] {
+        let seen = Seen::default();
+        let backend = backend_with(
+            seen.clone(),
+            move |message, sink, request_id| match message {
+                Message::Query {
+                    query_id,
+                    category: 0,
+                } => {
+                    sink.submitted(request_id);
+                    let format = if case == "wrong-format" { 2 } else { 1 };
+                    sink.received(identity_with(query_id, UID, NONCE, format));
+                }
+                Message::ReadConfig { query_id, view } if view == ConfigView::Factory as u8 => {
+                    sink.submitted(request_id);
+                    let nonce = if case == "wrong-run" { [8; 16] } else { NONCE };
+                    sink.received(config_with_nonce(
+                        query_id,
+                        nonce,
+                        ConfigView::Factory,
+                        VALID_CONFIG,
+                    ));
+                }
+                other => panic!("invalid factory source must not send {other:?}"),
+            },
+        );
+        let mut client = Client::new(backend);
+        identify_client(&mut client);
+
+        let error = client
+            .restore_factory_and_restart(&Wait::new(Duration::from_millis(25)))
+            .expect_err("different factory run or format must not become a save");
+        assert!(matches!(
+            error.failure,
+            Failure::Timeout | Failure::InvalidInput(_)
+        ));
+        assert_eq!(seen.count(MessageKind::SaveAndRestart), 0);
+    }
 }

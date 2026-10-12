@@ -229,7 +229,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "eha-config"
-version = "4.0.0-dev.2"
+version = "4.0.0-dev.3"
 dependencies = [
  "serde",
  "serde-json-core",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "eha-sdk"
-version = "4.0.0-dev.2"
+version = "4.0.0-dev.3"
 dependencies = [
  "eha-config",
  "jsonschema",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "eha-tool"
-version = "4.0.0-dev.2"
+version = "4.0.0-dev.3"
 dependencies = [
  "clap",
  "eha-sdk",
@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "4.0.0-dev.2"
+version = "4.0.0-dev.3"
 
 [[package]]
 name = "quote"
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "transport"
-version = "4.0.0-dev.2"
+version = "4.0.0-dev.3"
 dependencies = [
  "protocol",
 ]

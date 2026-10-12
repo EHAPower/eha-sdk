@@ -1,9 +1,9 @@
 // Copyright The eha-sdk Contributors
-//! 通过公开 SDK 留存实板查询、心跳、停止和保存读回证据。
+//! 通过公开 SDK 留存实板查询、心跳、停止和保存并重启的本地提交事实。
 //! 用法：board_check usb SERIAL OUTDIR [save-current|reconnect]
 //!       board_check can CONTEXT NODE MODE OUTDIR [PYTHON] [save-current|reconnect]
-//! save-current 明确请求以相同容量/业务配置、不同 JSON 空白保存一次，再实际读回。
-//! inspect / reconnect-readonly / result:KEYHEX 只读，适用于异常后的取证。
+//! save-current 明确请求以相同容量/业务配置、不同 JSON 空白保存并重启一次。
+//! inspect / reconnect-readonly 只读，适用于异常后的取证。
 //! 可用 EHA_EXPECT_UID 指定24位十六进制设备 UID；decode OUTDIR 只解码已有文件。
 use eha_sdk::{
     can::{CanChannelFactory, CanConnector, CanOptions, python::PythonCanOptions},
@@ -45,7 +45,6 @@ fn fields(response: Response<'_>) -> String {
             v.entries().map(|v| v.fields()).collect::<Vec<_>>()
         ),
         Response::ConfigData(v) => format!("{:?}", v.fields()),
-        Response::OperationResult(v) => format!("{:?}", v.fields()),
         Response::DataUnavailable(v) => format!("{:?}", v.fields()),
     }
 }
@@ -84,7 +83,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mode=match args[3].as_str(){"classic"=>eha_sdk::transport::can::Mode::Classic,"fd"=>eha_sdk::transport::can::Mode::Fd,_=>return Err("CAN MODE 必须为 classic 或 fd".into())};
             let (python, operation)=match args.get(5).map(String::as_str){
                 Some(value @ ("inspect"|"reconnect-readonly"|"save-current")) => (None, Some(value)),
-                Some(value) if value.starts_with("result:") => (None, Some(value)),
                 Some(python) => (Some(python.to_owned()), args.get(6).map(String::as_str)),
                 None => (None, None),
             };
@@ -118,7 +116,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         ("factory", ConfigView::Factory),
         ("user", ConfigView::UserRecord),
         ("startup", ConfigView::Startup),
-        ("communication", ConfigView::Communication),
     ] {
         let reply = client.read_config(view, &wait)?;
         record(&out, label, &reply)?;
@@ -129,28 +126,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    if mode.is_some_and(|mode| {
-        mode == "inspect" || mode == "reconnect-readonly" || mode.starts_with("result:")
-    }) {
-        if let Some(text) = mode.and_then(|mode| mode.strip_prefix("result:")) {
-            if text.len() != 72 || !text.is_ascii() {
-                return Err("result: 后须为72个十六进制字符".into());
-            }
-            let mut bytes = [0; 36];
-            for (i, byte) in bytes.iter_mut().enumerate() {
-                *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)?;
-            }
-            let key = eha_sdk::session::MaintenanceKey::from_bytes(&bytes)
-                .map_err(|e| format!("{e:?}"))?;
-            client.track_operation(key)?;
-            match client.read_result(key, &wait) {
-                Ok(reply) => record(&out, "recovered-result", &reply)?,
-                Err(error) => println!(
-                    "{}",
-                    serde_json::json!({"event":"recovered-result-error","error":format!("{error:?}")})
-                ),
-            }
-        }
+    if mode.is_some_and(|mode| mode == "inspect" || mode == "reconnect-readonly") {
         if mode == Some("reconnect-readonly") {
             let state = client.disconnect();
             client = Client::resume(connector.open()?, state);
@@ -210,7 +186,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 || f.axis_error_raw != 0
                 || !f.driver_state.qualified
                 || f.driver_state.stale
-                || f.facts.retained_result
                 || f.facts.unknown_effect
                 || f.facts.device_operation_pending
             {
@@ -236,40 +211,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::fs::write(out.join("candidate.json"), &candidate)?;
         println!(
             "{}",
-            serde_json::json!({"event":"save-preflight","original_bytes":original.len(),"candidate_bytes":candidate.len(),"same_json_value":true,"reset":false})
+            serde_json::json!({"event":"save-preflight","original_bytes":original.len(),"candidate_bytes":candidate.len(),"same_json_value":true,"restart_after_admission":true})
         );
-        let saved = match client.save_and_readback(&candidate, &wait) {
-            Ok(saved) => saved,
+        let submission = match client.save_and_restart(&candidate, &wait) {
+            Ok(submission) => submission,
             Err(error) => {
                 eprintln!(
                     "{}",
-                    serde_json::json!({"event":"save-failed","error":format!("{error:?}"),"adapter":format!("{:?}",client.adapter_status()),"transport":format!("{:?}",client.transport_status())})
+                    serde_json::json!({"event":"save-submission-error","error":format!("{error:?}"),"adapter":format!("{:?}",client.adapter_status()),"transport":format!("{:?}",client.transport_status())})
                 );
-                if let Ok(reply) = client.identify(None, &wait) {
-                    record(&out, "identity-after-save-failure", &reply)?;
-                }
-                if let Ok(reply) = client.status(&wait) {
-                    record(&out, "status-after-save-failure", &reply)?;
-                }
                 return Err(error.into());
             }
         };
-        record(&out, "saved-readback", &saved.readback)?;
         println!(
             "{}",
-            serde_json::json!({"event":"saved","key":format!("{:?}",saved.submission.key),"local":format!("{:?}",saved.submission.local),"firmware":format!("{:?}",saved.result),"exact_readback":true})
+            serde_json::json!({"event":"save-and-restart-local","local":format!("{submission:?}"),"effect":"unknown; reconnect and read actual configuration"})
         );
-        let key = saved.submission.key;
-        println!(
-            "{}",
-            serde_json::json!({"event":"release-local","facts":format!("{:?}",client.release_result(&wait)?)})
-        );
-        std::thread::sleep(Duration::from_millis(100));
-        client.confirm_released(key, &wait)?;
-        println!(
-            "{}",
-            serde_json::json!({"event":"release-confirmed","key":format!("{:?}",key)})
-        );
+        client.close();
+        return Ok(());
     }
     if mode == Some("reconnect") {
         let state = client.disconnect();

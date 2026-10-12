@@ -87,18 +87,10 @@ enum Command {
         #[arg(long, default_value = "user")]
         view: String,
     },
-    ConfigSave {
+    SaveAndRestart {
         file: PathBuf,
     },
-    RestoreFactory,
-    Result {
-        #[arg(long)]
-        operation_key: String,
-    },
-    Release {
-        #[arg(long)]
-        operation_key: String,
-    },
+    RestoreFactoryAndRestart,
     ResetApplication,
     EnterUpdate,
     /// 纯本地等待；不发送查询、心跳或控制。
@@ -143,7 +135,6 @@ enum DeviceCommand {
 #[derive(Subcommand)]
 enum ConfigCommand {
     Check { file: PathBuf },
-    Validate { file: PathBuf },
 }
 
 #[derive(Default)]
@@ -172,18 +163,6 @@ impl Session {
                 configuration::check_file(&file)?;
                 return Ok(true);
             }
-            Command::Config {
-                command: ConfigCommand::Validate { file },
-            } => {
-                let record = read_record(&file)?;
-                print_result(
-                    &self
-                        .tool
-                        .execute(SessionCommand::ConfigValidate { record })
-                        .map_err(|error| error.to_string())?,
-                )?;
-                return Ok(true);
-            }
             Command::Device { command } => return self.device(command),
             Command::Status => SessionCommand::Status,
             Command::Measurements => SessionCommand::Measurements,
@@ -206,16 +185,10 @@ impl Session {
             },
             Command::Stop => SessionCommand::Stop,
             Command::ConfigRead { view } => SessionCommand::ConfigRead { view },
-            Command::ConfigSave { file } => SessionCommand::ConfigSave {
+            Command::SaveAndRestart { file } => SessionCommand::ConfigSaveAndRestart {
                 record: read_record(&file)?,
             },
-            Command::RestoreFactory => SessionCommand::RestoreFactory,
-            Command::Result { operation_key } => {
-                SessionCommand::MaintenanceResult { operation_key }
-            }
-            Command::Release { operation_key } => {
-                SessionCommand::MaintenanceRelease { operation_key }
-            }
+            Command::RestoreFactoryAndRestart => SessionCommand::RestoreFactoryAndRestart,
             Command::ResetApplication => SessionCommand::ResetApplication,
             Command::EnterUpdate => SessionCommand::EnterUpdate,
             Command::Wait { seconds } => {

@@ -56,8 +56,7 @@ decode_enum!(
     Position,
     Pressure,
     ConfigStore,
-    Platform,
-    Maintenance
+    Platform
 );
 decode_enum!(
     DiagnosticObject,
@@ -83,11 +82,6 @@ decode_enum!(
     SendCalled,
     WaitingFeedback,
     WaitingExit,
-    FormatParse,
-    StorageReplacement,
-    ActualReadback,
-    ResultDelivery,
-    ApplicationHandoff,
     ResourceRecovery
 );
 decode_enum!(
@@ -113,7 +107,7 @@ decode_enum!(
     TurnsPerSecond,
     Bytes
 );
-decode_enum!(ConfigView, Factory, UserRecord, Startup, Communication);
+decode_enum!(ConfigView, Factory, UserRecord, Startup);
 decode_enum!(
     ConfigRecordState,
     Complete,
@@ -125,30 +119,13 @@ decode_enum!(
     ViewUnavailable
 );
 decode_enum!(
-    MaintenanceOperation,
-    SaveConfig,
-    RestoreFactory,
-    ResetApplication,
-    EnterUpdate
-);
-decode_enum!(
-    MaintenanceState,
-    NotStarted,
-    Started,
-    InProgress,
-    FirmwareStepComplete,
-    Failed,
-    WaitingDeadline,
-    ResultUnknown,
-    ApplicationHandoffStarted
-);
-decode_enum!(
     UnavailableSubject,
     Identity,
     Status,
     Measurements,
     Diagnostics,
     Config,
-    OperationResult,
-    ResultRelease
+    SaveAndRestart,
+    ResetApplication,
+    EnterUpdate
 );

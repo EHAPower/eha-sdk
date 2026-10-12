@@ -1,6 +1,6 @@
 // Copyright The eha-sdk Contributors
 
-use protocol::{Direction, MAX_MESSAGE_LEN, crc32c};
+use protocol::{Direction, MAX_MESSAGE_LEN};
 use transport::usb::*;
 
 use super::common::*;
@@ -8,11 +8,7 @@ use super::common::*;
 #[test]
 fn maximum_message_uses_65_long_blocks_without_copying_partial_ranges() {
     let mut message = [0; MAX_MESSAGE_LEN];
-    message[..4].copy_from_slice(&[2, 0x94, 0x30, 0x40]);
-    message[4..8].copy_from_slice(&1_u32.to_le_bytes());
-    message[40..44].copy_from_slice(&16_384_u32.to_le_bytes());
-    let crc = crc32c(&message[..MAX_MESSAGE_LEN - 4]);
-    message[MAX_MESSAGE_LEN - 4..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(maximum_config_data(&mut message), MAX_MESSAGE_LEN);
 
     let mut tx_heartbeat = [0; 8];
     let mut tx_short = [0; 256];
@@ -58,7 +54,7 @@ fn maximum_message_uses_65_long_blocks_without_copying_partial_ranges() {
 
 #[test]
 fn discard_completed_reuses_the_completed_long_lane_and_keeps_its_guard() {
-    let message = maximum_host_config();
+    let message = maximum_save_and_restart();
     let mut tx_heartbeat = [0; 8];
     let mut tx_short = [0; 256];
     let mut tx_large = [0; MAX_MESSAGE_LEN];
@@ -101,7 +97,7 @@ fn discard_completed_reuses_the_completed_long_lane_and_keeps_its_guard() {
 
 #[test]
 fn discard_completed_does_not_abandon_an_assembling_long_lane() {
-    let message = maximum_host_config();
+    let message = maximum_save_and_restart();
     let mut tx_heartbeat = [0; 8];
     let mut tx_short = [0; 256];
     let mut tx_large = [0; MAX_MESSAGE_LEN];
@@ -153,7 +149,7 @@ fn discard_completed_does_not_abandon_an_assembling_long_lane() {
 
 #[test]
 fn long_transfer_allows_heartbeat_and_short_blocks_between_its_fragments() {
-    let long_message = maximum_host_config();
+    let long_message = maximum_save_and_restart();
     let mut long_h = [0; 8];
     let mut long_s = [0; 256];
     let mut long_l = [0; MAX_MESSAGE_LEN];
@@ -228,7 +224,7 @@ fn long_transfer_allows_heartbeat_and_short_blocks_between_its_fragments() {
 
 #[test]
 fn long_deadline_is_absolute_and_phase_cleanup_keeps_its_guard() {
-    let message = maximum_host_config();
+    let message = maximum_save_and_restart();
     let mut tx_h = [0; 8];
     let mut tx_s = [0; 256];
     let mut tx_l = [0; MAX_MESSAGE_LEN];

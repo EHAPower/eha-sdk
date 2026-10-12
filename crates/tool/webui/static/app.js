@@ -38,8 +38,6 @@ const connectionFormSources = { usb:null, can:null };
 const discovering = new Set();
 let localControlSubmission = null;
 let configDraft = { dirty:false, source:null, baseline:"" };
-let operationKeySource = null;
-let operationKeyManual = false;
 let renderedDiagnostics;
 let renderedOdrive;
 const chartController = createTelemetryChart({
@@ -386,9 +384,6 @@ function updateActionAvailability() {
   setDisabled('[data-action="heartbeat_stop"]', locked || !active || !heartbeat.enabled);
   setDisabled("#validate-config", busy || trialLocked);
   setDisabled("#discover-odrive, #read-odrive, #odrive-serial", busy || odriveBusy || discovering.has("odrive"));
-  $("#operation-key").disabled = busy || !active;
-  const hasOperationKey = Boolean($("#operation-key").value.trim());
-  setDisabled("#query-result, #release-result", locked || !active || !hasOperationKey || trialLocked);
   $("#config-record").disabled = busy || trialLocked;
   setDisabled("#config-import, #config-export", busy || trialLocked);
   setDisabled("#config-fields input, #config-fields select", busy || trialLocked);
@@ -466,7 +461,7 @@ async function get(path, { timeout = 0 } = {}) {
   } finally { if (timer) window.clearTimeout(timer); }
 }
 function actionLabel(action) {
-  return ({status:"读取状态", measurements:"读取测量", diagnostics:"读取诊断", heartbeat_start:"启用心跳", heartbeat_stop:"停止心跳", heartbeat_once:"发送一次心跳", position:"提交位置目标", velocity:"提交速度目标", force:"提交力目标", impedance:"提交阻抗目标", stop:"停止控制", config_read:"读取配置", config_validate:"校验配置", config_save:"保存配置", restore_factory:"恢复出厂配置", maintenance_result:"查询维护结果", maintenance_release:"释放维护结果", reset_application:"请求应用复位", enter_update:"请求进入更新入口"})[action] || action || "操作";
+  return ({status:"读取状态", measurements:"读取测量", diagnostics:"读取诊断", heartbeat_start:"启用心跳", heartbeat_stop:"停止心跳", heartbeat_once:"发送一次心跳", position:"提交位置目标", velocity:"提交速度目标", force:"提交力目标", impedance:"提交阻抗目标", stop:"停止控制", config_read:"读取配置", config_validate:"校验配置", config_save_and_restart:"保存并重启", restore_factory_and_restart:"恢复出厂并重启", reset_application:"请求应用复位", enter_update:"请求进入更新入口"})[action] || action || "操作";
 }
 function renderOperationSummary(body, fallback, state = "success") {
   const data = body.error || body.result || body.data;
@@ -478,23 +473,8 @@ function renderOperationSummary(body, fallback, state = "success") {
   $("#operation-summary").hidden = false;
   $("#operation-title").textContent = `${transportLabel(body.transport || activeTransport)} · ${actionLabel(action)}${state === "working" ? "进行中" : unknown ? "结果未知" : state === "error" ? "失败" : ""}`;
   const control = ["position", "velocity", "force", "impedance", "stop"].includes(resultBody.action);
-  const readback = resultBody.data?.readback;
-  $("#operation-detail").textContent = unknown ? "未得到可确认的结果；恢复通信后核对当前事实，有维护操作键时可只读查询。" : state === "error" ? (body.message || fallback) : readback ? action === "restore_factory" ? "已恢复出厂记录并读回，编辑器已更新为读回内容。" : "已保存并核对读回，编辑器已更新为读回内容。" : local ? control ? `已本地提交（${local.boundary}）；请对照固件当前目标与输出状态。` : `已本地提交（${local.boundary}）；请查看维护结果与实际读回。` : (body.message || fallback);
+  $("#operation-detail").textContent = unknown ? "未得到本地提交结论；请显式恢复通信并核对当前事实。" : state === "error" ? (body.message || fallback) : local ? control ? `已本地提交（${local.boundary}）；请对照固件当前目标与输出状态。` : `已本地提交（${local.boundary}）；设备效果待显式重连或查询核对。` : (body.message || fallback);
   $("#operation-summary").className = `operation-summary is-${unknown ? "warning" : state}`;
-  const link = $("#operation-link");
-  link.hidden = !body.operation_key && !body.result?.operation_key;
-}
-function setOperationKey(key, source = snapshot, transport = activeTransport) {
-  if (!key) return;
-  if (transport !== activeTransport) {
-    const view = viewStates[transport] ||= {};
-    Object.assign(view, { operationKey:key, operationKeySource:sourceKey(source), operationKeyManual:false, keyState:"本次会话的维护操作键；切换对象后会保留但标为历史。" });
-    return;
-  }
-  $("#operation-key").value = key;
-  operationKeySource = sourceKey(source);
-  operationKeyManual = false;
-  $("#operation-key-state").textContent = `本次会话的维护操作键；切换对象后会保留但标为历史。`;
 }
 function sourceKey(value = snapshot) {
   const identity = value?.identity;
@@ -506,23 +486,20 @@ function updateDraftState() {
   else if (configDraft.source !== current) state.textContent = "此草稿来自另一设备或运行实例；保存到当前设备前会再次确认。";
   else state.textContent = `${configDraft.viewLabel || "已读取配置"}，来自当前已核对设备${configDraft.dirty ? "；已修改" : ""}。`;
   if (configDraft.warning) state.textContent += " " + configDraft.warning;
-  if (operationKeySource && operationKeySource !== current) $("#operation-key-state").textContent = "此操作键来自另一设备或运行实例；仍可明确查询，不会自动重发。";
 }
 function showResult(body, label, state = "success") {
   if (body.error) result.textContent = json(body.error);
   else if (body.result) result.textContent = json(body.result);
   else if (body.data) result.textContent = json(body.data);
   else if (body.results || body.nodes || body.trial || body.recording) result.textContent = json(body.results || body.nodes || body.trial || body.recording);
-  const key = body.operation_key || body.result?.operation_key;
-  if (key) setOperationKey(key, body.snapshot || snapshot, body.transport || activeTransport);
   const action = body.result?.action;
-  const config = action === "config_read" ? body.result.data : ["config_save", "restore_factory"].includes(action) ? body.result.data?.readback : null;
+  const config = action === "config_read" ? body.result.data : null;
   if (typeof config?.data_utf8 === "string") {
     const record = $("#config-record");
     const overwrite = action !== "config_read" || !configDraft.dirty || !record.value || window.confirm("当前草稿已有未保存修改。读取的配置将覆盖它，是否继续？");
     if (overwrite) {
       record.value = config.data_utf8;
-      configDraft = { dirty:false, source:sourceKey(body.snapshot || snapshot), view:config.view, viewLabel:action === "restore_factory" ? "已恢复出厂并读回用户配置" : config.view_label, warning:null, baseline:config.data_utf8 };
+      configDraft = { dirty:false, source:sourceKey(body.snapshot || snapshot), view:config.view, viewLabel:config.view_label, warning:null, baseline:config.data_utf8 };
       configEditor.setDocument(config.data_utf8, configDraft.source, configDraft.baseline);
       updateDraftState();
     }
@@ -561,10 +538,6 @@ async function run(path, payload, label) {
       localControlSubmission = { action:payload.action, parameters:Object.fromEntries(Object.entries(payload).filter(([key]) => !["action", "transport"].includes(key))), boundary:body.result.local_submission.boundary, source:sourceKey(snapshot) };
       update(snapshot, false, !odriveBusy && odriveEpoch === odriveRequestEpoch);
     }
-    if (payload.action === "maintenance_release") {
-      $("#operation-key").value = ""; operationKeySource = null; operationKeyManual = false;
-      $("#operation-key-state").textContent = "已提交释放并完成确认；操作键已从输入框清除。";
-    }
     showResult(body, label);
     setNotice(connectionNotice || `${label}：${body.message || "已完成。"}`, body.unknown ? "is-warning" : "");
     return body;
@@ -577,10 +550,9 @@ async function run(path, payload, label) {
       unavailable();
       renderOperationSummary({ transport, action:payload.action, error:{message:error.message}, unknown:true }, label, "warning");
     }
-    if (detail?.operation_key) setOperationKey(detail.operation_key, detail.snapshot || snapshot, transport);
     const network = !detail;
     const guidance = connectionErrorGuidance(detail?.error?.code || detail?.code);
-    setNotice(network ? `${label}未得到服务响应；未判断是否提交或执行，请先恢复服务后查看事实。` : detail.unknown ? `${label}结果未知：${error.message}；保留操作键后只读查询。` : `${label}失败：${guidance || error.message}`, network || detail?.unknown ? "is-warning" : "is-error");
+    setNotice(network ? `${label}未得到服务响应；未判断是否提交或执行，请先恢复服务后查看事实。` : detail.unknown ? `${label}结果未知：${error.message}；请显式恢复通信并核对当前事实。` : `${label}失败：${guidance || error.message}`, network || detail?.unknown ? "is-warning" : "is-error");
     return null;
   } finally {
     setBusy(false);
@@ -739,7 +711,6 @@ function update(nextSnapshot, cached = false, renderOdrive = true) {
   facts($("#heartbeat"), [["已启用", heartbeat.enabled], ["本地提交数", heartbeat.submitted], ["调度遗漏数", heartbeat.missed], ["最后错误", heartbeat.error]], "尚未取得心跳状态。");
   $("#observations").textContent = json({ status:snapshot.last_status, measurements:snapshot.last_measurements, diagnostics:snapshot.last_diagnostics, transport:snapshot.transport });
   renderDiagnostics(snapshot.last_diagnostics);
-  if (snapshot.pending_operation_key && !operationKeyManual && document.activeElement !== $("#operation-key")) setOperationKey(snapshot.pending_operation_key, snapshot);
   if (renderOdrive && snapshot.odrive_usb) renderOdriveResponse(snapshot.odrive_usb);
   updateDraftState();
   updateActionAvailability();
@@ -823,8 +794,7 @@ function selectTransport(transport, { force = false, announce = true, node = act
   if ((busy && !force) || (transport === activeTransport && !force)) return false;
   const priorKey = viewKey();
   viewStates[priorKey] = {
-    record:$("#config-record").value, configDraft, operationKey:$("#operation-key").value,
-    operationKeySource, operationKeyManual, keyState:$("#operation-key-state").textContent, localControlSubmission,
+    record:$("#config-record").value, configDraft, localControlSubmission,
     controlMode:$("input[name=control-mode]:checked").value,
     controlValues:$$(".command-form input").map((input) => input.value),
   };
@@ -837,10 +807,6 @@ function selectTransport(transport, { force = false, announce = true, node = act
   $("#config-record").value = view?.record || "";
   configDraft = view?.configDraft || { dirty:false, source:null, baseline:"" };
   configEditor.setDocument($("#config-record").value, configDraft.source, configDraft.baseline || "");
-  $("#operation-key").value = view?.operationKey || "";
-  operationKeySource = view?.operationKeySource || null;
-  operationKeyManual = view?.operationKeyManual || false;
-  $("#operation-key-state").textContent = view?.keyState || "操作键尚未关联本页会话。";
   localControlSubmission = view?.localControlSubmission || null;
   const mode = view?.controlMode || "position";
   $('input[name=control-mode][value="' + mode + '"]').checked = true;
@@ -942,17 +908,9 @@ $("#config-record").addEventListener("input", () => { configDraft.dirty = true; 
 $("#validate-config").addEventListener("click", () => command("config_validate", { record:$("#config-record").value }));
 $("#save-config").addEventListener("click", () => {
   if (configDraft.source && configDraft.source !== sourceKey() && !window.confirm("此草稿来自另一设备或运行实例。确认将它保存到当前已核对设备吗？")) return;
-  command("config_save", { record:$("#config-record").value });
+  command("config_save_and_restart", { record:$("#config-record").value });
 });
-$("#restore-factory").addEventListener("click", () => command("restore_factory"));
-$("#operation-key").addEventListener("input", () => {
-  operationKeyManual = true;
-  operationKeySource = null;
-  $("#operation-key-state").textContent = "手动输入的操作键；只会在你明确查询或释放时使用。";
-  updateActionAvailability();
-});
-$("#query-result").addEventListener("click", () => command("maintenance_result", { operation_key:$("#operation-key").value.trim() }));
-$("#release-result").addEventListener("click", () => command("maintenance_release", { operation_key:$("#operation-key").value.trim() }));
+$("#restore-factory").addEventListener("click", () => command("restore_factory_and_restart"));
 $("#reset-application").addEventListener("click", () => command("reset_application"));
 $("#enter-update").addEventListener("click", () => command("enter_update"));
 

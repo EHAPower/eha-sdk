@@ -33,7 +33,7 @@ required-features = ["desktop"]
 
 [workspace.package]
 edition = "2024"
-version = "4.0.0-dev.2"
+version = "4.0.0-dev.3"
 license = "MIT"
 
 [profile.release]

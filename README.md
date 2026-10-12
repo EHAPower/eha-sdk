@@ -68,10 +68,9 @@ CAN 与 USB 合计只支持**一个调用方串行提交**，无需等待上一�
 |---|---|---|
 | `LocalSubmission` | CAN 通道 `send` 或 USB 最后一个 Bulk 包在本地完成 | 另观察新鲜状态；不证明 CAN ACK、固件接收、目标采用、驱动执行或运动 |
 | `Reply` | 主机取得并解码回复 | 按回复内容解释；快照不等于当前状态 |
-| `TransportStatus.errors` 增加且 `last_error` 指出普通事件 FIFO 淘汰 | SDK 已因本地有界队列满而丢弃最早的普通事件，可能包括 `Submitted`、`Reply` 或断连通知 | 保留已有本地阶段和维护键；不把缺失误作未提交、已拒绝或成功，不自动重发 |
-| `NotStarted` | 本次维护副作用尚未开始 | 修正条件后以新维护键明确提出下一次操作 |
-| `ResultUnknown` | 已发操作的结果尚不明确 | 保留维护键，重连后 `identify`，查询原结果及实际状态；不自动重发 |
-| 同设备保存读回一致 | 实际记录与候选逐字节一致 | 另行启动后核对采用；不证明已重启或生效 |
+| `TransportStatus.errors` 增加且 `last_error` 指出普通事件 FIFO 淘汰 | SDK 已因本地有界队列满而丢弃最早的普通事件，可能包括 `Submitted`、`Reply` 或断连通知 | 不把缺失误作未提交、已拒绝或成功，不自动重发 |
+| `ResultUnknown` | 本地提交边界不明确，设备副作用可能已经开始 | 不自动重发；重新接入后另行 `identify` 并读取当前实际配置与状态 |
+| `DataUnavailable` | 设备在取走变异请求前明确拒绝本次请求 | 只关联本次 `query_id` 与运行实例；本地提交之后到达的拒绝不改写已经返回的本地提交事实 |
 
 查询和遥测需分别保留数值、质量、来源年龄、快照时间和主机收到时间。缓存、转发或重新读取不刷新数据；过期、断连前或不同运行实例的数据不能当作当前状态。
 
@@ -137,17 +136,17 @@ USB 仅替换为 `UsbConnector::new("完整 USB 序列号")?.open()`。控制前
 
 `configuration::validate_json` 不访问设备。它以 [`eha-config`](crates/config/README.md) 的
 schema、字段表示和纯换算为基础，检查完整记录、跨字段关系、派生值和名义心跳周期；不补齐
-字段、不重排 JSON，也不证明目标固件、现场设备或安装方向匹配。`begin_save` 与
-`save_and_readback` 只报告本地提交、固件结果和同设备实际读回；结果已结清后才可显式
-`release_result` 与 `confirm_released`。
+字段、不重排 JSON，也不证明目标固件、现场设备或安装方向匹配。
 
-Release 只提交一次。`confirm_released` 先等待同一运行实例、提交后新收到且快照时间推进的被动
-`retained_result=false` 事实，再查询原键确认释放；等待期间该 Client 阻止查询、目标和维护请求覆盖 Release。
-显式 Stop 仍可提交，心跳使用独立通道。Stop 可能覆盖尚未取走的 Release，旧 Release 保持未确认；
-此时先观察 Stop 后的新鲜停止事实，再查询释放结果，不能让查询覆盖 Stop。
-超时、取消或断连保留原键和未知结果，不重发。先用 `confirm_released` 继续确认原键，再进行 `identify` 或新维护。
-若带着未确认的 Release 断连后 `resume`，新 backend 尚未核实身份，不能用其遥测放行旧请求；
-`identify` 返回结果未知且不发送查询。旧维护仍未确认，新建会话取得的当前状态不能补证旧 Release。
+`save_and_restart` 先完成这项本地静态检查，再以当前已核对的 UID 和运行实例提交完整记录。
+它只等待本地 I/O 的 `Submitted`，不等待设备读回、重启或采用；若同一 `query_id` 的前置
+`DataUnavailable` 先到，调用返回明确拒绝。提交后才到达的拒绝不留存，超时、取消、断连或
+本地传输中断也不自动重发。保存会结束当前应用，调用方须明确重新接入、`identify` 并读取实际
+记录和启动配置核对后续事实。
+
+`restore_factory_and_restart` 读取已核对设备的 Factory 原字节，完成同一静态检查后走相同的
+`save_and_restart` 提交路径。`reset_application` 和 `enter_update` 同样只报告本地提交。上述
+方法不持有维护键、结果缓存、释放门槛或重连任务。
 
 ## 独立 ODrive 读取
 
@@ -164,8 +163,8 @@ Release 只提交一次。`confirm_released` 先等待同一运行实例、提�
 cargo run -p eha-sdk --example reconnect_readonly -- usb <完整 USB 序列号>
 ```
 
-[`board_check`](examples/board_check.rs) 通过公开 SDK 查询、心跳、停止和维护读回；它不创建
-运动目标。USB 的实际调用形式为 `cargo run -p eha-sdk --example board_check -- usb SERIAL OUTDIR`；
+[`board_check`](examples/board_check.rs) 通过公开 SDK 查询、心跳、停止和保存并重启的本地提交记录
+事实；它不创建运动目标。USB 的实际调用形式为 `cargo run -p eha-sdk --example board_check -- usb SERIAL OUTDIR`；
 `decode` 模式只解码已有原始回复，示例不自动复位或重发。
 
 构建与软件检查统一按[贡献指南](CONTRIBUTING.md#构建与检查)执行，并按改动影响选择范围。
