@@ -1,0 +1,3 @@
+# Copyright The eha-sdk Contributors
+# eha-tool 外部 CAN 通道运行时；包含串口后端依赖。
+python-can[serial]>=4.6.1,<5

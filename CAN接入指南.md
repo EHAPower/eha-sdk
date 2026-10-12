@@ -26,8 +26,16 @@ CAN 适配器是操作系统和驱动的资源，不是 EHA SDK 或官方工具�
 
 Python 不是公共协议或 Rust SDK 的必需依赖。Rust 应用可以通过 `CanChannelFactory` 接入自己的系统服务或驱动。官方工具当前选择 `python-can`，用于复用其多种设备后端及统一的帧接口；这是第三方驱动接入方案，并非三个操作系统共同提供的原生 CAN 标准。选择该方案需部署 Python 运行时，并承担进程通信开销；具体平台、设备与帧格式的可用性仍由外部驱动决定。
 
-官方 `eha-tool` 将 `--can-channel CONTEXT` 交给一个持久的通用 `python-can` 进程。该进程使用
-`python-can>=4.6.1,<5` 的命名配置上下文打开驱动，转发原始帧，并在关闭时释放该通道；它不包含任何适配器的专用协议。可在驱动的 `can.conf`／`can.ini` 中定义上下文，例如：
+官方工具需要 Python 3.9+，运行依赖由 [requirements.txt](requirements.txt) 维护，包含 CAN 库及串口后端依赖。首次部署时，在 SDK 仓库根目录安装到持久虚拟环境；已有环境可直接使用其 Python 执行安装，后续启动无需重复安装：
+
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+CLI／Shell 的 `--can-python` 或 WebUI 的“Python 路径”填写该环境解释器的绝对路径，例如 `/path/to/eha-sdk/.venv/bin/python`。Windows 使用 `.venv\Scripts\python.exe`。路径属于运行工具的主机；未指定时使用工具进程 `PATH` 中的 `python3`。
+
+官方 `eha-tool` 将 `--can-channel CONTEXT` 交给一个持久的通用 `python-can` 进程。该进程使用命名配置上下文打开驱动，转发原始帧，并在关闭时释放该通道；它不包含任何适配器的专用协议。Linux／macOS 可将上下文保存在运行工具用户的 `~/can.conf`，Windows 可使用 `%USERPROFILE%/can.conf`；无需包装脚本。例如：
 
 ```ini
 [EHA_PRODUCTION]
@@ -35,6 +43,8 @@ interface = <外部驱动接口名>
 channel = <该驱动的通道>
 fd = true
 ```
+
+CLI／Shell 的 `--can-channel` 或 WebUI 的“外部 CAN 通道”填写 `EHA_PRODUCTION`，不是配置文件或设备路径。节点号与帧形态另按控制器实际启动配置填写。
 
 也可为隔离部署设置 `CAN_CONFIG_EHA_PRODUCTION` 为等价 JSON 配置；变量名后缀必须逐字匹配 `--can-channel EHA_PRODUCTION`。每个上下文都应显式给出 `interface` 和 `channel`，避免拼写错误回退到默认通道。权限、终端、仲裁／数据速率和其他驱动属性均由所选驱动的文档决定；示例中的占位符不是可直接使用的驱动设置。参见 [python-can 配置说明](https://python-can.readthedocs.io/en/stable/configuration.html) 与 [总线接口](https://python-can.readthedocs.io/en/stable/bus.html)。
 
