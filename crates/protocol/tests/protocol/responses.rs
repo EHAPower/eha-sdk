@@ -5,7 +5,7 @@ use super::*;
 fn wire(kind: MessageKind, payload: &[u8]) -> Vec<u8> {
     let mut message = Vec::with_capacity(payload.len() + 8);
     message.extend_from_slice(&[
-        1,
+        2,
         kind as u8,
         payload.len() as u8,
         (payload.len() >> 8) as u8,
@@ -42,8 +42,10 @@ fn independent_minimal_response_vectors_cover_every_firmware_type() {
     measurement[72..76].copy_from_slice(&u32::MAX.to_le_bytes());
     measurement[76..80].copy_from_slice(&u32::MAX.to_le_bytes());
     measurement[80..84].copy_from_slice(&u32::MAX.to_le_bytes());
-    let mut diagnostics = [0u8; 36];
+    let mut diagnostics = [0u8; 44];
     diagnostics[..32].copy_from_slice(&response_sample(1));
+    diagnostics[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+    diagnostics[36..40].copy_from_slice(&u32::MAX.to_le_bytes());
     let mut config = [0u8; 48];
     config[..32].copy_from_slice(&response_sample(1));
     config[32] = 1;
@@ -105,6 +107,8 @@ fn independent_minimal_response_vectors_cover_every_firmware_type() {
                 );
             }
             Message::Response(Response::Diagnostics(view)) => {
+                assert_eq!(view.decision_age_us(), u32::MAX);
+                assert_eq!(view.device_evidence_age_us(), u32::MAX);
                 assert!(view.entries().next().is_none())
             }
             Message::Response(Response::ConfigData(view)) => {
@@ -138,11 +142,12 @@ fn independent_minimal_response_vectors_cover_every_firmware_type() {
 
 #[test]
 fn diagnostic_without_operation_rejects_a_real_deadline() {
-    let mut payload = [0u8; 100];
+    let mut payload = [0u8; 108];
     payload[..32].copy_from_slice(&response_sample(1));
-    payload[32..34].copy_from_slice(&1u16.to_le_bytes());
+    payload[40..42].copy_from_slice(&1u16.to_le_bytes());
     // Entry offset16 is started_time_us and offset24 is deadline_us.
-    payload[52..60].copy_from_slice(&u64::MAX.to_le_bytes());
+    payload[60..68].copy_from_slice(&u64::MAX.to_le_bytes());
+    payload[68..76].copy_from_slice(&1u64.to_le_bytes());
     let message = wire(MessageKind::Diagnostics, &payload);
     assert_eq!(
         validate(&message, Direction::FirmwareToHost),

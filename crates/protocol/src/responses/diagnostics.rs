@@ -288,6 +288,10 @@ pub struct DiagnosticFields {
 pub struct DiagnosticsFields<'a> {
     /// 共同回复快照。
     pub sample: SampleData,
+    /// 最近完整控制周期决策副本的年龄；未知为 `u32::MAX`。
+    pub decision_age_us: u32,
+    /// 固件捕获设备执行者事实副本的年龄；未知为 `u32::MAX`。
+    pub device_evidence_age_us: u32,
     /// 是否还有未逐项列出的诊断。
     pub overflow: bool,
     /// 最多16条有序诊断。
@@ -300,7 +304,7 @@ impl DiagnosticsFields<'_> {
         if self.entries.len() > 16 {
             return Err(Error::InvalidPayloadLength);
         }
-        let payload_length = 36usize
+        let payload_length = 44usize
             .checked_add(
                 self.entries
                     .len()
@@ -320,11 +324,13 @@ pub fn encode_diagnostics(
     let length = fields.encoded_len()?;
     let p = payload(output, length - 8)?;
     write_sample(p, fields.sample);
-    put_u16(p, 32, fields.entries.len() as u16);
-    p[34] = fields.overflow as u8;
-    p[35] = 0;
+    put_u32(p, 32, fields.decision_age_us);
+    put_u32(p, 36, fields.device_evidence_age_us);
+    put_u16(p, 40, fields.entries.len() as u16);
+    p[42] = fields.overflow as u8;
+    p[43] = 0;
     for (index, entry) in fields.entries.iter().enumerate() {
-        write_diagnostic(&mut p[36 + index * 64..100 + index * 64], entry);
+        write_diagnostic(&mut p[44 + index * 64..108 + index * 64], entry);
     }
     encode_in_place(MessageKind::Diagnostics, length - 8, output)
 }

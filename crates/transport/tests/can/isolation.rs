@@ -207,7 +207,7 @@ fn first_fragment_replacement_and_invalid_frames_preserve_or_guard_the_right_gro
                     can_id(1, Direction::HostToFirmware, Lane::Short, 1, 0),
                     false,
                     8,
-                    &[2, 1, 4, 0, 0, 0, 0, 0],
+                    &[3, 1, 4, 0, 0, 0, 0, 0],
                 ),
                 1,
                 0,

@@ -38,7 +38,9 @@ fn fields(response: Response<'_>) -> String {
         Response::Status(v) | Response::Telemetry(v) => format!("{:?}", v.fields()),
         Response::Measurements(v) => format!("{:?}", v.fields()),
         Response::Diagnostics(v) => format!(
-            "overflow={} entries={:?}",
+            "decision_age_us={} device_evidence_age_us={} overflow={} entries={:?}",
+            v.decision_age_us(),
+            v.device_evidence_age_us(),
             v.overflow(),
             v.entries().map(|v| v.fields()).collect::<Vec<_>>()
         ),

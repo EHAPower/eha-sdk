@@ -8,7 +8,7 @@ use super::common::*;
 #[test]
 fn maximum_message_uses_65_long_blocks_without_copying_partial_ranges() {
     let mut message = [0; MAX_MESSAGE_LEN];
-    message[..4].copy_from_slice(&[1, 0x94, 0x30, 0x40]);
+    message[..4].copy_from_slice(&[2, 0x94, 0x30, 0x40]);
     message[4..8].copy_from_slice(&1_u32.to_le_bytes());
     message[40..44].copy_from_slice(&16_384_u32.to_le_bytes());
     let crc = crc32c(&message[..MAX_MESSAGE_LEN - 4]);

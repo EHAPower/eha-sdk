@@ -33,7 +33,7 @@ fn config_data_preserves_raw_invalid_utf8_at_the_maximum_message_length() {
     data[..4].copy_from_slice(&[0xff, 0x80, 0, 0xfe]);
     let length = writer.finish().expect("原始记录无需UTF-8或JSON解析");
     assert_eq!(length, 16_440);
-    assert_eq!(&output[..4], &[1, 0x94, 0x30, 0x40]);
+    assert_eq!(&output[..4], &[2, 0x94, 0x30, 0x40]);
     assert_eq!(
         &output[36..52],
         &[1, 2, 1, 3, 0, 64, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0]
@@ -69,7 +69,7 @@ fn communication_settings_are_a_typed_twenty_byte_config_projection() {
     let length = encode_communication_settings(fields, settings, &mut output)
         .expect("通信视图具有确定的二十字节投影");
     assert_eq!(length, 76);
-    assert_eq!(&output[..4], &[1, 0x94, 68, 0]);
+    assert_eq!(&output[..4], &[2, 0x94, 68, 0]);
     assert_eq!(
         &output[36..52],
         &[3, 0, 1, 0, 20, 0, 0, 0, 99, 0, 0, 0, 0, 0, 0, 0]
@@ -157,7 +157,7 @@ fn operation_result_matches_the_contract_13_2_fixed_fields() {
         0, 0, 0, 0x45, 0x73, 0xaf, 0x93, 3, 0, 0, 0,
     ];
     assert_eq!(length, 96);
-    assert_eq!(&output[..4], &[1, 0x95, 88, 0]);
+    assert_eq!(&output[..4], &[2, 0x95, 88, 0]);
     assert_eq!(&output[36..92], expected_tail);
     assert!(validate(&output, Direction::FirmwareToHost).is_ok());
 }
@@ -180,7 +180,7 @@ fn data_unavailable_has_a_named_subject_and_maintenance_association() {
     );
     let length = encode_data_unavailable(&fields, &mut output).expect("不可取得事实符合合同");
     assert_eq!(length, 56);
-    assert_eq!(&output[..4], &[1, 0x96, 48, 0]);
+    assert_eq!(&output[..4], &[2, 0x96, 48, 0]);
     assert_eq!(
         &output[36..52],
         &[5, 7, 3, 1, 0, 1, 0, 0, 42, 0, 0, 0, 0, 0, 0, 0]

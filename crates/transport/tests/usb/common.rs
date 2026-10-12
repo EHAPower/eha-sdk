@@ -3,8 +3,8 @@
 use protocol::{Direction, MAX_MESSAGE_LEN, Message, OperationKey, encode};
 use transport::usb::{Lane, ReceiveEvent, Receiver, RejectReason, SendEvent, Sender};
 
-pub(super) const HEARTBEAT: [u8; 8] = [1, 6, 0, 0, 0x68, 0x17, 0x93, 0x44];
-pub(super) const POSITION: [u8; 12] = [1, 1, 4, 0, 0, 0, 0x20, 0x41, 0xaf, 0xa9, 0x79, 0xd3];
+pub(super) const HEARTBEAT: [u8; 8] = [2, 6, 0, 0, 0x51, 0x9e, 0xb1, 0x26];
+pub(super) const POSITION: [u8; 12] = [2, 1, 4, 0, 0, 0, 0x20, 0x41, 0xc6, 0x2e, 0x3d, 0x08];
 
 pub(super) fn drain(sender: &mut Sender<'_>, lane: Lane, now_ms: u64) -> Vec<u8> {
     let mut bytes = Vec::new();

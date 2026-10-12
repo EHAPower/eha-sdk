@@ -193,11 +193,11 @@ pub(super) fn validate_measurements(p: &[u8]) -> Result<(), Error> {
 }
 pub(super) fn validate_diagnostics(p: &[u8]) -> Result<(), Error> {
     validate_sample(p, true)?;
-    let count = usize::from(u16_at(p, 32));
-    if count > 16 || p[34] > 1 || p[35] != 0 || p.len() != 36 + count * 64 {
+    let count = usize::from(u16_at(p, 40));
+    if count > 16 || p[42] > 1 || p[43] != 0 || p.len() != 44 + count * 64 {
         return Err(Error::InvalidField);
     }
-    let (entries, []) = p[36..].as_chunks::<64>() else {
+    let (entries, []) = p[44..].as_chunks::<64>() else {
         return Err(Error::InvalidField);
     };
     for e in entries {

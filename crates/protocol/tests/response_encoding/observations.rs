@@ -88,7 +88,7 @@ fn measurements_match_the_contract_13_2_payload_vector() {
     );
     let length = encode_measurements(&fields, &mut output).expect("合同样例可编码");
     assert_eq!(length, 108);
-    assert_eq!(&output[..4], &[1, MessageKind::Measurements as u8, 100, 0]);
+    assert_eq!(&output[..4], &[2, MessageKind::Measurements as u8, 100, 0]);
     assert_eq!(
         &output[4..36],
         &[
@@ -172,7 +172,7 @@ fn telemetry_and_status_write_target_reference_and_independent_ages() {
     );
     let length = encode_telemetry(&fields, &mut telemetry).expect("遥测字段符合合同");
     assert_eq!(length, 160);
-    assert_eq!(&telemetry[..4], &[1, 0x80, 152, 0]);
+    assert_eq!(&telemetry[..4], &[2, 0x80, 152, 0]);
     assert_eq!(&telemetry[36..40], &[21, 0, 0, 0]);
     assert_eq!(&telemetry[40..44], &[1, 1, 3, 0]);
     assert_eq!(
@@ -206,7 +206,7 @@ fn telemetry_and_status_write_target_reference_and_independent_ages() {
     let mut status_fields = fields;
     status_fields.sample.query_id = 19;
     encode_status(&status_fields, &mut status).expect("查询状态要求非零 query_id");
-    assert_eq!(&status[..8], &[1, 0x91, 152, 0, 19, 0, 0, 0]);
+    assert_eq!(&status[..8], &[2, 0x91, 152, 0, 19, 0, 0, 0]);
     assert_eq!(&status[36..156], &telemetry[36..156]);
 }
 
@@ -249,7 +249,7 @@ fn identity_accepts_eight_bounded_strings_at_its_maximum_length() {
     );
     let length = encode_identity(&fields, &mut output).expect("八个最大字符串可编码");
     assert_eq!(length, 528);
-    assert_eq!(&output[..4], &[1, 0x90, 0x08, 0x02]);
+    assert_eq!(&output[..4], &[2, 0x90, 0x08, 0x02]);
     assert_eq!(&output[36..48], &[7; 12]);
     assert_eq!(&output[48..57], &[1, 0, 1, 1, 0x44, 0x33, 0x22, 0x11, 6]);
     assert_eq!(
@@ -307,28 +307,34 @@ fn diagnostics_supports_sixteen_entries_and_rejects_a_seventeenth() {
     let entries = [entry; 16];
     let fields = DiagnosticsFields {
         sample: sample(2),
+        decision_age_us: 17,
+        device_evidence_age_us: u32::MAX,
         overflow: true,
         entries: &entries,
     };
-    let mut output = [0xa5; 1068];
-    assert_eq!(fields.encoded_len(), Ok(1068));
+    let mut output = [0xa5; 1076];
+    assert_eq!(fields.encoded_len(), Ok(1076));
     assert_eq!(
-        encode_diagnostics(&fields, &mut [0; 1067]),
+        encode_diagnostics(&fields, &mut [0; 1075]),
         Err(Error::BufferTooSmall)
     );
     let length = encode_diagnostics(&fields, &mut output).expect("合同上限16条诊断");
-    assert_eq!(length, 1068);
-    assert_eq!(&output[..4], &[1, 0x93, 0x24, 0x04]);
-    assert_eq!(&output[36..40], &[16, 0, 1, 0]);
+    assert_eq!(length, 1076);
+    assert_eq!(&output[..4], &[2, 0x93, 0x2c, 0x04]);
     assert_eq!(
-        &output[40..104],
+        &output[36..44],
+        &[17, 0, 0, 0, u8::MAX, u8::MAX, u8::MAX, u8::MAX]
+    );
+    assert_eq!(&output[44..48], &[16, 0, 1, 0]);
+    assert_eq!(
+        &output[48..112],
         &[
             8, 8, 0x48, 8, 4, 2, 0x10, 0, 11, 0, 0, 0, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 13, 0,
             0, 0, 0, 0, 0, 0, 14, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 6, 0x10, 0, 0, 0, 0, 0x70, 0x41,
             9, 7, 9, 0, 16, 0, 0, 0, 8, 0, 0, 0
         ]
     );
-    assert_eq!(&output[1000..1064], &output[40..104]);
+    assert_eq!(&output[1008..1072], &output[48..112]);
     assert!(validate(&output, Direction::FirmwareToHost).is_ok());
     let too_many = [entry; 17];
     let mut oversized = [0u8; 1132];
@@ -336,6 +342,8 @@ fn diagnostics_supports_sixteen_entries_and_rejects_a_seventeenth() {
         encode_diagnostics(
             &DiagnosticsFields {
                 sample: sample(2),
+                decision_age_us: 0,
+                device_evidence_age_us: 0,
                 overflow: true,
                 entries: &too_many
             },

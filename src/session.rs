@@ -14,7 +14,7 @@ pub type MaintenanceKey = protocol::OperationKeyFields;
 /// 公共协议当前版本。
 ///
 /// `protocol` 在解码时已经拒绝其他版本；此常量供宿主接入说明其会话所使用的版本。
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// 本地会话不能继续生成合同所需标识或尚未取得对象身份。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

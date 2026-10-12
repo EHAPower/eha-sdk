@@ -22,7 +22,7 @@ pub(super) fn payload_len_is_valid(kind: MessageKind, n: usize) -> bool {
         MessageKind::Telemetry | MessageKind::Status => n == 152,
         MessageKind::Identity => (100..=520).contains(&n),
         MessageKind::Measurements => n == 100,
-        MessageKind::Diagnostics => (36..=1060).contains(&n) && (n - 36).is_multiple_of(64),
+        MessageKind::Diagnostics => (44..=1068).contains(&n) && (n - 44).is_multiple_of(64),
         MessageKind::ConfigData => (48..=16_432).contains(&n),
         MessageKind::OperationResult => n == 88,
         MessageKind::DataUnavailable => n == 48,

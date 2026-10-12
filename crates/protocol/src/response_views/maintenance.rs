@@ -71,14 +71,22 @@ impl<'a> Diagnostics<'a> {
             bytes: &self.payload[..32],
         }
     }
+    /// 最近完整控制周期决策副本的年龄；`u32::MAX` 表示未知。
+    pub fn decision_age_us(self) -> u32 {
+        u32_at(self.payload, 32)
+    }
+    /// 固件捕获设备执行者事实副本的年龄；`u32::MAX` 表示未知。
+    pub fn device_evidence_age_us(self) -> u32 {
+        u32_at(self.payload, 36)
+    }
     /// 是否还有未逐项列出的诊断。
     pub fn overflow(self) -> bool {
-        self.payload[34] != 0
+        self.payload[42] != 0
     }
     /// 有界、借用的诊断迭代器；每项通过 [`DiagnosticEntry::fields`] 读取。
     pub fn entries(self) -> DiagnosticEntries<'a> {
         DiagnosticEntries {
-            bytes: &self.payload[36..],
+            bytes: &self.payload[44..],
             at: 0,
         }
     }

@@ -4,7 +4,7 @@
 pub const MAX_MESSAGE_LEN: usize = 16_440;
 /// 公共载荷的最大字节数。
 pub const MAX_PAYLOAD_LEN: usize = MAX_MESSAGE_LEN - 8;
-pub(super) const VERSION: u8 = 1;
+pub(super) const VERSION: u8 = 2;
 
 /// 公共消息所在的应用方向。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

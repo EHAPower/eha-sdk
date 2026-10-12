@@ -2574,7 +2574,7 @@ fn reply_json(reply: &Reply) -> Result<Value, SessionError> {
                 .entries()
                 .map(|entry| diagnostic_entry_json(entry.fields()))
                 .collect();
-            json!({"kind":"diagnostics","received_age_ms":age_ms,"sample":sample_view_json(response.sample()),"overflow":response.overflow(),"entries":entries})
+            json!({"kind":"diagnostics","received_age_ms":age_ms,"sample":sample_view_json(response.sample()),"decision_age_us":response.decision_age_us(),"device_evidence_age_us":response.device_evidence_age_us(),"overflow":response.overflow(),"entries":entries})
         }
         Response::ConfigData(response) => {
             let fields = response.fields();

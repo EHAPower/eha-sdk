@@ -80,7 +80,7 @@ fn full_message_requires_exact_length_and_crc() {
 
 #[test]
 fn non_finite_target_is_rejected_even_with_valid_crc() {
-    let mut nan = [1, 1, 4, 0, 0, 0, 0xc0, 0x7f, 0, 0, 0, 0, 0];
+    let mut nan = [2, 1, 4, 0, 0, 0, 0xc0, 0x7f, 0, 0, 0, 0, 0];
     let crc = crc32c(&nan[..8]);
     nan[8..12].copy_from_slice(&crc.to_le_bytes());
     assert_eq!(
@@ -135,13 +135,13 @@ fn every_kind_has_one_direction_and_one_exact_header_length() {
         (MessageKind::Identity, Direction::FirmwareToHost, 100),
         (MessageKind::Status, Direction::FirmwareToHost, 152),
         (MessageKind::Measurements, Direction::FirmwareToHost, 100),
-        (MessageKind::Diagnostics, Direction::FirmwareToHost, 36),
+        (MessageKind::Diagnostics, Direction::FirmwareToHost, 44),
         (MessageKind::ConfigData, Direction::FirmwareToHost, 48),
         (MessageKind::OperationResult, Direction::FirmwareToHost, 88),
         (MessageKind::DataUnavailable, Direction::FirmwareToHost, 48),
     ];
     for (kind, direction, payload) in cases {
-        let header = [1, kind as u8, payload as u8, (payload >> 8) as u8];
+        let header = [2, kind as u8, payload as u8, (payload >> 8) as u8];
         assert_eq!(
             probe_prefix(&header, direction),
             Ok(Prefix::Complete {
@@ -227,7 +227,7 @@ fn every_host_message_encodes_as_a_complete_independent_message() {
 fn type_lengths_reject_neighbouring_and_nested_lengths() {
     for (kind, direction, valid) in [(MessageKind::Position, Direction::HostToFirmware, 4usize)] {
         for length in [valid - 1, valid + 1] {
-            let header = [1, kind as u8, length as u8, (length >> 8) as u8];
+            let header = [2, kind as u8, length as u8, (length >> 8) as u8];
             assert_eq!(
                 probe_prefix(&header, direction),
                 Err(Error::InvalidPayloadLength)
@@ -239,25 +239,25 @@ fn type_lengths_reject_neighbouring_and_nested_lengths() {
         (MessageKind::SaveConfig, Direction::HostToFirmware, 16_421),
         (MessageKind::Identity, Direction::FirmwareToHost, 99),
         (MessageKind::Identity, Direction::FirmwareToHost, 521),
-        (MessageKind::Diagnostics, Direction::FirmwareToHost, 35),
-        (MessageKind::Diagnostics, Direction::FirmwareToHost, 1061),
+        (MessageKind::Diagnostics, Direction::FirmwareToHost, 43),
+        (MessageKind::Diagnostics, Direction::FirmwareToHost, 1069),
         (MessageKind::ConfigData, Direction::FirmwareToHost, 47),
     ] {
-        let header = [1, kind as u8, invalid as u8, (invalid >> 8) as u8];
+        let header = [2, kind as u8, invalid as u8, (invalid >> 8) as u8];
         assert_eq!(
             probe_prefix(&header, direction),
             Err(Error::InvalidPayloadLength)
         );
     }
-    let header = [1, MessageKind::Diagnostics as u8, 100, 0];
+    let header = [2, MessageKind::Diagnostics as u8, 108, 0];
     assert_eq!(
         probe_prefix(&header, Direction::FirmwareToHost),
         Ok(Prefix::Complete {
-            length: 108,
+            length: 116,
             kind: MessageKind::Diagnostics
         })
     );
-    let malformed_nested = [1, MessageKind::Diagnostics as u8, 37, 0];
+    let malformed_nested = [2, MessageKind::Diagnostics as u8, 45, 0];
     assert_eq!(
         probe_prefix(&malformed_nested, Direction::FirmwareToHost),
         Err(Error::InvalidPayloadLength)

@@ -22,7 +22,7 @@ fn contract_heartbeat_block_has_the_independent_golden_bytes() {
     let bytes = drain(&mut sender, Lane::Heartbeat, 40);
     assert_eq!(
         bytes,
-        [0, 1, 2, 1, 1, 3, 1, 6, 1, 5, 0x68, 0x17, 0x93, 0x44, 0],
+        [0, 1, 2, 1, 1, 3, 2, 6, 1, 5, 0x51, 0x9e, 0xb1, 0x26, 0],
     );
 }
 

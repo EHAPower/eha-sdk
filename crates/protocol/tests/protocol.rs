@@ -5,8 +5,8 @@ use protocol::{
     crc32c, decode, encode, encode_in_place, probe_prefix, validate,
 };
 
-const H: [u8; 8] = [1, 6, 0, 0, 0x68, 0x17, 0x93, 0x44];
-const P10: [u8; 12] = [1, 1, 4, 0, 0, 0, 0x20, 0x41, 0xaf, 0xa9, 0x79, 0xd3];
+const H: [u8; 8] = [2, 6, 0, 0, 0x51, 0x9e, 0xb1, 0x26];
+const P10: [u8; 12] = [2, 1, 4, 0, 0, 0, 0x20, 0x41, 0xc6, 0x2e, 0x3d, 0x08];
 
 #[path = "protocol/requests.rs"]
 mod requests;

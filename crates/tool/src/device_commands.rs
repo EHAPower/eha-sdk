@@ -617,7 +617,12 @@ fn print_reply(label: &str, reply: &Reply) -> Result<(), String> {
         Response::Measurements(value) => println!("{:#?}", value.fields()),
         Response::Diagnostics(value) => {
             let entries: Vec<_> = value.entries().map(|entry| entry.fields()).collect();
-            println!("overflow={}; entries={entries:#?}", value.overflow());
+            println!(
+                "decision_age_us={}; device_evidence_age_us={}; overflow={}; entries={entries:#?}",
+                value.decision_age_us(),
+                value.device_evidence_age_us(),
+                value.overflow()
+            );
         }
         Response::ConfigData(value) => print_config_data(value),
         Response::OperationResult(value) => println!("{:#?}", value.fields()),
