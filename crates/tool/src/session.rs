@@ -18,8 +18,8 @@ use eha_sdk::{
         CanChannelFactory, CanConnector, CanNodeConnector, CanOptions, python::PythonCanOptions,
     },
     host::{
-        Client, ClientState, Error as SdkError, Failure, LocalSubmission, OperationSubmission,
-        Reply, Wait,
+        Client, ClientState, Error as SdkError, Failure, LocalStage, LocalSubmission,
+        OperationSubmission, Reply, Wait,
     },
     protocol::{
         Response,
@@ -642,6 +642,8 @@ impl ToolSession {
     /// 同一 UID 与运行实例只更新 SDK 的维护编号下界，连续遥测历史保持不变；同一 UID
     /// 的新运行实例会清除旧运行的观测和趋势。刷新失败时主动把未核对的 `Client` 转为
     /// 可恢复的断开状态：它不再能执行业务操作，调用方可显式 `reconnect` 后重新核对。
+    /// 若已核对 Client 的 ReleaseResult fence 在本地零发送地拒绝刷新，则保留该 Client，
+    /// 使调用方仍可用同一原键完成确认。
     /// 此入口不由普通 CLI/Shell 的 [`Self::execute`] 隐式调用。
     pub fn refresh_identity(&mut self) -> Result<Snapshot, SessionError> {
         let mut client = self
@@ -652,6 +654,12 @@ impl ToolSession {
         let identity = match client.identify(None, &self.wait()) {
             Ok(identity) => identity,
             Err(error) => {
+                if matches!(&error.failure, Failure::PendingOperation)
+                    && error.local == LocalStage::NotSubmitted
+                {
+                    self.client = Some(client);
+                    return Err(sdk_error(error));
+                }
                 self.disconnected_reason = Some(format!("维护前身份刷新失败：{error}"));
                 self.disconnected_pending_operation = client.pending_operation().map(key_hex);
                 self.disconnected = Some(client.disconnect());
@@ -927,11 +935,24 @@ impl ToolSession {
                 Command::MaintenanceRelease { operation_key: key } => {
                     let key = parse_key(&key)?;
                     client.track_operation(key).map_err(sdk_error)?;
-                    let before = reply_json(&client.read_result(key, &wait).map_err(sdk_error)?)?;
-                    let local = client.release_result(&wait).map_err(sdk_error)?;
-                    local_submission = Some(local_submission_json(local));
-                    client.confirm_released(key, &wait).map_err(sdk_error)?;
-                    json!({"before_release": before, "released": true})
+                    match client.read_result(key, &wait) {
+                        Ok(reply) => {
+                            let before = reply_json(&reply)?;
+                            let local = client.release_result(&wait).map_err(sdk_error)?;
+                            local_submission = Some(local_submission_json(local));
+                            client.confirm_released(key, &wait).map_err(sdk_error)?;
+                            json!({"before_release": before, "released": true})
+                        }
+                        Err(error)
+                            if matches!(&error.failure, Failure::PendingOperation)
+                                && error.local == LocalStage::NotSubmitted
+                                && client.pending_operation() == Some(key) =>
+                        {
+                            client.confirm_released(key, &wait).map_err(sdk_error)?;
+                            json!({"released": true})
+                        }
+                        Err(error) => return Err(sdk_error(error)),
+                    }
                 }
                 Command::ResetApplication => operation_submission_data(
                     client.reset_application(&wait).map_err(sdk_error)?,
@@ -1011,13 +1032,23 @@ impl ToolSession {
         Ok(value)
     }
 
-    /// 结束并刷新当前记录；它不改变 SDK 连接或控制状态。
+    /// 结束并刷新记录。写入失败时仍保留缺口，并收尾正在进行的试验。
     pub fn stop_recording(&mut self) -> Result<Value, SessionError> {
         let recording = self
             .recording
             .take()
             .ok_or_else(|| invalid("当前没有进行中的记录"))?;
-        recording.finish().map_err(recording_error)
+        let result = match &self.recording_error {
+            Some(error) => Err(error.clone()),
+            None => recording.finish(),
+        };
+        result.map_err(|error| {
+            self.recording_error = Some(error.clone());
+            if self.trial.active.is_some() {
+                let _ = self.submit_trial_stop("recording_failed");
+            }
+            recording_error(error)
+        })
     }
 
     pub fn recording_snapshot(&self) -> Value {
@@ -1121,6 +1152,15 @@ impl ToolSession {
         )?;
         self.last_telemetry = Some(fresh);
         self.record_event("trial_command_input", json!({"request": &request}));
+        self.flush_recording();
+        if self.recording.is_some()
+            && let Some(error) = &self.recording_error
+        {
+            return Err(SessionError {
+                local_stage: Some("not_submitted".into()),
+                ..recording_error(error.clone())
+            });
+        }
         let started_sample_time_us = prepared.status["sample"]["snapshot_time_us"]
             .as_u64()
             .unwrap_or(0);
@@ -1138,6 +1178,8 @@ impl ToolSession {
             started_sample_time_us,
             stop_after_sample_time_us: None,
             stop_attempt_finished_at: None,
+            stop_confirmation_timeout: self.timeout,
+            stop_confirmation_overdue: false,
             stop_recovery_after_received_at: None,
             settled_sample_time_us: None,
         });
@@ -1214,12 +1256,14 @@ impl ToolSession {
                 self.finish_recording_boundary("transport_disconnected");
             }
         }
+        self.flush_recording();
         let stop_reason = self.trial_stop_reason();
         if let Some(reason) = stop_reason {
             let _ = self.submit_trial_stop(&reason);
         }
         self.flush_trial_position();
         self.observe_trial_stop();
+        self.observe_stop_confirmation_deadline();
         self.flush_recording();
     }
 
@@ -1227,6 +1271,9 @@ impl ToolSession {
         let active = self.trial.active.as_mut()?;
         if active.stop_submission.is_some() {
             return None;
+        }
+        if self.recording.is_some() && self.recording_error.is_some() {
+            return Some("recording_failed".into());
         }
         if active.started_at.elapsed() >= active.duration {
             return Some("duration_elapsed".into());
@@ -1320,6 +1367,11 @@ impl ToolSession {
             return;
         };
         self.record_event("trial_position_submit", json!({"mm": mm}));
+        self.flush_recording();
+        if self.recording.is_some() && self.recording_error.is_some() {
+            let _ = self.submit_trial_stop("recording_failed");
+            return;
+        }
         let result = self.execute_trial_command(Command::Position { mm });
         match result {
             Ok(result) => {
@@ -1393,6 +1445,27 @@ impl ToolSession {
         }
     }
 
+    fn observe_stop_confirmation_deadline(&mut self) {
+        let active = self.trial.active.as_mut().or_else(|| {
+            self.trial
+                .interrupted
+                .as_mut()
+                .map(|interrupted| &mut interrupted.active)
+        });
+        let Some(active) = active else {
+            return;
+        };
+        if !active.stop_confirmation_overdue
+            && active
+                .stop_attempt_finished_at
+                .is_some_and(|finished| finished.elapsed() >= active.stop_confirmation_timeout)
+        {
+            // 超期只留存事实；继续持有试验并等待被动证据，不重发 Stop 或解锁命令。
+            active.stop_confirmation_overdue = true;
+            self.record_event("trial_stop_confirmation_overdue", self.trial.snapshot());
+        }
+    }
+
     fn observe_trial_stop(&mut self) {
         let received_at = self.last_telemetry.as_ref().map(|reply| reply.received_at);
         let telemetry = self
@@ -1442,14 +1515,28 @@ impl ToolSession {
                     .is_some_and(|not_before| received > not_before)
             });
         if confirmed {
+            let overdue = active.stop_confirmation_overdue
+                || active
+                    .stop_attempt_finished_at
+                    .zip(received_at)
+                    .is_some_and(|(finished, received)| {
+                        received.saturating_duration_since(finished)
+                            >= active.stop_confirmation_timeout
+                    });
+            let newly_overdue = overdue && !active.stop_confirmation_overdue;
             let completed = json!({
                 "state": "completed",
                 "request": active.request.clone(),
                 "stop_reason": active.stop_reason.clone(),
                 "stop_submission": active.stop_submission.clone(),
                 "stop_observed": true,
+                "stop_confirmation_timeout_ms": active.stop_confirmation_timeout.as_millis(),
+                "stop_confirmation_overdue": overdue,
                 "evidence": &telemetry,
             });
+            if newly_overdue {
+                self.observe_stop_confirmation_deadline();
+            }
             self.record_event("trial_stop_confirmed", json!({"telemetry": &telemetry}));
             self.trial.completed = Some(completed);
             self.trial.active = None;
@@ -1585,6 +1672,9 @@ impl ToolSession {
         let Some(mut recording) = self.recording.take() else {
             return;
         };
+        if self.recording_error.is_some() {
+            return;
+        }
         let result = recording.event("recording_boundary", json!({"reason": reason}));
         if let Err(error) = result.and_then(|_| recording.finish()) {
             self.recording_error = Some(error);
@@ -2514,6 +2604,7 @@ mod tests {
             backend::{Backend, Pump},
         },
         protocol::{self, Direction, Message, SampleData, responses::*},
+        session::MaintenanceKey,
     };
     use serde_json::json;
     use std::{
@@ -2671,6 +2762,149 @@ mod tests {
         bytes[..length].to_vec()
     }
 
+    fn settled_result_bytes(query_id: u32, operation_id: u64) -> Vec<u8> {
+        let fields = OperationResultFields {
+            sample: SampleData {
+                query_id,
+                run_nonce: [9; 16],
+                snapshot_sequence: 2,
+                snapshot_time_us: 20,
+            },
+            operation_id,
+            operation: MaintenanceOperation::SaveConfig,
+            state: MaintenanceState::FirmwareStepComplete,
+            phase: OperationPhase::StorageReplacement,
+            evidence: OperationEvidence {
+                storage_replace_succeeded: true,
+                settled: true,
+                ..Default::default()
+            },
+            reason: 0,
+            next_actions: 0,
+            constraints: Constraints {
+                result_slot: true,
+                ..Default::default()
+            },
+            started_time_us: 1,
+            deadline_us: 2,
+            finished_time_us: 2,
+            content_length: 0,
+            content_crc32c: 0,
+            revision: 1,
+        };
+        let mut bytes = [0; OperationResultFields::encoded_len()];
+        let length = encode_operation_result(&fields, &mut bytes).expect("settled result encodes");
+        bytes[..length].to_vec()
+    }
+
+    fn release_fence_clear_telemetry() -> Vec<u8> {
+        let unavailable = ValueFields::new(
+            0.0,
+            ValueState::new(ValueResult::Never, SourceQuality::Unknown, false),
+        );
+        let fields = TelemetryFields {
+            sample: SampleData {
+                query_id: 0,
+                run_nonce: [9; 16],
+                snapshot_sequence: 3,
+                snapshot_time_us: 30,
+            },
+            decision_age_us: 0,
+            target_mode: TargetMode::None,
+            target_ingress: TargetIngress::None,
+            facts: TelemetryFacts {
+                retained_result: false,
+                ..Default::default()
+            },
+            target_values: [0.0; 3],
+            can_adoption_blockers: 0,
+            usb_adoption_blockers: 0,
+            output_blockers: 0,
+            last_end_reason: 0,
+            limits: Default::default(),
+            main_values: [value(); 5],
+            position_age_us: 0,
+            velocity_age_us: 0,
+            pressure_pair_age_us: 0,
+            reference: unavailable,
+            reference_kind: ReferenceKind::None,
+            candidate_rpm: value(),
+            last_submitted_rpm: value(),
+            submitted_age_us: 0,
+            axis_state_raw: 0,
+            axis_error_raw: 0,
+            driver_age_us: u32::MAX,
+            driver_state: Default::default(),
+            desired_axis: DesiredAxis::Idle,
+            can_heartbeat_age_us: 0,
+            usb_heartbeat_age_us: 0,
+            can_contact: ContactState::Expired,
+            usb_contact: ContactState::Expired,
+        };
+        let mut bytes = vec![0; TelemetryFields::encoded_len()];
+        let length =
+            encode_telemetry(&fields, &mut bytes).expect("release clear telemetry encodes");
+        bytes.truncate(length);
+        bytes
+    }
+
+    fn release_recovery_backend(
+        clear_release: Arc<AtomicBool>,
+        reply_release: Arc<AtomicBool>,
+        releases: Arc<AtomicUsize>,
+        read_keys: Arc<Mutex<Vec<u64>>>,
+    ) -> Backend {
+        let clear_sent = Arc::new(AtomicBool::new(false));
+        Backend::spawn("eha-tool-release-recovery-test", move |commands, sink| {
+            let mut pump = Pump::new(commands, sink);
+            while pump.poll() {
+                if clear_release.load(Ordering::Acquire)
+                    && releases.load(Ordering::Acquire) != 0
+                    && !clear_sent.swap(true, Ordering::AcqRel)
+                {
+                    pump.sink.received(release_fence_clear_telemetry());
+                }
+                for lane in 0..3 {
+                    while let Some(request) = pump.take(lane) {
+                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
+                            .expect("tool emits a contract-valid request");
+                        match message {
+                            Message::Query {
+                                query_id,
+                                category: 0,
+                            } => {
+                                pump.sink.submitted(request.id);
+                                pump.sink.received(identity_bytes(query_id, 4, 0));
+                            }
+                            Message::ReadResult { query_id, key } => {
+                                read_keys
+                                    .lock()
+                                    .expect("read key list lock")
+                                    .push(key.operation_id());
+                                pump.sink.submitted(request.id);
+                                let reply = if releases.load(Ordering::Acquire) == 0 {
+                                    settled_result_bytes(query_id, key.operation_id())
+                                } else if reply_release.load(Ordering::Acquire) {
+                                    released_result_bytes(query_id, key.operation_id())
+                                } else {
+                                    continue;
+                                };
+                                pump.sink.received(reply);
+                            }
+                            Message::ReleaseResult { .. } => {
+                                releases.fetch_add(1, Ordering::AcqRel);
+                                pump.sink.submitted(request.id);
+                            }
+                            _ => panic!("unexpected SDK request in release recovery test"),
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        })
+        .expect("release recovery backend starts")
+    }
+
     fn identified_tool_session(backend: Backend, timeout: Duration) -> ToolSession {
         let mut client = Client::new(backend);
         let identity = client
@@ -2758,6 +2992,57 @@ mod tests {
             .expect("new maintenance key submits only after release confirmation");
 
         assert_eq!(*operations.lock().expect("operation list lock"), vec![6]);
+    }
+
+    #[test]
+    fn maintenance_release_retries_only_confirmation_after_timeouts() {
+        let clear_release = Arc::new(AtomicBool::new(false));
+        let reply_release = Arc::new(AtomicBool::new(false));
+        let releases = Arc::new(AtomicUsize::new(0));
+        let read_keys = Arc::new(Mutex::new(Vec::new()));
+        let backend = release_recovery_backend(
+            Arc::clone(&clear_release),
+            Arc::clone(&reply_release),
+            Arc::clone(&releases),
+            Arc::clone(&read_keys),
+        );
+        let mut session = identified_tool_session(backend, Duration::from_millis(30));
+        let key = MaintenanceKey {
+            uid: [7; 12],
+            run_nonce: [9; 16],
+            operation_id: 4,
+        };
+        let command = Command::MaintenanceRelease {
+            operation_key: super::key_hex(key),
+        };
+
+        session
+            .execute(command.clone())
+            .expect_err("missing passive clear leaves ReleaseResult unknown");
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        let refresh = session
+            .refresh_identity()
+            .expect_err("fenced release rejects a zero-send identity refresh");
+        assert_eq!(refresh.kind.as_ref(), "pending_operation");
+        assert!(session.snapshot().connected);
+
+        clear_release.store(true, Ordering::Release);
+        session
+            .execute(command.clone())
+            .expect_err("missing confirmation reply keeps the original release pending");
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert_eq!(*read_keys.lock().expect("read key list lock"), vec![4, 4]);
+
+        reply_release.store(true, Ordering::Release);
+        let completed = session
+            .execute(command)
+            .expect("same maintenance_release confirms the original key after clear");
+        assert_eq!(completed.data["released"], true);
+        assert_eq!(releases.load(Ordering::Acquire), 1);
+        assert_eq!(
+            *read_keys.lock().expect("read key list lock"),
+            vec![4, 4, 4]
+        );
     }
 
     #[test]

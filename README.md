@@ -141,6 +141,14 @@ schema、字段表示和纯换算为基础，检查完整记录、跨字段关�
 `save_and_readback` 只报告本地提交、固件结果和同设备实际读回；结果已结清后才可显式
 `release_result` 与 `confirm_released`。
 
+Release 只提交一次。`confirm_released` 先等待同一运行实例、提交后新收到且快照时间推进的被动
+`retained_result=false` 事实，再查询原键确认释放；等待期间该 Client 阻止查询、目标和维护请求覆盖 Release。
+显式 Stop 仍可提交，心跳使用独立通道。Stop 可能覆盖尚未取走的 Release，旧 Release 保持未确认；
+此时先观察 Stop 后的新鲜停止事实，再查询释放结果，不能让查询覆盖 Stop。
+超时、取消或断连保留原键和未知结果，不重发。先用 `confirm_released` 继续确认原键，再进行 `identify` 或新维护。
+若带着未确认的 Release 断连后 `resume`，新 backend 尚未核实身份，不能用其遥测放行旧请求；
+`identify` 返回结果未知且不发送查询。旧维护仍未确认，新建会话取得的当前状态不能补证旧 Release。
+
 ## 独立 ODrive 读取
 
 默认 `desktop` feature 的 `eha_sdk::odrive` 只读地发现或读取调用方明确指定的 ODrive USB

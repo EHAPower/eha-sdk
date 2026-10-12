@@ -67,6 +67,8 @@ pub(crate) struct ActiveTrial {
     pub(crate) started_sample_time_us: u64,
     pub(crate) stop_after_sample_time_us: Option<u64>,
     pub(crate) stop_attempt_finished_at: Option<Instant>,
+    pub(crate) stop_confirmation_timeout: Duration,
+    pub(crate) stop_confirmation_overdue: bool,
     pub(crate) stop_recovery_after_received_at: Option<Instant>,
     pub(crate) settled_sample_time_us: Option<u64>,
 }
@@ -99,6 +101,8 @@ impl TrialState {
                 "stop_reason": active.stop_reason,
                 "stop_submission": active.stop_submission,
                 "stop_observed": active.stop_observed,
+                "stop_confirmation_timeout_ms": active.stop_confirmation_timeout.as_millis(),
+                "stop_confirmation_overdue": active.stop_confirmation_overdue,
             });
         }
         if let Some(prepared) = &self.prepared {
@@ -112,6 +116,8 @@ impl TrialState {
                 "request": interrupted.active.request,
                 "reason": interrupted.reason,
                 "stop_submission": interrupted.active.stop_submission,
+                "stop_confirmation_timeout_ms": interrupted.active.stop_confirmation_timeout.as_millis(),
+                "stop_confirmation_overdue": interrupted.active.stop_confirmation_overdue,
                 "last_telemetry": interrupted.last_telemetry,
             });
         }

@@ -54,6 +54,18 @@
               <div class="hero-copy"><p class="eyebrow">设备会话</p><h2>从身份核对开始</h2><p>先明确连接通路和设备身份，再读取状态、遥测或提交持续目标。页面如实显示本机已取得的信息。</p><div class="hero-actions"><a class="button" href="#telemetry">查看遥测</a></div></div>
               <div class="hero-schematic" aria-hidden="true"><svg class="actuator-visual" viewBox="0 0 300 150"><path d="M45 48h108a12 12 0 0112 12v30a12 12 0 01-12 12H45a12 12 0 01-12-12V60a12 12 0 0112-12zM165 68h72v16h-72zM237 56h22v40h-22zM70 62h34v26H70z"></path><path d="M45 120h210M45 114v12M255 114v12" class="actuator-line"></path></svg><span class="schematic-label">EHA actuator · reference</span></div>
             </section>
+            <section class="card">
+              <div class="card-header"><div><h2>按需执行的独立操作</h2><p>各项可单独进行；开始前核对当前设备和运行条件。</p></div></div>
+              <div class="card-body">
+                <ol>
+                  <li><a class="inline-link" href="#configuration">检查配置</a>：读取当前记录或导入候选，再校验；每次继续前以当前设备事实为准。</li>
+                  <li><a class="inline-link" href="#configuration">保存并读回</a>：保存后核对实际用户记录；结果未知时保留操作键，只读查询。</li>
+                  <li><a class="inline-link" href="#diagnostics">核对启动采用</a>：仅在本次需要采用新配置时请求应用复位；观察到设备重启后，再重新连接同一 UID 的新运行实例并读取 Startup。</li>
+                  <li><a class="inline-link" href="#trial">进行单次有界试验</a>：为本次输入目标、范围、时限和停止条件。若要留存过程，先在<a class="inline-link" href="#recordings">运行记录</a>开始一份记录；同一记录可覆盖多次独立试验。</li>
+                </ol>
+                <p class="helper">本入口以单节点操作为例。单次有界试验必须持续到显式 Stop 的新鲜确认；到位、关闭连接和零速度都不等于 Stop。</p>
+              </div>
+            </section>
             <section class="metric-grid" aria-label="关键遥测">
               <article class="metric-card card"><div class="metric-top"><span>位置（mm）</span><svg aria-hidden="true"><use href="#icon-position"></use></svg></div><strong id="metric-position" class="metric-value">—</strong><small id="metric-position-detail" class="metric-detail">等待当前遥测</small></article>
               <article class="metric-card card"><div class="metric-top"><span>速度（mm/s）</span><svg aria-hidden="true"><use href="#icon-wave"></use></svg></div><strong id="metric-velocity" class="metric-value">—</strong><small id="metric-velocity-detail" class="metric-detail">等待当前遥测</small></article>

@@ -285,6 +285,8 @@ fn active(request: TrialRequest, started_at: Instant, started_sample_time_us: u6
         stop_reason: None,
         stop_observed: false,
         stop_attempt_finished_at: None,
+        stop_confirmation_timeout: Duration::from_millis(100),
+        stop_confirmation_overdue: false,
         stop_recovery_after_received_at: None,
         started_sample_time_us,
         stop_after_sample_time_us: None,
@@ -1127,4 +1129,184 @@ fn trial_duration_rejects_unrepresentable_clock_values() {
         request.duration_limit().expect("可表示期限"),
         Duration::from_millis(125)
     );
+}
+
+#[test]
+fn stop_confirmation_overdue_keeps_owner_and_preserves_late_confirmation() {
+    let (mut session, probe) = session_fixture(1, [3; 12], FixtureBehavior::Ready);
+    let root = std::env::temp_dir().join(format!("eha-trial-overdue-{}", std::process::id()));
+    let recording = session.start_recording(&root).expect("开始记录");
+    session
+        .start_trial(trial_request(Command::Position { mm: 1.0 }))
+        .expect("开始试验");
+    session.stop_trial().expect("Stop 本地提交");
+    session
+        .trial
+        .active
+        .as_mut()
+        .expect("停止中")
+        .stop_attempt_finished_at = Some(Instant::now() - Duration::from_secs(1));
+
+    session.tick();
+    assert_eq!(session.trial_snapshot()["state"], "stopping");
+    assert_eq!(session.trial_snapshot()["stop_confirmation_overdue"], true);
+    assert!(session.execute(Command::Status).is_err());
+    assert!(session.update_trial_position(2.0).is_err());
+    assert!(
+        session
+            .prepare_trial(&trial_request(Command::Position { mm: 2.0 }))
+            .is_err()
+    );
+    session.stop_trial().expect("重复停止不重发");
+    session.tick();
+    assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
+
+    probe.inject_idle(100);
+    session.tick();
+    let completed = session.trial_snapshot();
+    assert_eq!(completed["state"], "completed");
+    assert_eq!(completed["stop_observed"], true);
+    assert_eq!(completed["stop_confirmation_overdue"], true);
+    session.stop_recording().expect("结束记录");
+    let directory = Path::new(recording["directory"].as_str().expect("记录目录"));
+    let events = std::fs::read_to_string(directory.join("events.jsonl")).expect("读取事件");
+    assert_eq!(
+        events
+            .matches("\"event\":\"trial_stop_confirmation_overdue\"")
+            .count(),
+        1
+    );
+    assert!(events.contains("\"event\":\"trial_stop_confirmed\""));
+    std::fs::remove_dir_all(root).expect("清理测试记录");
+}
+
+#[test]
+fn failed_recording_blocks_initial_target_and_cannot_finish_as_complete() {
+    let (mut session, probe) = session_fixture(1, [3; 12], FixtureBehavior::Ready);
+    let root =
+        std::env::temp_dir().join(format!("eha-trial-recording-before-{}", std::process::id()));
+    let recording = session.start_recording(&root).expect("开始记录");
+    session
+        .recording
+        .as_mut()
+        .expect("记录器")
+        .fail_event_writes()
+        .expect("只读文件故障");
+
+    let error = session
+        .start_trial(trial_request(Command::Position { mm: 1.0 }))
+        .expect_err("记录无法落盘时不发送目标");
+    assert_eq!(error.kind.as_ref(), "recording");
+    assert_eq!(error.local_stage.as_deref(), Some("not_submitted"));
+    assert!(!error.unknown);
+    assert_eq!(session.trial_snapshot()["state"], "idle");
+    assert_eq!(probe.observed.lock().expect("提交观测").targets, 0);
+    assert_eq!(probe.observed.lock().expect("提交观测").stops, 0);
+    assert!(session.stop_recording().is_err());
+    let directory = Path::new(recording["directory"].as_str().expect("记录目录"));
+    let metadata: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("metadata.json")).expect("读取元数据"),
+    )
+    .expect("元数据 JSON");
+    assert!(metadata.get("completion").is_none());
+    std::fs::remove_dir_all(root).expect("清理测试记录");
+}
+
+#[test]
+fn recording_failure_stops_once_without_flushing_queued_position_or_completing_recording() {
+    let (mut session, probe) = session_fixture(1, [3; 12], FixtureBehavior::Ready);
+    let root =
+        std::env::temp_dir().join(format!("eha-trial-recording-during-{}", std::process::id()));
+    let recording = session.start_recording(&root).expect("开始记录");
+    session
+        .start_trial(trial_request(Command::Position { mm: 1.0 }))
+        .expect("开始试验");
+    session
+        .recording
+        .as_mut()
+        .expect("记录器")
+        .fail_event_writes()
+        .expect("只读文件故障");
+    session.update_trial_position(2.0).expect("合并目标");
+    session
+        .trial
+        .active
+        .as_mut()
+        .expect("试验中")
+        .last_position_submit = None;
+
+    session.tick();
+    session.tick();
+    assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
+    assert_eq!(session.trial_snapshot()["state"], "stopping");
+    assert_eq!(session.recording_snapshot()["failed"], true);
+    {
+        let observed = probe.observed.lock().expect("提交观测");
+        assert_eq!(observed.positions, vec![1.0]);
+        assert_eq!(observed.stops, 1);
+    }
+    probe.inject_idle(100);
+    session.tick();
+    assert_eq!(session.trial_snapshot()["state"], "completed");
+    assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
+    session.finish_recording_boundary("disconnect");
+    let directory = Path::new(recording["directory"].as_str().expect("记录目录"));
+    let metadata: Value = serde_json::from_slice(
+        &std::fs::read(directory.join("metadata.json")).expect("读取元数据"),
+    )
+    .expect("元数据 JSON");
+    assert!(metadata.get("completion").is_none());
+    std::fs::remove_dir_all(root).expect("清理测试记录");
+}
+
+#[test]
+fn recording_finish_failure_cannot_bypass_trial_stop() {
+    let (mut session, probe) = session_fixture(1, [3; 12], FixtureBehavior::Ready);
+    let root =
+        std::env::temp_dir().join(format!("eha-trial-recording-finish-{}", std::process::id()));
+    session.start_recording(&root).expect("开始记录");
+    session
+        .start_trial(trial_request(Command::Position { mm: 1.0 }))
+        .expect("开始试验");
+    session
+        .recording
+        .as_mut()
+        .expect("记录器")
+        .fail_event_writes()
+        .expect("只读文件故障");
+
+    assert!(session.stop_recording().is_err());
+    assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
+    assert_eq!(session.trial_snapshot()["state"], "stopping");
+    assert!(session.recording_error.is_some());
+    session.tick();
+    assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
+    std::fs::remove_dir_all(root).expect("清理测试记录");
+}
+
+#[test]
+fn stop_confirmation_deadline_uses_receipt_time_instead_of_tick_time() {
+    for (receipt_delay, overdue) in [
+        (Duration::from_millis(25), false),
+        (Duration::from_millis(75), true),
+    ] {
+        let (mut session, probe) = session_fixture(1, [3; 12], FixtureBehavior::Ready);
+        session
+            .start_trial(trial_request(Command::Position { mm: 1.0 }))
+            .expect("开始试验");
+        session.stop_trial().expect("Stop 本地提交");
+        let finished = Instant::now() - Duration::from_millis(100);
+        let active = session.trial.active.as_mut().expect("停止中");
+        active.stop_attempt_finished_at = Some(finished);
+        active.stop_confirmation_timeout = Duration::from_millis(50);
+        probe.inject_idle_at(100, finished + receipt_delay);
+
+        session.tick();
+        assert_eq!(session.trial_snapshot()["state"], "completed");
+        assert_eq!(
+            session.trial_snapshot()["stop_confirmation_overdue"],
+            overdue
+        );
+        assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
+    }
 }

@@ -159,6 +159,16 @@ struct PendingOperation {
     key: MaintenanceKey,
     kind: Option<MaintenanceOperation>,
     result: Option<OperationResultFields>,
+    release_fence: Option<ReleaseFence>,
+}
+/// ReleaseResult 本地提交后，阻止任何普通请求覆盖设备共用槽的本地边界。
+///
+/// 只接受提交之后、同一运行实例且快照时间推进的被动 Telemetry；旧缓存、重连后的
+/// 新实例和查询回复都不能跨过该边界。
+#[derive(Clone, Debug)]
+struct ReleaseFence {
+    submitted_before: Instant,
+    minimum_snapshot_time_us: u64,
 }
 /// 可携带至重新打开连接的会话状态。保存查询编号、原维护键和已取得结果，防止重连重用编号。
 #[derive(Clone, Debug)]
@@ -199,6 +209,9 @@ impl Client {
         }
     }
     /// 重新装配已显式保存的会话。先 identify 核对现设备；不自动重发或开启心跳。
+    ///
+    /// 若状态保留了本地提交未知的 ReleaseResult，新的 backend 不能以旧 Identity 或新实例
+    /// Telemetry 确认它；该键继续是未知，调用方不得把新的 Idle 或当前配置当作旧释放证据。
     ///
     /// `backend` 必须由之前同一个 CAN/USB Connector 重开，或由调用方后端保留等价
     /// 的传输序号和 guard 历史。不能以一次性 `can::open` / `usb::open` 重置传输状态。
@@ -271,7 +284,27 @@ impl Client {
         protocol::encode(*message, &mut bytes).map_err(|e| invalid(format!("{e:?}")))?;
         Ok(bytes)
     }
+    fn release_fence_blocks_send(&self) -> Result<(), Error> {
+        if self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.release_fence.as_ref())
+            .is_some()
+        {
+            Err(self.error(Failure::PendingOperation, LocalStage::NotSubmitted))
+        } else {
+            Ok(())
+        }
+    }
     fn send(
+        &mut self,
+        message: &Message<'_>,
+        wait: &Wait,
+    ) -> Result<(u64, Instant, Arc<AtomicBool>), Error> {
+        self.release_fence_blocks_send()?;
+        self.send_without_release_fence(message, wait)
+    }
+    fn send_without_release_fence(
         &mut self,
         message: &Message<'_>,
         wait: &Wait,
@@ -329,6 +362,125 @@ impl Client {
                 .wait_timeout(inbox, remaining.min(Duration::from_millis(10)))
                 .map_err(|_| Failure::Disconnected("I/O 等待锁失效".into()))?
                 .0;
+        }
+    }
+    fn telemetry_clears_release_fence(
+        key: MaintenanceKey,
+        fence: &ReleaseFence,
+        received: &Received,
+    ) -> bool {
+        if received.at <= fence.submitted_before {
+            return false;
+        }
+        let Ok(Message::Response(Response::Telemetry(telemetry))) =
+            protocol::decode(&received.bytes, Direction::FirmwareToHost)
+        else {
+            return false;
+        };
+        let fields = telemetry.fields();
+        fields.sample.run_nonce == key.run_nonce
+            && fields.sample.snapshot_time_us > fence.minimum_snapshot_time_us
+            && !fields.facts.retained_result
+    }
+    /// 等待 ReleaseResult 所属运行实例的被动消费证据。
+    ///
+    /// Telemetry 只更新 latest 缓存而不占用普通事件 FIFO，因此在同一个条件变量下检查
+    /// 缓存和普通传输事件，不能借助另一条 Query 或固定 sleep 轮询。
+    fn next_release_fence_event(
+        &self,
+        key: MaintenanceKey,
+        fence: &ReleaseFence,
+        deadline: Instant,
+        wait: &Wait,
+    ) -> Result<Option<Event>, Failure> {
+        let (lock, cv) = &*self.backend.sink.0;
+        let mut inbox = lock
+            .lock()
+            .map_err(|_| Failure::Disconnected("I/O 状态锁失效".into()))?;
+        loop {
+            if wait.cancellation.is_cancelled() {
+                return Err(Failure::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(Failure::Timeout);
+            }
+            if inbox
+                .telemetry
+                .as_ref()
+                .is_some_and(|received| Self::telemetry_clears_release_fence(key, fence, received))
+            {
+                return Ok(None);
+            }
+            if let Some(event) = inbox.events.pop_front() {
+                return Ok(Some(event));
+            }
+            if let Some(reason) = &inbox.disconnected {
+                return Err(Failure::Disconnected(reason.clone()));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            inbox = cv
+                .wait_timeout(inbox, remaining.min(Duration::from_millis(10)))
+                .map_err(|_| Failure::Disconnected("I/O 等待锁失效".into()))?
+                .0;
+        }
+    }
+    fn await_release_fence(&mut self, key: MaintenanceKey, wait: &Wait) -> Result<(), Error> {
+        let Some(fence) = self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.release_fence.clone())
+        else {
+            return Ok(());
+        };
+        if self.pending_operation() != Some(key) {
+            return Err(self.error(Failure::PendingOperation, LocalStage::NotSubmitted));
+        }
+        let identity_matches_key = self
+            .session
+            .identity()
+            .is_some_and(|identity| identity.uid == key.uid && identity.run_nonce == key.run_nonce);
+        if !identity_matches_key {
+            return Err(self.error(
+                Failure::ResultUnknown("ReleaseResult 的原运行实例已不再可确认".into()),
+                LocalStage::FullySubmitted,
+            ));
+        }
+        if !self.identity_verified {
+            return Err(self.error(
+                Failure::ResultUnknown("断连后的 ReleaseResult 原实例不可确认".into()),
+                LocalStage::FullySubmitted,
+            ));
+        }
+        self.require_key_identity(key)?;
+        let deadline = Instant::now()
+            .checked_add(wait.timeout)
+            .ok_or_else(|| invalid("等待期限无法表示"))?;
+        if wait.timeout.is_zero() || wait.cancellation.is_cancelled() {
+            return Err(self.wait_error(Failure::Cancelled, LocalStage::FullySubmitted, true));
+        }
+        loop {
+            match self.next_release_fence_event(key, &fence, deadline, wait) {
+                Ok(None) => return Ok(()),
+                Ok(Some(Event::Message(received))) => self.observe(&received.into()),
+                Ok(Some(Event::Disconnected(reason))) => {
+                    return Err(self.wait_error(
+                        Failure::Disconnected(reason),
+                        LocalStage::FullySubmitted,
+                        true,
+                    ));
+                }
+                Ok(Some(Event::TransportError { detail, raw })) => {
+                    return Err(self.wait_error(
+                        Failure::Transport { detail, raw },
+                        LocalStage::FullySubmitted,
+                        true,
+                    ));
+                }
+                Ok(Some(_)) => {}
+                Err(failure) => {
+                    return Err(self.wait_error(failure, LocalStage::FullySubmitted, true));
+                }
+            }
         }
     }
     fn observe(&mut self, reply: &Reply) {
@@ -418,6 +570,24 @@ impl Client {
         expected_uid: Option<[u8; 12]>,
         wait: &Wait,
     ) -> Result<Reply, Error> {
+        if self
+            .pending
+            .as_ref()
+            .and_then(|pending| pending.release_fence.as_ref())
+            .is_some()
+        {
+            let failure = if self.identity_verified {
+                Failure::PendingOperation
+            } else {
+                Failure::ResultUnknown("断连后的 ReleaseResult 原实例不可确认".into())
+            };
+            let stage = if self.identity_verified {
+                LocalStage::NotSubmitted
+            } else {
+                LocalStage::FullySubmitted
+            };
+            return Err(self.error(failure, stage));
+        }
         self.identity_verified = false;
         let expected_uid = expected_uid.or_else(|| self.session.identity().map(|i| i.uid));
         let reply = self.query(QueryKind::Identity, wait)?;
@@ -431,12 +601,12 @@ impl Client {
                 LocalStage::FullySubmitted,
             ));
         }
-        self.session.observe_identity(&identity).map_err(|e| {
-            self.error(
-                Failure::Session(format!("{e:?}")),
+        if let Err(error) = self.session.observe_identity(&identity) {
+            return Err(self.error(
+                Failure::Session(format!("{error:?}")),
                 LocalStage::FullySubmitted,
-            )
-        })?;
+            ));
+        }
         self.identity_verified = true;
         self.heartbeat_hz = Some(f.host_heartbeat_hz);
         if self.pending.is_none() && f.retained_operation_id != 0 {
@@ -448,6 +618,7 @@ impl Client {
                 },
                 kind: None,
                 result: None,
+                release_fence: None,
             });
         }
         Ok(reply)
@@ -477,6 +648,15 @@ impl Client {
         }
     }
     fn query(&mut self, kind: QueryKind, wait: &Wait) -> Result<Reply, Error> {
+        self.query_inner(kind, wait, false)
+    }
+    /// `allow_release_fence` 仅供同键的 ReleaseResult 确认在被动消费证据之后发送。
+    fn query_inner(
+        &mut self,
+        kind: QueryKind,
+        wait: &Wait,
+        allow_release_fence: bool,
+    ) -> Result<Reply, Error> {
         if kind != QueryKind::Identity {
             self.require_identity()?;
         }
@@ -484,7 +664,11 @@ impl Client {
             self.error(Failure::Session(format!("{e:?}")), LocalStage::NotSubmitted)
         })?;
         let message = matcher.request().map_err(|e| invalid(format!("{e:?}")))?;
-        let (id, deadline, cancel) = self.send(&message, wait)?;
+        let (id, deadline, cancel) = if allow_release_fence {
+            self.send_without_release_fence(&message, wait)?
+        } else {
+            self.send(&message, wait)?
+        };
         let mut stage = LocalStage::MayHaveBeenSubmitted;
         // USB 的 IN completion 可以先于 OUT completion 到达。只为本查询保留一份已匹配
         // 回复，仍须等待本地完整提交，不能以任意回复伪造提交事实。
@@ -661,7 +845,7 @@ impl Client {
     /// 显式发送一次心跳，只返回本地提交。
     /// 显式发送一次心跳；返回本地提交，不证明固件已刷新入口联系。
     pub fn heartbeat(&mut self, wait: &Wait) -> Result<LocalSubmission, Error> {
-        self.submit(Message::Heartbeat, wait)
+        self.submit_without_release_fence(Message::Heartbeat, wait)
     }
     /// 提交持续位置目标，单位 mm；只返回本地提交，限值与采用由固件决定。
     pub fn position(&mut self, mm: f32, wait: &Wait) -> Result<LocalSubmission, Error> {
@@ -694,11 +878,20 @@ impl Client {
     }
     /// 仅此入口表示用户显式停止意图。其返回值不证明设备已取走停止。
     pub fn stop_control(&mut self, wait: &Wait) -> Result<LocalSubmission, Error> {
-        self.submit(Message::Stop, wait)
+        self.submit_without_release_fence(Message::Stop, wait)
     }
     fn submit(&mut self, message: Message<'_>, wait: &Wait) -> Result<LocalSubmission, Error> {
         self.require_identity()?;
         let (id, deadline, cancel) = self.send(&message, wait)?;
+        self.await_submission(id, deadline, cancel, wait, true)
+    }
+    fn submit_without_release_fence(
+        &mut self,
+        message: Message<'_>,
+        wait: &Wait,
+    ) -> Result<LocalSubmission, Error> {
+        self.require_identity()?;
+        let (id, deadline, cancel) = self.send_without_release_fence(&message, wait)?;
         self.await_submission(id, deadline, cancel, wait, true)
     }
     /// 保存前完成全量静态检查；保留原始字节，绝不重排 JSON 或自动停止控制。
@@ -742,6 +935,7 @@ impl Client {
             key,
             kind: Some(kind),
             result: None,
+            release_fence: None,
         });
         let result = self
             .send(&message, wait)
@@ -786,6 +980,14 @@ impl Client {
         self.require_key_identity(key)?;
         self.query(QueryKind::Result(key), wait)
     }
+    fn read_result_after_release_fence(
+        &mut self,
+        key: MaintenanceKey,
+        wait: &Wait,
+    ) -> Result<Reply, Error> {
+        self.require_key_identity(key)?;
+        self.query_inner(QueryKind::Result(key), wait, true)
+    }
     /// 重连后继续跟踪已核对设备的调用方原键。不会改变键或提交维护。
     ///
     /// 键的 UID 必须与最近一次 [`Self::identify`] 核对的设备一致；可跟踪该设备先前运行实例的
@@ -804,19 +1006,28 @@ impl Client {
             key,
             kind: None,
             result: None,
+            release_fence: None,
         });
         Ok(())
     }
-    /// 只释放已核对设备上已取得并处理的已结清结果的精确版本。随后 ReadResult 确认回收。
+    /// 只释放已核对设备上已取得并处理的已结清结果的精确版本。
+    ///
+    /// 本地提交或提交结果未知后，会保留该键的隔离，拒绝后续普通查询、目标和维护请求；
+    /// [`Self::confirm_released`] 先等待同一运行实例的新鲜被动 `retained_result=false`
+    /// 事实，再发送唯一允许的 `ReadResult` 确认回收。显式 Stop 和 Heartbeat 仍可提交；
+    /// Stop 后仍须先取得新的被动停止事实，才能继续确认释放。
     ///
     /// 已跟踪键的 UID 必须与最近一次 [`Self::identify`] 核对的设备一致。
     pub fn release_result(&mut self, wait: &Wait) -> Result<LocalSubmission, Error> {
         self.require_identity()?;
-        let (key, result) = self
+        let (key, result, fence_active) = self
             .pending
             .as_ref()
-            .map(|p| (p.key, p.result))
+            .map(|p| (p.key, p.result, p.release_fence.is_some()))
             .ok_or_else(|| invalid("没有已跟踪操作"))?;
+        if fence_active {
+            return Err(self.error(Failure::PendingOperation, LocalStage::NotSubmitted));
+        }
         self.require_key_identity(key)?;
         let result = result.ok_or_else(|| invalid("尚未取得维护结果"))?;
         if !result.evidence.settled
@@ -831,18 +1042,84 @@ impl Client {
             return Err(invalid("结果尚不可释放"));
         }
         let bytes = key.to_bytes();
-        let (id, deadline, cancel) = self.send(
+        let minimum_snapshot_time_us = self
+            .telemetry()
+            .and_then(|reply| match reply.response() {
+                Ok(Response::Telemetry(telemetry))
+                    if telemetry.fields().sample.run_nonce == key.run_nonce =>
+                {
+                    Some(telemetry.fields().sample.snapshot_time_us)
+                }
+                _ => None,
+            })
+            .map_or(result.sample.snapshot_time_us, |telemetry_time_us| {
+                telemetry_time_us.max(result.sample.snapshot_time_us)
+            });
+        let fence = ReleaseFence {
+            // 尚未取得本地提交边界时先保守隔离；成功或未知返回后会更新为对应边界。
+            submitted_before: Instant::now(),
+            minimum_snapshot_time_us,
+        };
+        self.pending
+            .as_mut()
+            .expect("release requires the tracked pending operation")
+            .release_fence = Some(fence);
+        let submitted = self.send_without_release_fence(
             &Message::ReleaseResult {
                 key: protocol::OperationKey::new(&bytes).map_err(|e| invalid(format!("{e:?}")))?,
                 revision: result.revision,
             },
             wait,
-        )?;
-        self.await_submission(id, deadline, cancel, wait, true)
+        );
+        let result = submitted.and_then(|(id, deadline, cancel)| {
+            self.await_submission(id, deadline, cancel, wait, true)
+        });
+        match &result {
+            Ok(local) => {
+                self.pending
+                    .as_mut()
+                    .expect("release pending operation remains local")
+                    .release_fence
+                    .as_mut()
+                    .expect("locally submitted release keeps its fence")
+                    .submitted_before = local.submitted_at;
+            }
+            Err(error) if error.local == LocalStage::NotSubmitted => {
+                self.pending
+                    .as_mut()
+                    .expect("release pending operation remains local")
+                    .release_fence = None;
+            }
+            Err(_) => {
+                // 未知提交不能采用发送前或旧缓存；从本次等待结束后重新等待被动事实。
+                self.pending
+                    .as_mut()
+                    .expect("unknown release keeps its pending operation")
+                    .release_fence
+                    .as_mut()
+                    .expect("unknown release keeps its fence")
+                    .submitted_before = Instant::now();
+            }
+        }
+        result
     }
     /// 用新的查询确认指定原结果已释放。只有明确 0x0306 才清本地跟踪。
+    ///
+    /// 若前一步 ReleaseResult 已本地提交或提交未知，先等待同 UID／nonce、快照时间推进且
+    /// 接收时刻晚于本地提交边界的被动清除事实。超时、取消或断连保留 pending 和未知结果，
+    /// 不重发 ReleaseResult。
     pub fn confirm_released(&mut self, key: MaintenanceKey, wait: &Wait) -> Result<(), Error> {
-        match self.read_result(key, wait) {
+        let started = Instant::now();
+        self.await_release_fence(key, wait)?;
+        let left = wait.timeout.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(self.wait_error(Failure::Timeout, LocalStage::FullySubmitted, true));
+        }
+        let step = Wait {
+            timeout: left,
+            cancellation: wait.cancellation.clone(),
+        };
+        match self.read_result_after_release_fence(key, &step) {
             Err(Error {
                 failure: Failure::DataUnavailable(f),
                 ..

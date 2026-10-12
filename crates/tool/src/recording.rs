@@ -175,6 +175,13 @@ impl Recording {
         self.telemetry.flush().map_err(|error| error.to_string())
     }
 
+    #[cfg(test)]
+    pub(super) fn fail_event_writes(&mut self) -> std::io::Result<()> {
+        self.events.flush()?;
+        self.events = BufWriter::new(File::open(&self.metadata_path)?);
+        Ok(())
+    }
+
     pub(crate) fn finish(mut self) -> Result<Value, String> {
         self.event("recording_stopped", json!({}))?;
         self.flush()?;

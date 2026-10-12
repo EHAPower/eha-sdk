@@ -68,8 +68,15 @@ test("a live session on the other transport retains the global write lock", () =
 });
 
 test("completed status exposes its stop reason and observed confirmation", () => {
-  assert.equal(trialState({ trial:{ state:"completed" } }).label, "已完成");
+  assert.equal(trialState({ trial:{ state:"completed" } }).label, "已结束");
   assert.match(trialStatusText({ state:"completed", stop_reason:"position_reached", stop_observed:true }), /位置到位.*无目标且驱动 Idle/);
   assert.match(trialStatusText({ state:"completed", stop_reason:"explicit", stop_observed:true, stop_submission:{ unknown_no_retry:true } }), /Stop 提交结果未确认.*无目标且驱动 Idle/);
   assert.match(trialStatusText({ state:"interrupted_unknown", reason:"transport_disconnected:lost" }), /结果未知.*transport_disconnected/);
+});
+
+test("Stop confirmation overdue remains visible while waiting and after completion", () => {
+  assert.match(trialStatusText({ state:"stopping", stop_reason:"telemetry_stale", stop_confirmation_overdue:true }), /遥测过期.*确认已超期/);
+  assert.match(trialStatusText({ state:"completed", stop_reason:"recording_failed", stop_observed:true, stop_confirmation_overdue:true }), /运行记录失败.*确认曾超期.*无目标且驱动 Idle/);
+  assert.match(trialStatusText({ state:"interrupted_unknown", reason:"transport_disconnected", stop_confirmation_overdue:true }), /结果未知.*确认已超期/);
+  assert.match(trialStatusText({ state:"interrupted_unrecoverable", reason:"running_instance_changed", stop_confirmation_overdue:true }), /结果未知.*确认曾超期.*运行实例已变化/);
 });

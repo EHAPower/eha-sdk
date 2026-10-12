@@ -8,6 +8,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -21,10 +22,11 @@ use eha_sdk::{
     protocol::{
         self, Direction, Message, MessageKind, SampleData,
         responses::{
-            self, ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView,
-            FallbackReason, IdentityFields, IdentityText, MaintenanceOperation, MaintenanceState,
-            OperationEvidence, OperationPhase, OperationResultFields, StartupSource,
-            UnavailableSubject,
+            self, ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView, ContactState,
+            DesiredAxis, FallbackReason, IdentityFields, IdentityText, MaintenanceOperation,
+            MaintenanceState, OperationEvidence, OperationPhase, OperationResultFields,
+            ReferenceKind, StartupSource, TargetIngress, TargetMode, TelemetryFacts,
+            TelemetryFields, UnavailableSubject, ValueFields, ValueResult, ValueState,
         },
     },
     session::MaintenanceKey,
@@ -178,6 +180,70 @@ fn operation_result(query_id: u32, operation_id: u64) -> Vec<u8> {
     let length =
         responses::encode_operation_result(&fields, &mut bytes).expect("operation result encodes");
     bytes[..length].to_vec()
+}
+
+fn available(value: f32) -> ValueFields {
+    ValueFields::new(
+        value,
+        ValueState::new(
+            ValueResult::Available,
+            responses::SourceQuality::Qualified,
+            false,
+        ),
+    )
+}
+
+fn never() -> ValueFields {
+    ValueFields::new(
+        0.0,
+        ValueState::new(ValueResult::Never, responses::SourceQuality::Unknown, false),
+    )
+}
+
+fn telemetry(run_nonce: [u8; 16], sequence: u32, retained_result: bool) -> Vec<u8> {
+    let fields = TelemetryFields {
+        sample: SampleData {
+            query_id: 0,
+            run_nonce,
+            snapshot_sequence: sequence,
+            snapshot_time_us: u64::from(sequence) * 1_000,
+        },
+        decision_age_us: 0,
+        target_mode: TargetMode::None,
+        target_ingress: TargetIngress::None,
+        facts: TelemetryFacts {
+            retained_result,
+            ..Default::default()
+        },
+        target_values: [0.0; 3],
+        can_adoption_blockers: 0,
+        usb_adoption_blockers: 0,
+        output_blockers: 0,
+        last_end_reason: 0,
+        limits: Default::default(),
+        main_values: [available(1.0); 5],
+        position_age_us: 0,
+        velocity_age_us: 0,
+        pressure_pair_age_us: 0,
+        reference: never(),
+        reference_kind: ReferenceKind::None,
+        candidate_rpm: available(0.0),
+        last_submitted_rpm: available(0.0),
+        submitted_age_us: 0,
+        axis_state_raw: 0,
+        axis_error_raw: 0,
+        driver_age_us: u32::MAX,
+        driver_state: Default::default(),
+        desired_axis: DesiredAxis::Idle,
+        can_heartbeat_age_us: 0,
+        usb_heartbeat_age_us: 0,
+        can_contact: ContactState::Expired,
+        usb_contact: ContactState::Expired,
+    };
+    let mut bytes = vec![0; TelemetryFields::encoded_len()];
+    let length = responses::encode_telemetry(&fields, &mut bytes).expect("telemetry encodes");
+    bytes.truncate(length);
+    bytes
 }
 
 fn read_failed_config(query_id: u32) -> Vec<u8> {
@@ -565,6 +631,284 @@ fn tracking_the_same_key_keeps_the_observed_result_for_release() {
         .release_result(&Wait::new(Duration::from_millis(100)))
         .expect("the retained result remains releasable");
     assert_eq!(seen.count(MessageKind::ReleaseResult), 1);
+}
+
+#[test]
+fn release_waits_for_a_new_passive_clear_before_reading_its_result() {
+    let seen = Seen::default();
+    let release_started = Arc::new(AtomicBool::new(false));
+    let fresh_clear_sent = Arc::new(AtomicBool::new(false));
+    let read_before_clear = Arc::new(AtomicBool::new(false));
+    let backend = Backend::spawn("eha-sdk-release-fence-test", {
+        let seen = seen.clone();
+        let release_started = release_started.clone();
+        let fresh_clear_sent = fresh_clear_sent.clone();
+        let read_before_clear = read_before_clear.clone();
+        move |commands, sink| {
+            let mut pump = Pump::new(commands, sink);
+            let mut early_clear_due = None;
+            let mut release_submission_due = None;
+            let mut fresh_clear_due = None;
+            while pump.poll() {
+                for lane in 0..3 {
+                    while let Some(request) = pump.take(lane) {
+                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
+                            .expect("SDK emits a contract-valid host request");
+                        seen.record(message.kind());
+                        match message {
+                            Message::Query {
+                                query_id,
+                                category: 0,
+                            } => {
+                                pump.sink.submitted(request.id);
+                                pump.sink.received(identity(query_id));
+                            }
+                            Message::SaveConfig { key, .. } => {
+                                pump.sink.submitted(request.id);
+                                pump.sink.received(operation_result(0, key.operation_id()));
+                            }
+                            Message::ReadResult { query_id, key } => {
+                                if release_started.load(Ordering::Acquire) {
+                                    if !fresh_clear_sent.load(Ordering::Acquire) {
+                                        read_before_clear.store(true, Ordering::Release);
+                                    }
+                                    pump.sink.submitted(request.id);
+                                    if fresh_clear_sent.load(Ordering::Acquire) {
+                                        pump.sink.received(unavailable_result(
+                                            query_id,
+                                            UnavailableSubject::OperationResult,
+                                            0x0306,
+                                            key.operation_id(),
+                                        ));
+                                    }
+                                } else {
+                                    pump.sink.submitted(request.id);
+                                    pump.sink
+                                        .received(operation_result(query_id, key.operation_id()));
+                                    // Release 前的留存事实和其后的同一快照均不能跨越 fence。
+                                    pump.sink.received(telemetry(NONCE, 10, true));
+                                }
+                            }
+                            Message::ReleaseResult { .. } => {
+                                release_started.store(true, Ordering::Release);
+                                // 发送排队后的 clear 不能越过尚未到达的本地 Submitted 边界。
+                                early_clear_due = Some(Instant::now() + Duration::from_millis(10));
+                                release_submission_due =
+                                    Some((request.id, Instant::now() + Duration::from_millis(35)));
+                            }
+                            other => panic!("unexpected request: {other:?}"),
+                        }
+                    }
+                }
+                if early_clear_due.is_some_and(|due| Instant::now() >= due) {
+                    pump.sink.received(telemetry(NONCE, 11, false));
+                    early_clear_due = None;
+                }
+                if let Some((request_id, due)) = release_submission_due
+                    && Instant::now() >= due
+                {
+                    pump.sink.submitted(request_id);
+                    fresh_clear_due = Some(Instant::now() + Duration::from_millis(35));
+                    release_submission_due = None;
+                }
+                if fresh_clear_due.is_some_and(|due| Instant::now() >= due) {
+                    pump.sink.received(telemetry(NONCE, 12, false));
+                    fresh_clear_sent.store(true, Ordering::Release);
+                    fresh_clear_due = None;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    })
+    .expect("test backend starts");
+    let mut client = Client::new(backend);
+    identify(&mut client);
+
+    let submission = client
+        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
+        .expect("save is locally submitted");
+    client
+        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
+        .expect("the retained result is observed before release");
+    client
+        .release_result(&Wait::new(Duration::from_millis(100)))
+        .expect("release is locally submitted");
+
+    let blocked_identity = client
+        .identify(Some(UID), &Wait::new(Duration::from_millis(20)))
+        .expect_err(
+            "Identity must not overwrite ReleaseResult before its passive consumption evidence",
+        );
+    assert!(matches!(
+        blocked_identity.failure,
+        Failure::PendingOperation
+    ));
+    let blocked = client
+        .status(&Wait::new(Duration::from_millis(20)))
+        .expect_err("a later ordinary request cannot overwrite the ReleaseResult slot");
+    assert!(matches!(blocked.failure, Failure::PendingOperation));
+    assert_eq!(
+        seen.count(MessageKind::Query),
+        1,
+        "the timed-out Identity and blocked Status sent no later ordinary request"
+    );
+
+    client
+        .confirm_released(submission.key, &Wait::new(Duration::from_millis(150)))
+        .expect("only a fresh passive clear permits the 0x0306 confirmation");
+    assert!(fresh_clear_sent.load(Ordering::Acquire));
+    assert!(
+        !read_before_clear.load(Ordering::Acquire),
+        "ReadResult must not overwrite the unconsumed ReleaseResult"
+    );
+    assert_eq!(seen.count(MessageKind::ReleaseResult), 1);
+    assert_eq!(seen.count(MessageKind::ReadResult), 2);
+    assert!(client.pending_operation().is_none());
+}
+
+#[test]
+fn wrong_run_telemetry_cannot_confirm_or_replay_a_locally_submitted_release() {
+    let seen = Seen::default();
+    let backend = backend_with(seen.clone(), |message, sink, request_id| match message {
+        Message::Query {
+            query_id,
+            category: 0,
+        } => {
+            sink.submitted(request_id);
+            sink.received(identity(query_id));
+        }
+        Message::SaveConfig { key, .. } => {
+            sink.submitted(request_id);
+            sink.received(operation_result(0, key.operation_id()));
+        }
+        Message::ReadResult { query_id, key } => {
+            sink.submitted(request_id);
+            sink.received(operation_result(query_id, key.operation_id()));
+        }
+        Message::ReleaseResult { .. } => {
+            sink.submitted(request_id);
+            sink.received(telemetry([8; 16], 11, false));
+        }
+        Message::Heartbeat | Message::Stop => sink.submitted(request_id),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let mut client = Client::new(backend);
+    identify(&mut client);
+
+    let submission = client
+        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
+        .expect("save is locally submitted");
+    client
+        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
+        .expect("the retained result is observed before release");
+    client
+        .release_result(&Wait::new(Duration::from_millis(100)))
+        .expect("release is locally submitted");
+
+    let error = client
+        .confirm_released(submission.key, &Wait::new(Duration::from_millis(30)))
+        .expect_err("a different run's telemetry cannot clear this release fence");
+    assert!(matches!(error.failure, Failure::ResultUnknown(_)));
+    assert_eq!(client.pending_operation(), Some(submission.key));
+    assert_eq!(
+        seen.count(MessageKind::ReadResult),
+        1,
+        "timeout sends no confirmation query"
+    );
+
+    client
+        .heartbeat(&Wait::new(Duration::from_millis(20)))
+        .expect("a heartbeat uses its independent lane during release isolation");
+    client
+        .stop_control(&Wait::new(Duration::from_millis(20)))
+        .expect("explicit Stop remains available during release isolation");
+    let blocked = client
+        .status(&Wait::new(Duration::from_millis(20)))
+        .expect_err("ordinary requests remain isolated after Stop");
+    assert!(matches!(blocked.failure, Failure::PendingOperation));
+    assert_eq!(seen.count(MessageKind::Heartbeat), 1);
+    assert_eq!(seen.count(MessageKind::Stop), 1);
+
+    let repeat = client
+        .release_result(&Wait::new(Duration::from_millis(20)))
+        .expect_err("unknown local submission must not be replayed");
+    assert!(matches!(repeat.failure, Failure::PendingOperation));
+    assert_eq!(seen.count(MessageKind::ReleaseResult), 1);
+}
+
+#[test]
+fn resumed_client_cannot_use_a_new_backend_to_cross_an_unknown_release_fence() {
+    let original = backend_with(Seen::default(), |message, sink, request_id| match message {
+        Message::Query {
+            query_id,
+            category: 0,
+        } => {
+            sink.submitted(request_id);
+            sink.received(identity(query_id));
+        }
+        Message::SaveConfig { key, .. } => {
+            sink.submitted(request_id);
+            sink.received(operation_result(0, key.operation_id()));
+        }
+        Message::ReadResult { query_id, key } => {
+            sink.submitted(request_id);
+            sink.received(operation_result(query_id, key.operation_id()));
+        }
+        Message::ReleaseResult { .. } => sink.submitted(request_id),
+        other => panic!("unexpected request: {other:?}"),
+    });
+    let mut first = Client::new(original);
+    identify(&mut first);
+    let submission = first
+        .begin_save(VALID_CONFIG, &Wait::new(Duration::from_millis(100)))
+        .expect("save is locally submitted");
+    first
+        .read_result(submission.key, &Wait::new(Duration::from_millis(100)))
+        .expect("the retained result is observed before release");
+    first
+        .release_result(&Wait::new(Duration::from_millis(100)))
+        .expect("release is locally submitted before disconnect");
+    let state = first.disconnect();
+
+    let seen = Seen::default();
+    let (clear_ready, clear_observed) = mpsc::sync_channel(1);
+    let resumed_backend = Backend::spawn("eha-sdk-release-resume-test", {
+        let seen = seen.clone();
+        move |commands, sink| {
+            // 即便新 backend 立即出现相同 nonce 的 clear，也不能为旧连接的 Release 背书。
+            sink.received(telemetry(NONCE, 99, false));
+            clear_ready.send(()).expect("test observes preloaded clear");
+            let mut pump = Pump::new(commands, sink);
+            while pump.poll() {
+                for lane in 0..3 {
+                    if let Some(request) = pump.take(lane) {
+                        let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
+                            .expect("SDK emits a contract-valid host request");
+                        seen.record(message.kind());
+                        panic!(
+                            "resume must not send {message:?} before old ReleaseResult is confirmed"
+                        );
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+    })
+    .expect("test backend starts");
+    clear_observed
+        .recv_timeout(Duration::from_millis(100))
+        .expect("new backend preloads its same-nonce telemetry");
+    let mut resumed = Client::resume(resumed_backend, state);
+    let error = resumed
+        .identify(Some(UID), &Wait::new(Duration::from_millis(20)))
+        .expect_err("a new backend cannot prove the old release was consumed");
+    assert!(matches!(error.failure, Failure::ResultUnknown(_)));
+    let confirm = resumed
+        .confirm_released(submission.key, &Wait::new(Duration::from_millis(20)))
+        .expect_err("an unverified new backend cannot confirm the old release either");
+    assert!(matches!(confirm.failure, Failure::ResultUnknown(_)));
+    assert_eq!(resumed.pending_operation(), Some(submission.key));
+    assert!(seen.snapshot().is_empty());
 }
 
 #[test]
