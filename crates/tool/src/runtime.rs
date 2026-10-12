@@ -255,13 +255,15 @@ mod tests {
         fs::write(&python, []).expect("python placeholder");
         let link = launcher.0.join("eha-tool");
         symlink(&executable, &link).expect("launcher symlink");
+        let expected =
+            Resolution::Bundled(fs::canonicalize(python).expect("canonical bundled python"));
         assert_eq!(
             resolve(
                 &fs::canonicalize(link).expect("canonical executable"),
                 None,
                 None
             ),
-            Ok(Resolution::Bundled(python))
+            Ok(expected)
         );
     }
 

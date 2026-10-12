@@ -29,7 +29,7 @@ flowchart LR
 ```
 
 枚举不会打开设备或扫描总线，不能说明连接或 Identity 已核对。`device` 的每个动作新建本地
-会话、核对 Identity、执行一个动作后关闭本地句柄；单次调用返回后不保留会话或心跳。USB 目标使用完整
+会话、核对 Identity、执行一个动作后关闭本地句柄；单次调用返回后不保留会话、心跳或 USB 传输编号及其保护状态。因此两个独立 USB `device` 进程不构成同一串行会话；连续查询、维护核对或脚本自动化使用已有的 `shell --batch`，在同一 SDK 会话内完成，不把独立调用的超时自动重发。USB 目标使用完整
 序列号；CAN 目标可选已保存的 `--connection ID`，或给出高级 `--can-channel` 与 `--node`，可选
 `--can-mode classic|fd`（默认 `fd`）和 `--can-python` 指定带 `python-can` 的解释器。受管档案仅支持
 CANable2/SLCAN：它按保存的稳定 USB 序列号选择唯一串口，并应用 1 Mbps／2 Mbps FD 预设；发行包自带运行它的

@@ -959,7 +959,7 @@ fn handle_request_with_scan_body(
                                 node,
                                 None,
                                 odrive.last_read.as_ref(),
-                                json!({"ok":true,"message":if result.local_submission.is_some() { "请求已本地提交；设备效果需显式重连并读取当前事实。" } else { "已取得操作结果；设备状态单独展示。" },"result":result}),
+                                json!({"ok":true,"message":if result.local_submission.is_some() { "请求已本地提交；请根据后续状态或遥测判断设备效果。" } else { "已取得操作结果；设备状态单独展示。" },"result":result}),
                             ),
                             Err(error) => session_structured_error(
                                 request,
