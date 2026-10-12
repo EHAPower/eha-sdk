@@ -438,7 +438,20 @@ pub(crate) fn receive_frame(
             }
         }
         ReceiveResult::Rejected { reason } => {
-            sink.transport_error(format!("CAN 帧不满足绑定: {reason:?}"), Vec::new())
+            sink.transport_error(
+                format!(
+                    "CAN 帧不满足绑定: {reason:?}; id=0x{:08X}, extended={}, rtr={}, fdf={}, brs={}, esi={}, dlc={}, data_len={}",
+                    frame.id,
+                    frame.extended,
+                    frame.rtr,
+                    frame.fdf,
+                    frame.brs,
+                    frame.esi,
+                    frame.dlc,
+                    frame.data_len,
+                ),
+                frame.data().to_vec(),
+            )
         }
         ReceiveResult::Ignored | ReceiveResult::Incomplete { .. } => {}
     }
@@ -576,6 +589,61 @@ mod tests {
                     .0,
             );
         }
+    }
+
+    #[test]
+    fn rejected_prefix_keeps_the_received_can_frame_for_diagnosis() {
+        let mut heartbeat = [0_u8; 8];
+        let mut short = [0_u8; 256];
+        let mut large = [0_u8; protocol::MAX_MESSAGE_LEN];
+        let mut receiver = Receiver::new(
+            1,
+            protocol::Direction::FirmwareToHost,
+            Mode::Fd,
+            GENERATION,
+            RxBuffers {
+                heartbeat: &mut heartbeat,
+                short: &mut short,
+                large: &mut large,
+            },
+        )
+        .expect("test buffers are valid");
+        let sink = EventSink(Arc::new((
+            Mutex::new(crate::host::backend::Inbox::default()),
+            std::sync::Condvar::new(),
+        )));
+        let frame = Frame {
+            // 节点 1、F→H、短通道、传输号 0 的首片；v1 前缀在当前 v2 下必须拒绝。
+            id: 0x0068_0000,
+            extended: true,
+            rtr: false,
+            fdf: true,
+            brs: true,
+            esi: true,
+            dlc: 15,
+            data_len: 64,
+            data: [1; 64],
+        };
+
+        receive_frame(&mut receiver, &sink, &frame, 0);
+
+        let (lock, _) = &*sink.0;
+        let inbox = lock.lock().expect("event inbox available");
+        let (detail, raw, _) = inbox
+            .transport
+            .last_error
+            .as_ref()
+            .expect("invalid first fragment is rejected");
+        assert!(detail.contains("InvalidPrefix"));
+        assert!(detail.contains("id=0x00680000"));
+        assert!(detail.contains("extended=true"));
+        assert!(detail.contains("rtr=false"));
+        assert!(detail.contains("fdf=true"));
+        assert!(detail.contains("brs=true"));
+        assert!(detail.contains("esi=true"));
+        assert!(detail.contains("dlc=15"));
+        assert!(detail.contains("data_len=64"));
+        assert_eq!(raw, &frame.data().to_vec());
     }
 
     #[test]

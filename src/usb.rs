@@ -30,6 +30,7 @@ const INTERFACE_PROTOCOL: u8 = 0x01;
 const MAX_MESSAGE_LEN: usize = 16_440;
 const IO_IDLE_WAIT: Duration = Duration::from_millis(1);
 const IO_ISOLATION_WAIT: Duration = Duration::from_secs(1);
+const INPUT_TRANSFERS: usize = 8;
 
 struct ActiveRequest {
     id: u64,
@@ -56,6 +57,21 @@ struct OpenEndpoints {
     interface: nusb::Interface,
     input: nusb::Endpoint<Bulk, In>,
     output: nusb::Endpoint<Bulk, Out>,
+}
+
+/// 同步取得已经完成的 Bulk IN；时间必须在每个 completion 实际返回后采样。
+trait CompletedInput {
+    type Completion;
+
+    fn wait_next_complete(&mut self, wait: Duration) -> Option<Self::Completion>;
+}
+
+impl CompletedInput for nusb::Endpoint<Bulk, In> {
+    type Completion = nusb::transfer::Completion;
+
+    fn wait_next_complete(&mut self, wait: Duration) -> Option<Self::Completion> {
+        nusb::Endpoint::wait_next_complete(self, wait)
+    }
 }
 
 #[derive(Clone)]
@@ -380,7 +396,11 @@ fn run(
     let mut pending_tx: Option<(transport::usb::TxToken, usize)> = None;
     let mut active = [None, None, None];
 
-    input.submit(Buffer::new(transport::usb::PACKET_LEN));
+    // 按 nusb 的流式接收方式预挂多个请求，使 worker 处理 completion 时
+    // 内核仍可继续接收分片；保留每次 64 B，避免等待短包或额外填满大缓冲。
+    for _ in 0..INPUT_TRANSFERS {
+        input.submit(Buffer::new(transport::usb::PACKET_LEN));
+    }
     loop {
         if !pump.poll() {
             break;
@@ -425,7 +445,9 @@ fn run(
         }
 
         if let Err(reason) =
-            drain_received(&mut input, &mut receiver, &sink, now_ms, Duration::ZERO)
+            drain_received(&mut input, &mut receiver, &sink, Duration::ZERO, || {
+                pump.now_ms()
+            })
         {
             input.cancel_all();
             output.cancel_all();
@@ -450,7 +472,8 @@ fn run(
         }
         // 仅在这一轮没有待完成的 OUT 包时有限等待 IN；这避免空闲自旋，且不会
         // 为连续发送增加固定的 1 ms 包间隔。
-        if let Err(reason) = idle_receive(&mut input, &output, &mut receiver, &sink, pump.now_ms())
+        if let Err(reason) =
+            idle_receive(&mut input, &output, &mut receiver, &sink, || pump.now_ms())
         {
             input.cancel_all();
             output.cancel_all();
@@ -533,25 +556,40 @@ fn idle_receive(
     output: &nusb::Endpoint<Bulk, Out>,
     receiver: &mut transport::usb::Receiver<'_>,
     sink: &EventSink,
-    now_ms: u64,
+    now_ms: impl FnMut() -> u64,
 ) -> Result<(), String> {
     if output.pending() == 0 {
-        drain_received(input, receiver, sink, now_ms, IO_IDLE_WAIT)
+        drain_received(input, receiver, sink, IO_IDLE_WAIT, now_ms)
     } else {
         Ok(())
     }
+}
+
+fn drain_completions<S, E>(
+    input: &mut S,
+    wait: Duration,
+    mut now_ms: impl FnMut() -> u64,
+    mut handle: impl FnMut(&mut S, S::Completion, u64) -> Result<(), E>,
+) -> Result<(), E>
+where
+    S: CompletedInput,
+{
+    let mut wait = wait;
+    while let Some(completion) = input.wait_next_complete(wait) {
+        wait = Duration::ZERO;
+        handle(input, completion, now_ms())?;
+    }
+    Ok(())
 }
 
 fn drain_received(
     input: &mut nusb::Endpoint<Bulk, In>,
     receiver: &mut transport::usb::Receiver<'_>,
     sink: &EventSink,
-    now_ms: u64,
     wait: Duration,
+    now_ms: impl FnMut() -> u64,
 ) -> Result<(), String> {
-    let mut wait = wait;
-    while let Some(completion) = input.wait_next_complete(wait) {
-        wait = Duration::ZERO;
+    drain_completions(input, wait, now_ms, |input, completion, received_at_ms| {
         let nusb::transfer::Completion {
             buffer,
             actual_len,
@@ -563,7 +601,11 @@ fn drain_received(
         let mut consumed = 0;
         while consumed < actual_len {
             let before = consumed;
-            let result = receiver.feed(receiver.phase(), &buffer[consumed..actual_len], now_ms);
+            let result = receiver.feed(
+                receiver.phase(),
+                &buffer[consumed..actual_len],
+                received_at_ms,
+            );
             consumed += result.consumed;
             let raw = buffer[before..consumed].to_vec();
             match result.event {
@@ -598,8 +640,8 @@ fn drain_received(
             }
         }
         input.submit(buffer);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 fn report_timeouts(sink: &EventSink, timeouts: transport::usb::PollResult, raw: Vec<u8>) {
@@ -774,7 +816,26 @@ fn fail_expired_active(active: &mut [Option<ActiveRequest>; 3], sink: &EventSink
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::Cell, collections::VecDeque, rc::Rc};
+
     use super::*;
+
+    struct ReadyInput {
+        completions: VecDeque<(u64, Vec<u8>)>,
+        clock: Rc<Cell<u64>>,
+        waits: Vec<Duration>,
+    }
+
+    impl CompletedInput for ReadyInput {
+        type Completion = Vec<u8>;
+
+        fn wait_next_complete(&mut self, wait: Duration) -> Option<Self::Completion> {
+            self.waits.push(wait);
+            let (received_at_ms, bytes) = self.completions.pop_front()?;
+            self.clock.set(received_at_ms);
+            Some(bytes)
+        }
+    }
 
     fn device(serial: Option<&str>) -> Device {
         Device {
@@ -807,6 +868,94 @@ mod tests {
     fn connector_needs_a_persistent_serial_before_any_usb_io() {
         assert!(UsbConnector::new("").is_err());
         assert!(UsbConnector::new("240018000E51343033333232").is_ok());
+    }
+
+    #[test]
+    fn drain_samples_time_after_each_ready_completion() {
+        let clock = Rc::new(Cell::new(0));
+        let mut input = ReadyInput {
+            completions: VecDeque::from([(0, Vec::new()), (25, vec![1])]),
+            clock: Rc::clone(&clock),
+            waits: Vec::new(),
+        };
+        let mut heartbeat = [0; 8];
+        let mut short = [0; 256];
+        let mut long = [0; MAX_MESSAGE_LEN];
+        let mut receiver = transport::usb::Receiver::new(
+            protocol::Direction::FirmwareToHost,
+            &mut heartbeat,
+            &mut short,
+            &mut long,
+        );
+        let mut event = None;
+
+        let result = drain_completions(
+            &mut input,
+            IO_IDLE_WAIT,
+            || clock.get(),
+            |_, bytes, received_at_ms| {
+                if !bytes.is_empty() {
+                    event = Some(
+                        receiver
+                            .feed(receiver.phase(), &bytes, received_at_ms)
+                            .event,
+                    );
+                }
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(event, Some(transport::usb::ReceiveEvent::NeedMore));
+        assert_eq!(receiver.poll(25), transport::usb::PollResult::default());
+        assert_eq!(
+            input.waits,
+            vec![IO_IDLE_WAIT, Duration::ZERO, Duration::ZERO]
+        );
+    }
+
+    #[test]
+    fn drain_rejects_a_late_completion_for_an_existing_block() {
+        let clock = Rc::new(Cell::new(0));
+        let mut input = ReadyInput {
+            completions: VecDeque::from([(0, vec![1]), (25, vec![0])]),
+            clock: Rc::clone(&clock),
+            waits: Vec::new(),
+        };
+        let mut heartbeat = [0; 8];
+        let mut short = [0; 256];
+        let mut long = [0; MAX_MESSAGE_LEN];
+        let mut receiver = transport::usb::Receiver::new(
+            protocol::Direction::FirmwareToHost,
+            &mut heartbeat,
+            &mut short,
+            &mut long,
+        );
+        let mut events = Vec::new();
+
+        let result = drain_completions(
+            &mut input,
+            Duration::ZERO,
+            || clock.get(),
+            |_, bytes, received_at_ms| {
+                events.push(
+                    receiver
+                        .feed(receiver.phase(), &bytes, received_at_ms)
+                        .event,
+                );
+                Ok::<(), ()>(())
+            },
+        );
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(events[0], transport::usb::ReceiveEvent::NeedMore);
+        assert_eq!(
+            events[1],
+            transport::usb::ReceiveEvent::TimedOut(transport::usb::PollResult {
+                block_timed_out: true,
+                lane_timed_out: [false; 3],
+            })
+        );
     }
 
     #[test]
