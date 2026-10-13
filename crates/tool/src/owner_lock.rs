@@ -173,8 +173,32 @@ impl OwnerGuard {
     }
 }
 
+#[cfg(unix)]
 fn default_directory() -> Result<PathBuf, OwnerLockError> {
-    Ok(user_data_directory()?.join("owners-v1"))
+    // 通路 owner 属于实际 OS 用户；HOME/XDG/profile 只能改变数据目录，不能分割锁。
+    // 使用安全的系统账户查询，不执行 shell，也不在查询失败后回退到环境变量。
+    let uid = nix::unistd::geteuid();
+    let user = nix::unistd::User::from_uid(uid)
+        .map_err(|error| OwnerLockError::io("无法查询 owner 的 OS 账户", error))?
+        .ok_or_else(|| OwnerLockError::invalid("当前有效 UID 没有 OS 账户记录"))?;
+    if user.uid != uid || !user.dir.is_absolute() {
+        return Err(OwnerLockError::invalid(
+            "OS 账户 home 必须是当前有效 UID 的绝对路径",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let base = user.dir.join("Library").join("Application Support");
+    #[cfg(not(target_os = "macos"))]
+    let base = user.dir.join(".local").join("share");
+    Ok(base.join("eha-tool").join("owners-v1"))
+}
+
+#[cfg(not(unix))]
+fn default_directory() -> Result<PathBuf, OwnerLockError> {
+    Err(OwnerLockError {
+        code: "owner_lock_unsupported",
+        message: "当前平台尚未实现 OS 用户锚定的 owner 锁".into(),
+    })
 }
 
 pub(crate) fn user_data_directory() -> Result<PathBuf, OwnerLockError> {
@@ -570,9 +594,14 @@ mod tests {
     #[ignore = "仅由跨进程测试子进程执行"]
     fn owner_child() {
         use std::io::{Read, Write};
-        let directory = std::env::var_os("EHA_OWNER_TEST_DIRECTORY").expect("子进程目录");
-        let key = ResourceKey::usb("process-shared").expect("key");
-        match OwnerGuard::acquire_in(Path::new(&directory), &key) {
+        let serial =
+            std::env::var("EHA_OWNER_TEST_SERIAL").unwrap_or_else(|_| "process-shared".into());
+        let key = ResourceKey::usb(&serial).expect("key");
+        let acquired = match std::env::var_os("EHA_OWNER_TEST_DIRECTORY") {
+            Some(directory) => OwnerGuard::acquire_in(Path::new(&directory), &key),
+            None => OwnerGuard::acquire(&key),
+        };
+        match acquired {
             Ok(_guard) => {
                 assert!(std::env::var_os("EHA_OWNER_TEST_BUSY").is_none());
                 println!("owner_ready");
@@ -600,6 +629,58 @@ mod tests {
             .args(["--exact", &test_name, "--ignored", "--nocapture"])
             .env("EHA_OWNER_TEST_DIRECTORY", directory);
         command
+    }
+
+    #[test]
+    fn default_owner_namespace_ignores_home_and_xdg_across_processes() {
+        use std::process::Stdio;
+        let fixture = Fixture::new();
+        let serial = format!(
+            "namespace-fixture-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let key = ResourceKey::usb(&serial).expect("synthetic key");
+        let guard = OwnerGuard::acquire(&key).expect("OS account owner");
+        // 不改并行测试所在进程环境；只有真正子进程使用互异的 HOME/XDG。
+        for variant in ["a", "b"] {
+            let mut child = child_command(Path::new("/"));
+            child
+                .env_remove("EHA_OWNER_TEST_DIRECTORY")
+                .env("EHA_OWNER_TEST_SERIAL", &serial)
+                .env("EHA_OWNER_TEST_BUSY", "1")
+                .env("HOME", fixture.0.join(variant))
+                .env("XDG_RUNTIME_DIR", fixture.0.join(format!("run-{variant}")))
+                .env("TMPDIR", fixture.0.join(format!("tmp-{variant}")));
+            if variant == "a" {
+                child.env_remove("XDG_DATA_HOME");
+            } else {
+                child.env("XDG_DATA_HOME", fixture.0.join("independent-data"));
+            }
+            assert!(
+                child
+                    .stdout(Stdio::null())
+                    .status()
+                    .expect("competing child")
+                    .success()
+            );
+        }
+        drop(guard);
+        // 相同改写环境在原 owner 退出后可持锁，拒绝是竞争而非无效 fake HOME。
+        assert!(
+            child_command(Path::new("/"))
+                .env_remove("EHA_OWNER_TEST_DIRECTORY")
+                .env_remove("EHA_OWNER_TEST_BUSY")
+                .env("EHA_OWNER_TEST_SERIAL", &serial)
+                .env("HOME", fixture.0.join("b"))
+                .env("XDG_DATA_HOME", fixture.0.join("independent-data"))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .status()
+                .expect("released namespace child")
+                .success()
+        );
+        assert!(!fixture.0.join("independent-data").exists());
     }
 
     #[test]

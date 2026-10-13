@@ -434,6 +434,15 @@ pub(crate) struct FixtureProbe {
 }
 
 impl FixtureProbe {
+    pub(crate) fn disconnect(&self) {
+        self.sink
+            .lock()
+            .expect("fixture sink")
+            .as_ref()
+            .expect("started fixture")
+            .disconnected("synthetic passive disconnect");
+    }
+
     pub(crate) fn inject_idle(&self, sequence: u32) {
         self.inject_idle_at(sequence, Instant::now());
     }

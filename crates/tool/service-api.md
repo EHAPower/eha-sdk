@@ -356,6 +356,15 @@ USB 序列号；高级 CAN 使用规范化 channel/resource。节点、模式、
 取得 owner lock 后才打开 Backend；只有显式 `--via-service` 能复用服务会话，失败时不回落
 直连。旧 `webui` 是同一服务核心的兼容入口，不能再创建第二个持有者。
 
+Unix 的通路锁目录使用有效 UID 的 OS 账户数据库 home：macOS 为
+`<OS-home>/Library/Application Support/eha-tool/owners-v1`，Linux 和其它 Unix 为
+`<OS-home>/.local/share/eha-tool/owners-v1`。HOME、XDG_DATA_HOME、XDG_RUNTIME_DIR、
+TMPDIR、service dataDir 或 profile 都不能改变该 namespace；配置与服务数据仍可使用 XDG。
+账户查询失败、home 非绝对路径、路径 symlink 或 UID/权限不符合私有目录边界时直接拒绝，
+不回退到环境变量。升级前必须停止旧服务及直连 owner；旧版自定义 XDG 锁目录与新版不支持
+并发互斥，不扫描或兼容任意历史目录。该 advisory 锁不抵抗同 UID 主动删除/替换锁目录、
+运行期间管理员改变 OS 账户 home 或外部非合作发送者。
+
 CLI 精确形式为 `device --via-service <absolute-instance-file> --target-id <target-id> ACTION`。
 `--via-service` 和 `--target-id` 必须同时出现，且与 `--usb`、`--connection`、`--can-channel`、
 `--node`、显式 `--can-mode`、`--can-python` 互斥。默认没有 `--via-service` 时保持单次直连。

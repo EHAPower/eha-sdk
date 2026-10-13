@@ -174,7 +174,7 @@ fn instance_status(
     let snapshot = workbench.snapshot_json(super::WebTransport::Usb, None, None, None)?;
     let summary = |id: Value, snapshot: &Value| {
         json!({
-            "session_id":id,"connected":snapshot["connected"] == true,
+            "session_id":id,"connected":snapshot["connected"] == true && snapshot["transport"]["disconnected"].is_null(),
             "heartbeat_active":snapshot["heartbeat"]["enabled"] == true,
             "trial_state":snapshot["trial"]["state"],"recording_active":snapshot["recording"]["active"] == true
         })
@@ -300,6 +300,34 @@ mod tests {
         json!({"api_version":2,"instance_id":"i-test","target_id":"can:1","intent":"attach",
             "expected_identity":{"uid":uid,"run_nonce":run_nonce},
             "connection_generation":session.connection_generation().to_string()})
+    }
+
+    #[test]
+    fn passive_can_disconnect_is_consistent_in_instance_and_targets() {
+        let (mut workbench, probe) = fixture();
+        probe.disconnect();
+        workbench.tick();
+        let state = workbench.v2.take().expect("v2 state");
+        let instance = super::instance_status(&state, &mut workbench).expect("instance");
+        let can = instance["sessions"]
+            .as_array()
+            .expect("sessions")
+            .iter()
+            .find(|session| session["session_id"] == "can:1")
+            .expect("CAN summary");
+        assert_eq!(can["connected"], false);
+        let connections = workbench.service_connections();
+        let can = connections
+            .iter()
+            .find(|connection| connection["target_id"] == "can:1")
+            .expect("CAN connection");
+        assert_eq!(can["connected"], false);
+        assert!(
+            !workbench
+                .integration_session_mut("can:1")
+                .expect("session")
+                .integration_connected()
+        );
     }
 
     #[test]
