@@ -22,11 +22,17 @@ use std::{
     thread::{self, JoinHandle},
     time::Duration,
 };
-use tiny_http::{Header, Method as HttpMethod, Response, Server, StatusCode};
+use tiny_http::{Header, Method as HttpMethod, Response, StatusCode};
 
+mod connection_profiles;
+mod events;
 mod http_body;
+mod http_io;
 pub(crate) mod instance;
 mod integration;
+mod network_jobs;
+mod p2;
+mod read_jobs;
 mod v2;
 mod workbench;
 
@@ -94,7 +100,9 @@ struct OdriveView {
     last_read: Option<Value>,
     busy: bool,
     jobs: SyncSender<OdriveJob>,
-    completed: Receiver<OdriveResult>,
+    completed: Receiver<(Option<String>, OdriveResult)>,
+    v2_results: std::collections::BTreeMap<String, Value>,
+    next_v2: u64,
     _worker: JoinHandle<()>,
 }
 
@@ -136,16 +144,20 @@ impl OdriveView {
         let worker = thread::spawn(move || {
             while let Ok(job) = receiver.recv() {
                 let result = runner(job.operation);
-                if sender.send(result.clone()).is_err() {
+                if sender.send((job.job_id.clone(), result.clone())).is_err() {
                     break;
                 }
-                if let Err(error) = respond_json(job.request, result.status, result.value.clone()) {
+                if let Some(request) = job.request
+                    && let Err(error) = respond_json(request, result.status, result.value.clone())
+                {
                     eprintln!("warning: ODrive WebUI response failed: {error}");
                 }
             }
         });
         Self {
             last_read: None,
+            v2_results: std::collections::BTreeMap::new(),
+            next_v2: 1,
             busy: false,
             jobs,
             completed,
@@ -156,8 +168,22 @@ impl OdriveView {
     fn reap(&mut self) {
         loop {
             match self.completed.try_recv() {
-                Ok(result) => {
+                Ok((job_id, result)) => {
                     self.busy = false;
+                    if let Some(job_id) = job_id {
+                        let state = if result.status == 200 {
+                            "completed"
+                        } else {
+                            "failed"
+                        };
+                        let text = serde_json::to_string(&result.value).unwrap_or_default();
+                        self.v2_results.insert(
+                            job_id.clone(),
+                            json!({"job_id":job_id,"state":state,
+                            "data":{"source":"odrive_usb","native_json_text":text},
+                            "error":if result.status == 200 { None } else { Some(text) }}),
+                        );
+                    }
                     if result.cache_read {
                         self.last_read = Some(result.value);
                     }
@@ -180,16 +206,49 @@ impl OdriveView {
         if self.busy {
             return Err(OdriveStartError::Busy(Box::new(request)));
         }
-        match self.jobs.try_send(OdriveJob { request, operation }) {
+        match self.jobs.try_send(OdriveJob {
+            request: Some(request),
+            operation,
+            job_id: None,
+        }) {
             Ok(()) => {
                 self.busy = true;
                 Ok(())
             }
-            Err(TrySendError::Full(job)) => Err(OdriveStartError::Busy(Box::new(job.request))),
-            Err(TrySendError::Disconnected(job)) => {
-                Err(OdriveStartError::Unavailable(Box::new(job.request)))
-            }
+            Err(TrySendError::Full(job)) => Err(OdriveStartError::Busy(Box::new(
+                job.request.expect("legacy request"),
+            ))),
+            Err(TrySendError::Disconnected(job)) => Err(OdriveStartError::Unavailable(Box::new(
+                job.request.expect("legacy request"),
+            ))),
         }
+    }
+}
+
+impl OdriveView {
+    fn start_v2(&mut self, operation: OdriveOperation) -> Result<Value, String> {
+        self.reap();
+        if self.busy {
+            return Err("ODrive USB worker 正忙".into());
+        }
+        let next = self.next_v2.checked_add(1).ok_or("ODrive 任务序号耗尽")?;
+        let id = format!("odrive-{}", self.next_v2);
+        self.jobs
+            .try_send(OdriveJob {
+                request: None,
+                operation,
+                job_id: Some(id.clone()),
+            })
+            .map_err(|_| "ODrive USB worker 不可用")?;
+        self.next_v2 = next;
+        self.busy = true;
+        while self.v2_results.len() >= 16 {
+            let key = self.v2_results.keys().next().cloned().expect("nonempty");
+            self.v2_results.remove(&key);
+        }
+        let value = json!({"job_id":id,"state":"running","data":null,"error":null});
+        self.v2_results.insert(id, value.clone());
+        Ok(value)
     }
 }
 
@@ -201,7 +260,8 @@ enum OdriveOperation {
 }
 
 struct OdriveJob {
-    request: tiny_http::Request,
+    request: Option<tiny_http::Request>,
+    job_id: Option<String>,
     operation: OdriveOperation,
 }
 
@@ -239,10 +299,13 @@ enum OdriveStartError {
 struct CanScanView {
     jobs: SyncSender<CanScanJob>,
     busy: bool,
-    completed: Receiver<()>,
+    completed: Receiver<(Option<String>, Value)>,
+    v2_results: std::collections::BTreeMap<String, Value>,
+    next_v2: u64,
 }
 struct CanScanJob {
-    request: tiny_http::Request,
+    request: Option<tiny_http::Request>,
+    scan_id: Option<String>,
     channel: String,
     mode: String,
     python: Option<String>,
@@ -269,19 +332,42 @@ impl CanScanView {
                     Err(error) => errors.push(json!({"node":node,"message":error.message,"unknown":error.unknown,"error":error})),
                 }
                 }
-                let _ = respond_json(job.request, 200, scan_response(nodes, errors));
-                let _ = done.send(());
+                let result = scan_response(nodes, errors);
+                let _ = done.send((job.scan_id, result.clone()));
+                if let Some(request) = job.request {
+                    let _ = respond_json(request, 200, result);
+                }
             }
         });
         Self {
             jobs,
             busy: false,
             completed,
+            v2_results: std::collections::BTreeMap::new(),
+            next_v2: 1,
         }
     }
     fn reap(&mut self) {
-        while self.completed.try_recv().is_ok() {
+        while let Ok((scan_id, result)) = self.completed.try_recv() {
             self.busy = false;
+            if let Some(scan_id) = scan_id {
+                let nodes = result["nodes"].as_array().map(|nodes| nodes.iter().map(|node| json!({
+                    "node":node["node"],"identity":{"uid":node["identity"]["uid"],"run_nonce":node["identity"]["sample"]["run_nonce"]}
+                })).collect::<Vec<_>>()).unwrap_or_default();
+                let errors = result["errors"]
+                    .as_array()
+                    .map(|errors| {
+                        errors.iter().map(|error| json!({
+                    "node":error["node"],"message":error["message"],"unknown":error["unknown"],
+                    "error_json_text":serde_json::to_string(&error["error"]).ok()
+                })).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.v2_results.insert(
+                    scan_id.clone(),
+                    json!({"scan_id":scan_id,"state":"completed","nodes":nodes,"errors":errors}),
+                );
+            }
         }
     }
     #[allow(clippy::result_large_err)] // Caller must retain the request to report a busy scan.
@@ -297,6 +383,24 @@ impl CanScanView {
             }
             Err(TrySendError::Full(job) | TrySendError::Disconnected(job)) => Err(job),
         }
+    }
+}
+impl CanScanView {
+    fn start_v2(&mut self, mut job: CanScanJob) -> Result<Value, String> {
+        self.reap();
+        let next = self.next_v2.checked_add(1).ok_or("扫描序号耗尽")?;
+        let id = format!("scan-{}", self.next_v2);
+        job.scan_id = Some(id.clone());
+        self.start(job)
+            .map_err(|_| "CAN 扫描 worker 正忙或不可用")?;
+        self.next_v2 = next;
+        while self.v2_results.len() >= 16 {
+            let key = self.v2_results.keys().next().cloned().expect("nonempty");
+            self.v2_results.remove(&key);
+        }
+        let value = json!({"scan_id":id,"state":"running","nodes":[],"errors":[]});
+        self.v2_results.insert(id, value.clone());
+        Ok(value)
     }
 }
 fn scan_response(nodes: Vec<Value>, errors: Vec<Value>) -> Value {
@@ -392,10 +496,11 @@ fn run(
     if let Some(credentials) = &mut credentials {
         credentials.endpoint = format!("http://127.0.0.1:{port}");
     }
-    let server = Server::http(("127.0.0.1", port)).map_err(|error| error.to_string())?;
+    let server = http_io::server(port)?;
     let mut workbench = prepare_workbench(runs_dir, credentials, legacy_routes);
     let mut odrive = OdriveView::new(odrive_python);
     let mut scan = CanScanView::new();
+    let mut io_deadlines = http_io::Deadlines::default();
     let body_reader = BodyReader::new();
     let published = if legacy_routes {
         None
@@ -416,19 +521,19 @@ fn run(
             &descriptor,
         )?)
     };
-    if legacy_routes {
-        println!("WebUI 本地入口：http://127.0.0.1:{port}/");
+    let ready = if legacy_routes {
+        format!("WebUI 本地入口：http://127.0.0.1:{port}/")
     } else {
-        println!(
-            "{}",
-            v2::ready(
-                port,
-                workbench.v2.as_ref().expect("serve credentials"),
-                &published.as_ref().expect("published instance").path
-            )
-        );
-    }
+        v2::ready(
+            port,
+            workbench.v2.as_ref().expect("serve credentials"),
+            &published.as_ref().expect("published instance").path,
+        )
+        .to_string()
+    };
+    http_io::write_ready(&mut std::io::stdout().lock(), &ready);
     loop {
+        io_deadlines.poll();
         if workbench
             .v2
             .as_ref()
@@ -447,6 +552,7 @@ fn run(
         workbench.tick();
         odrive.reap();
         scan.reap();
+        p2::capture_jobs(&mut workbench, &odrive, &mut scan);
         while let Ok(ReadyRequest { request, body, .. }) = body_reader.try_recv() {
             if let Err(error) = handle_request_with_scan_body(
                 request,
@@ -479,6 +585,10 @@ fn run(
         else {
             continue;
         };
+        if !io_deadlines.register(&request) {
+            request.abort();
+            continue;
+        }
         if let Err(error) = handle_received_request(
             request,
             port,
@@ -524,7 +634,7 @@ fn handle_received_request(
             message,
         );
     }
-    let is_json_write = request_method(&request) == Method::Post
+    let is_json_write = matches!(request_method(&request), Method::Post | Method::Delete)
         && (request_path(&request).starts_with("/api/") || integration || service_v2);
     if !is_json_write {
         return handle_request_with_scan_body(request, port, workbench, odrive, scan, None);
@@ -593,12 +703,16 @@ fn handle_request_with_scan_body(
     scan: &mut CanScanView,
     parsed_body: Option<Result<crate::RawFields, String>>,
 ) -> Result<(), String> {
+    if http_io::was_aborted(&request) {
+        request.abort();
+        return Ok(());
+    }
     odrive.reap();
     scan.reap();
     let method = request_method(&request);
     let path = request_path(&request).to_owned();
     if path.starts_with("/service/v2/") {
-        return v2::dispatch(request, port, workbench, parsed_body);
+        return v2::dispatch(request, port, workbench, odrive, scan, parsed_body);
     }
     if !workbench.legacy_routes && !path.starts_with("/integration/v1/") {
         return v2::not_found(request, workbench.v2.as_ref());
@@ -1149,7 +1263,8 @@ fn handle_request_with_scan_body(
                     }
                 }
                 let job = CanScanJob {
-                    request,
+                    request: Some(request),
+                    scan_id: None,
                     channel,
                     mode,
                     python,
@@ -1158,7 +1273,7 @@ fn handle_request_with_scan_body(
                 match scan.start(job) {
                     Ok(()) => Ok(()),
                     Err(job) => respond_json(
-                        job.request,
+                        job.request.expect("legacy request"),
                         409,
                         json!({"ok":false,"message":"CAN 扫描工作线程不可用。"}),
                     ),
@@ -1626,13 +1741,31 @@ fn respond_async(
     request: tiny_http::Request,
     response: Response<std::io::Cursor<Vec<u8>>>,
 ) -> Result<(), String> {
-    thread::Builder::new()
-        .name("eha-tool-webui-response".into())
-        .spawn(move || {
-            let _ = request.respond(response);
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
+    if ACTIVE
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+            (n < 16).then_some(n + 1)
         })
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+        .is_err()
+    {
+        request.abort();
+        return Err("HTTP 响应发送容量已满；已关闭连接".into());
+    }
+    struct Slot;
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    http_io::spawn_response(
+        thread::Builder::new().name("eha-tool-webui-response".into()),
+        request,
+        response,
+        Slot,
+    )
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

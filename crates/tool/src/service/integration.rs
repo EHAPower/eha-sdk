@@ -756,7 +756,11 @@ pub(super) fn authorize(
     if hosts.len() != 1 || hosts[0].value.as_str() != format!("127.0.0.1:{port}") {
         return Err((403, "origin_rejected", "Host 不是本机集成端口"));
     }
-    if request.url().contains('?') {
+    let v2_query = state.version == 2
+        && request_method(request) == Method::Get
+        && (request_path(request) == "/service/v2/events"
+            || request_path(request).starts_with("/service/v2/recordings/"));
+    if request.url().contains('?') && !v2_query {
         return Err((400, "bad_request", "集成路由不接受查询参数"));
     }
     if header(request, "Origin").is_some() {
@@ -770,7 +774,11 @@ pub(super) fn authorize(
     if headers.len() != 1 || headers[0].value.as_str() != format!("Bearer {}", state.token) {
         return Err((401, "unauthorized", "集成凭据无效"));
     }
-    if request_method(request) == Method::Post {
+    if request_method(request) == Method::Post
+        || (state.version == 2
+            && request_method(request) == Method::Delete
+            && request_path(request).starts_with("/service/v2/profiles/"))
+    {
         if !header(request, "Content-Type").is_some_and(|value| {
             value
                 .split(';')
@@ -882,7 +890,14 @@ pub(super) mod tests {
             Ok(response)
         });
         if path.starts_with("/service/v2/") {
-            super::super::v2::dispatch(server.recv()?, port, workbench, None)?;
+            super::super::v2::dispatch(
+                server.recv()?,
+                port,
+                workbench,
+                &mut super::super::OdriveView::new(None),
+                &mut super::super::CanScanView::new(),
+                None,
+            )?;
         } else {
             dispatch(server.recv()?, port, workbench, None)?;
         }
@@ -1670,6 +1685,8 @@ mod observation_timeout_regression {
                                 request,
                                 address.port(),
                                 &mut workbench,
+                                &mut super::super::OdriveView::new(None),
+                                &mut super::super::CanScanView::new(),
                                 None,
                             )
                             .expect("actual service dispatch");

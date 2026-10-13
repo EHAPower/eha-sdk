@@ -196,9 +196,114 @@ API 版本、所需 capability 以及响应 `instance_id` 与发现记录完全�
 | `GET /service/v2/recordings`、`GET /service/v2/recordings/{id}` | 只按服务返回的记录 ID 列举或导出，不能接受任意文件路径。慢下载不阻塞采集、记录或 Stop。|
 | `GET /service/v2/odrive/devices`、`POST /service/v2/odrive/read` | 仅 ODrive USB 枚举/读取；不能证明 H723 CAN 通路或扩大为控制能力。|
 
+#### P2 精确 DTO（实现后由 capability 启用）
+
+P2 增量 capability：`managed_profiles`、`adapter_discovery`、`connections`、`can_scan`、
+`events`、`recordings_read`、`odrive_read`、`read_jobs`、`usb_profiles`、`advanced_can`、`selected_node_connections`。记录开始/结束仍为 P4，P2 不发布该 capability。
+所有下述对象均附加通用 envelope；ID 只在当前实例有效。读取接口也须认证。
+
+- `GET /adapters`、`GET /recordings`、`GET /recordings/{id}?file=NAME&offset=DECIMAL`
+  返回 HTTP 202 任务对象。`GET /jobs/{job_id}` 返回 HTTP 200 同一任务对象：
+  `{job_id,state:"queued|running|completed|failed",data:null|object,error:null|string}`。
+  队列忙返回 409 `busy`，任务不自动重试。结果最多保留 16 项，过期 ID 返回 404。
+  adapters data 为 `{adapters:[{kind,serial,description,vid,pid}]}`，不公开设备路径；
+  解释器不可用通过 failed/error 明示。
+- recordings data 为 `{runs:[{id,metadata_json_text:null|string,files:[NAME]}],truncated:boolean}`。
+  最多返回 128 项、检查 1024 目录项、每项 metadata 最多 65536 字节、总原文预算 262144 字节；超预算条目为 null 且 truncated=true。不可读 metadata_json_text 为 null，合法 JSON 原文不经过浮点回显。
+  下载只能使用该服务列举返回的 ID，NAME 只能是 `metadata.json`、`events.jsonl`、
+  `telemetry.csv`，不接受路径。下载 data 为
+  `{run_id,file,offset:"0",next_offset:"65536",eof:boolean,content_base64:string}`，
+  每批最多 65536 原始字节；offset 为非负 u64 十进制字符串，缺省为 0。客户端按 next_offset
+  显式获取后续批次，不能把部分批次报告为完整导出。文件/目录符号链接拒绝。
+- `GET /profiles` 返回 `{profiles:[PROFILE],load_error:null|string,busy:boolean}`。
+  受管 CAN PROFILE 为 `{transport:"can",id,name,adapter:{kind:"canable2",serial},node:0..127,mode:"fd",expected_uid:null|string}`；
+  不提供 autoconnect/default。POST 顶层为 `{api_version,instance_id,profile:PROFILE}`，
+  DELETE `/profiles/{id}` body 为 `{api_version,instance_id}`。保存/删除返回任务对象；
+  `GET /jobs/{id}` 中完成 data 为 `{profile:PROFILE}` 或 `{id,deleted:true}`。
+  同 ID 保存沿用 ConnectionStore UID 绑定规则，不能更换已有绑定 UID。
+- `POST /connections` body 仅允许 `{api_version,instance_id,transport:"usb",serial}` 或
+  `{api_version,instance_id,profile_id}`。新连接仅允许空闲 owner 的明确候选/档案；
+  已断开的会话须显式 reconnect，不能通过 connect 隐式恢复。
+  成功返回 `{connection_id,target_id,identity,connection_generation,connected,snapshot_json_text,telemetry_received_age_ms:null|DECIMAL}`；
+  connection_id 当前等于 target_id（`usb:SERIAL` 或 `can:N`），不能替代身份/代次。
+  `GET /connections` 返回 `{connections:[同一对象]}`，仅投影缓存，包含断开会话事实。
+  reconnect/disconnect body 精确为 `{api_version,instance_id,expected_identity,connection_generation}`；
+  完成返回更新后的上述对象，旧代次立即失效。失败不重连/回落/重发。
+  首次 Identity 握手失败可能保留 `identity:null` 的断开上下文；人工 reconnect 必须回显该 null
+  和当前代次，服务仅在自己同样没有 Identity 时接受 null，再通过同一连接器完成首次身份核对。
+  已知 Identity 绝不接受 null；调用者不能删除身份门禁以跨设备恢复。
+  连接/重连仍在唯一 owner 串行执行 SDK 握手，P2 不承诺 P4 的高优先级 Stop 调度。
+- `POST /scans` body 为 `{api_version,instance_id,connection_id,expected_identity,connection_generation,nodes:[0..127]}`，
+  nodes 非空、不重复、最多 16 项，connection_id 必须是已连接 CAN 会话。
+  返回 HTTP 202 `{scan_id,state:"running",nodes:[],errors:[]}`；
+  `GET /scans/{scan_id}` 返回 `{scan_id,state:"running|completed",nodes:[{node,identity}],errors:[{node,message,unknown,error_json_text}]}`。
+  最多保留 16 项；节点无响应只进入 errors，不抹去成功节点。扫描复用既有共享 CAN 网络和门禁。
+- `GET /odrive/devices` 和 `POST /odrive/read` 返回 HTTP 202 任务对象，后者 body
+  精确为 `{api_version,instance_id,serial}`。结果通过 `/jobs/{id}` 读取；data 包含
+  `{source:"odrive_usb",native_json_text:string}`。失败保留解释器/SDK 原生错误文本，
+  不作为 H723 通路、身份或停止证据。独立 ODrive worker 同时最多一个任务。
+- `GET /events?after=DECIMAL&limit=INTEGER` 默认 after=0、limit=100，limit 为 1..100。
+  返回 `{events:[{cursor,kind,source_id,source_timestamp:{clock,value},received_at,payload,gap,source_gap}],
+  cursor,gap,gap_reasons,lost_ranges,truncated}`。cursor/时间/掉样计数均为十进制字符串。
+  `source_id` 为含 target_id、连接代次和 Identity 的不透明字符串；客户端以 payload 的
+  target_id/connection_generation/identity 关联会话。kind 为 `connection`、`telemetry`、
+  `source_gap`、`scan` 或 `job`；连接/scan/job clock 为 host_unix_ms，遥测为 device_monotonic_us。
+  telemetry payload 固定为 `{target_id,identity,connection_generation,native_json_text}`；原文为趋势点
+  `{cursor,time_us,sequence,position,velocity,force,target_mode,target_values,gap}`，仅供展示，不能重建业务请求。
+  connection/source_gap payload 为 `{target_id,identity,connection_generation,connected}`；
+  scan/job payload 为 `{scan_id|job_id,state}`。received_at 为 owner 将事实放入服务缓存的主机时间。source_gap 为 null 或
+  `{reason,dropped:null|DECIMAL}`；lost_ranges 为 `{first_cursor,last_cursor,count}` 数组，
+  只代表服务缓存遗漏，不能推断设备掉样。cursor_ahead/cache_loss/source_gap 均令 gap=true。
+  消费不会删除其他消费者事件；limit 不跳过未返回项。遇 gap 必须重取 snapshot。
+  缓存最多 4096 事件、估算 4 MiB、保留 30 秒；单事件最大 8192 字节。
+
+`describe.limits` 明示上述 events/job/scan/recording 和有界 HTTP 发送线程上限。HTTP 单次往返使用 Connection: close，不支持连接流水线；发送最多 16 个并发线程，满载先 shutdown 实际 socket。
+SDK opt-in bounded HTTP 在 accept 前预留、parser 分派前限制最多 64 个连接 permit，permit 跟随实际读写所有权；
+Request 队列同样最多 64，满时关闭 socket。请求行与首部总计最多 16 KiB；chunk 原始编码 body 最多 8 MiB，应用实体限制不变；独立 monitor 从 accept 起
+执行 10000 ms 绝对连接截止，涵盖首部、预读、排队、body 和响应。每连接只解析一个请求。
+owner 的最多 64 个未完成控制引用与轮询截止仅为第二层保护；同步 SDK 等待不会阻止独立 monitor。
+ready 写入 stdout 失败不会终止已监听并发布发现记录的服务。P4 前仍不承诺 SDK 请求可抢占。
+客户端不得因关闭或超时自动重发设备动作。
+P2 保持 `read_gate: existing_global_readonly_gate`、`control_supported:false`、
+`mutation_ledger_supported:false`、`recording_write_supported:false`；无自动连接、心跳、目标或 Stop。
+
 事件是服务采集事实，独立于浏览器绘制、binding 解除和前端轮询。Fieldkit 后端通过受认证的
 批次接口投影事件；浏览器只接收插件 Remote 结果。隐藏面板最多停止前端轮询，不能停止服务采集
 或记录。连接或重连不会启心跳、恢复目标或重放动作。
+
+### P2 连接补全 DTO（同版本兼容扩展）
+
+`PROFILE` 是带 `transport` 的联合：受管 CAN 在既有字段上增加 `transport:"can"`（保存时兼容省略），
+USB 为 `{transport:"usb",id,name,serial,expected_uid:string|null}`。两个档案文件共享 id 命名空间；
+加载损坏或跨类型重名汇入原 `load_error:string|null`，拒绝涉及档案的连接/写入，绝不静默覆盖。
+GET/POST/DELETE profiles 和完成 job 的原封装不变；USB sidecar 为原档案目录的 `usb-connections.json`。
+USB 档案首次连接和每次显式重连均核对 expected UID；未绑定档案首次 Identity 后把 UID 交有界档案
+worker 持久化，连接回复额外含 `profile_job_id:string|null`。该 job 完成 data 为 `{profile:PROFILE}`；
+持久化失败显示失败，不能解释为持久身份已绑定。当前 Workbench owner 仍保留首次 UID，所有 v1/v2 bindings 和连接入口统一核对以后重连。
+档案 id 删除后重建为另一 serial 时，旧会话不能向新档案写入绑定 UID。
+
+高级 CAN 输入 `ADVANCED={channel:string,mode:"classic"|"fd",python:string|null}`，channel 是既有
+SDK python-can 配置 context，python 是显式解释器覆盖；复用原 SDK factory/配置和物理 owner lock。
+`POST /connections` 新增 `{api_version,instance_id,transport:"can",advanced:ADVANCED,node:number}`，
+高级/受管 CAN 连接统一 HTTP 202 标准 JOB，完成 data 为 `{connection:CONNECTION}`；节点 0..127。
+网络首次构造交给有界 worker，仅移交唯一 CanNetwork，pending 时拒绝重复打开。owner 收回网络后
+才执行 Identity 握手；工厂错误不回落、不自动重试。
+无已持有节点且网络已终止时，下一次明确 connect/scan 可将旧网络交给同一 worker 释放后重建；
+网络代次递增，旧 scan 失效。有节点的网络不得用此路径替换，须显式原会话重连。USB 连接仍返回 HTTP 200 原 CONNECTION。已存在的 target（包括断连）拒绝，须原上下文显式重连。
+
+`POST /scans` 除原已连接 `connection_id/expected_identity/connection_generation` 外，允许空网络来源
+`{api_version,instance_id,advanced:ADVANCED,nodes:number[]}` 或
+`{api_version,instance_id,profile_id:string,nodes:number[]}`，三个来源互斥。profile 必须是 CAN。
+创建或复用同一个 owner CAN 网络，202 scan 和部分结果封装不变；不自动连接扫描所得节点。
+
+`POST /connections/batch {api_version,instance_id,scan_id:string,nodes:number[]}` 返回 HTTP 202 标准 JOB；
+只能从该已完成且仍缓存的 scan 成功项明确选择 1..16 个互异节点。服务保留扫描身份并在首次连接后核对。
+owner 每轮最多执行一个节点握手；不在线程中复制 Client，HTTP 请求不等待整批握手。
+完成 JOB 的 data 为 `{connections:CONNECTION[],errors:[{node:number,target_id:string,code:string,
+message:string,unknown:boolean,error_json_text:string|null}]}`。部分失败仍 `state:"completed"`，保留成功项；
+已有 target 包括断连逐项 `binding_stale`，不调用旧批量入口的隐式 reconnect。扫描结果被淘汰、实例改变、
+当前网络不匹配或扫描正忙则拒绝。作业、扫描、会话原上限 16 不变，同一时刻最多一个连接批次。
+同步单次 SDK 握手仍不能承诺 Stop 抢占；P4 调度门未开放。客户端超时只显式刷新事实，不能自动重发。
 
 ### P3：配置和维护
 

@@ -45,14 +45,17 @@ pub(crate) struct CanNetworkState {
 /// 但由一个 `CanNetwork` 持有外部 CAN 通道。
 pub(crate) struct Workbench {
     usb: ToolSession,
+    usb_expected_identity: BTreeMap<String, String>,
     can_nodes: BTreeMap<u8, ToolSession>,
     can_network: Option<CanNetworkState>,
+    can_network_generation: u64,
     default_can_node: Option<u8>,
     /// 成功进入 group start 的原始范围。即使单项开始返回 unknown 也保留，直到每台
     /// 节点的 Stop 被新遥测确认，避免浏览器下一次请求缩窄 Stop 覆盖范围。
     group_nodes: BTreeSet<u8>,
     runs_dir: PathBuf,
-    profiles: ConnectionStore,
+    pub(super) profiles: Option<ConnectionStore>,
+    pub(super) p2: Option<super::p2::State>,
     pub(super) integration: Option<super::integration::IntegrationState>,
     pub(super) v2: Option<super::integration::IntegrationState>,
     pub(super) legacy_routes: bool,
@@ -62,12 +65,15 @@ impl Workbench {
     pub(crate) fn new(runs_dir: PathBuf) -> Self {
         Self {
             usb: new_session(),
+            usb_expected_identity: BTreeMap::new(),
             can_nodes: BTreeMap::new(),
             can_network: None,
+            can_network_generation: 0,
             default_can_node: None,
             group_nodes: BTreeSet::new(),
+            p2: Some(super::p2::State::new(runs_dir.clone())),
             runs_dir,
-            profiles: ConnectionStore::load_default(),
+            profiles: Some(ConnectionStore::load_default()),
             integration: None,
             v2: None,
             legacy_routes: true,
@@ -82,14 +88,19 @@ impl Workbench {
         let default_can_node = can_nodes.keys().next().copied();
         Self {
             usb,
+            usb_expected_identity: BTreeMap::new(),
             can_nodes,
             can_network: None,
+            can_network_generation: 0,
             default_can_node,
             group_nodes: BTreeSet::new(),
             runs_dir: std::env::temp_dir().join("eha-tool-webui-tests"),
-            profiles: ConnectionStore::load(
+            profiles: Some(ConnectionStore::load(
                 std::env::temp_dir().join("eha-tool-webui-tests-connections.json"),
-            ),
+            )),
+            p2: Some(super::p2::State::new(
+                std::env::temp_dir().join("eha-tool-webui-tests"),
+            )),
             integration: None,
             v2: None,
             legacy_routes: true,
@@ -122,6 +133,11 @@ impl Workbench {
     }
 
     pub(crate) fn tick(&mut self) {
+        if let Some(mut p2) = self.p2.take() {
+            p2.reap(self);
+            p2.advance_batch(self);
+            self.p2 = Some(p2);
+        }
         self.usb.tick();
         for session in self.can_nodes.values_mut() {
             session.tick();
@@ -134,10 +150,68 @@ impl Workbench {
         {
             self.group_nodes.clear();
         }
+        self.capture_service_events();
+    }
+
+    pub(super) fn capture_service_events(&mut self) {
+        if self.v2.is_none() {
+            return;
+        }
+        let Some(mut state) = self.p2.take() else {
+            return;
+        };
+        if let Some(ConnectionRequest::Usb { serial }) = self.usb.snapshot().connection {
+            state.capture_session(&format!("usb:{serial}"), &mut self.usb);
+        }
+        for (node, session) in &mut self.can_nodes {
+            state.capture_session(&format!("can:{node}"), session);
+        }
+        self.p2 = Some(state);
+    }
+
+    pub(super) fn service_connections(&mut self) -> Vec<Value> {
+        let mut values = Vec::new();
+        if let Some(ConnectionRequest::Usb { serial }) = self.usb.snapshot().connection {
+            values.push(super::p2::connection_value(
+                &format!("usb:{serial}"),
+                &mut self.usb,
+            ));
+        }
+        for (node, session) in &mut self.can_nodes {
+            values.push(super::p2::connection_value(&format!("can:{node}"), session));
+        }
+        values
+    }
+
+    pub(super) fn service_scan_job(&mut self, nodes: &[u8]) -> Result<super::CanScanJob, String> {
+        if let Some(reason) = self.integration_global_read_blocker() {
+            return Err(format!("当前服务只读门禁拒绝扫描：{reason}"));
+        }
+        self.can_scan_guard()?;
+        let network = self.can_network.as_ref().ok_or("CAN 网络未连接")?;
+        let channel = network.channel.clone();
+        let mode = network.mode.clone();
+        let python = network.python.clone();
+        let mut connectors = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            connectors.push((*node, self.network_connector(*node)?));
+        }
+        Ok(super::CanScanJob {
+            request: None,
+            scan_id: None,
+            channel,
+            mode,
+            python,
+            connectors,
+        })
     }
 
     pub(crate) fn profiles_json(&self) -> Value {
-        let mut value = self.profiles.response();
+        let mut value = self
+            .profiles
+            .as_ref()
+            .map(ConnectionStore::response)
+            .unwrap_or_else(|| json!({"profiles":[],"load_error":null,"busy":true}));
         value["runtime"] = crate::runtime::status();
         value
     }
@@ -145,10 +219,13 @@ impl Workbench {
         &mut self,
         profile: ConnectionProfile,
     ) -> Result<ConnectionProfile, String> {
-        self.profiles.save(profile)
+        self.profiles
+            .as_mut()
+            .ok_or("连接档案写入正忙")?
+            .save(profile)
     }
     pub(crate) fn delete_profile(&mut self, id: &str) -> Result<(), String> {
-        self.profiles.delete(id)
+        self.profiles.as_mut().ok_or("连接档案写入正忙")?.delete(id)
     }
     pub(crate) fn adapters(&self) -> Result<Vec<Value>, String> {
         crate::runtime::python(None).and_then(|python| crate::connections::adapters(&python))
@@ -156,18 +233,29 @@ impl Workbench {
 
     /// WebUI 启动时最多执行一次；失败只写入可见状态，不阻止本机页面服务。
     pub(crate) fn autoconnect_once(&mut self) {
-        let Some(profile) = self.profiles.autoconnect_profile() else {
+        let Some(profile) = self
+            .profiles
+            .as_ref()
+            .and_then(ConnectionStore::autoconnect_profile)
+        else {
             return;
         };
         let result = self
             .connect_managed(profile)
             .map(|_| ())
             .map_err(|error| error.message.into_string());
-        self.profiles.autoconnect_result(result);
+        if let Some(profiles) = self.profiles.as_mut() {
+            profiles.autoconnect_result(result);
+        }
     }
 
     pub(crate) fn connect_profile(&mut self, id: &str) -> Result<Value, SessionError> {
-        let profile = self.profiles.profile(id).map_err(session_error)?;
+        let profile = self
+            .profiles
+            .as_ref()
+            .ok_or_else(|| session_error("连接档案写入正忙"))?
+            .profile(id)
+            .map_err(session_error)?;
         self.connect_managed(profile)
     }
 
@@ -185,31 +273,7 @@ impl Workbench {
                 "中断试验等待原会话重连；不能连接或切换其他 CAN 连接档案",
             ));
         }
-        let python = crate::runtime::python(None).map_err(session_error)?;
-        let key = format!("managed:{}", profile.adapter.serial);
-        if let Some(network) = self.can_network.as_ref() {
-            if network.channel != key
-                || network.mode != profile.mode
-                || network.python.as_deref() != Some(&python)
-            {
-                return Err(session_error(
-                    "CAN 网络已绑定到另一连接档案；请先显式恢复原会话或重启 WebUI",
-                ));
-            }
-        } else {
-            let parsed = crate::session::parse_can_mode(&profile.mode)?;
-            let network = CanNetwork::new(
-                managed_factory(profile.adapter.serial.clone(), python.clone()),
-                parsed,
-            )
-            .map_err(session_error)?;
-            self.can_network = Some(CanNetworkState {
-                network,
-                channel: key,
-                mode: profile.mode.clone(),
-                python: Some(python),
-            });
-        }
+        self.service_ensure_managed_network(&profile)?;
         let expected_uid = profile.expected_uid.clone();
         let request = ConnectionRequest::ManagedCan {
             serial: profile.adapter.serial,
@@ -254,6 +318,224 @@ impl Workbench {
         Ok(json!({"connected":true,"node":node,"identity":snapshot.identity,"snapshot":snapshot}))
     }
 
+    /// 所有服务入口共用的 USB 档案 UID pin；不依赖 v2 路由或浏览器 binding。
+    pub(super) fn service_pin_usb_identity(
+        &mut self,
+        serial: &str,
+        uid: &str,
+    ) -> Result<(), SessionError> {
+        if self
+            .usb_expected_identity
+            .get(serial)
+            .is_some_and(|old_uid| !old_uid.eq_ignore_ascii_case(uid))
+        {
+            let mut error = session_error("当前USB owner已绑定另一UID");
+            error.kind = "identity_changed".into();
+            return Err(error);
+        }
+        // 保留当前可恢复会话的 pin，加一项候选；失败候选不能覆盖旧会话约束。
+        let current = match self.usb.snapshot().connection {
+            Some(ConnectionRequest::Usb { serial }) => Some(serial),
+            _ => None,
+        };
+        self.usb_expected_identity
+            .retain(|key, _| Some(key) == current.as_ref() || key == serial);
+        self.usb_expected_identity.insert(serial.into(), uid.into());
+        Ok(())
+    }
+    fn service_check_usb_identity(&mut self, serial: &str) -> Result<(), SessionError> {
+        if self
+            .usb_expected_identity
+            .get(serial)
+            .is_some_and(|expected_uid| {
+                self.usb
+                    .integration_identity()
+                    .is_none_or(|(uid, _)| !uid.eq_ignore_ascii_case(expected_uid))
+            })
+        {
+            self.usb.disconnect()?;
+            let mut error = session_error("USB Identity 与 owner 绑定 UID 不同；已断连");
+            error.kind = "identity_changed".into();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub(super) fn service_network_generation(&self) -> Option<u64> {
+        self.can_network
+            .as_ref()
+            .map(|_| self.can_network_generation)
+    }
+    pub(super) fn service_network_matches(
+        &self,
+        operation: &super::network_jobs::Operation,
+    ) -> Result<bool, String> {
+        let Some(network) = self.can_network.as_ref() else {
+            return Ok(false);
+        };
+        if self.can_nodes.is_empty()
+            && matches!(
+                network.network.status(),
+                CanNetworkStatus::Terminated { .. }
+            )
+        {
+            return Ok(false);
+        }
+        let matches = match operation {
+            super::network_jobs::Operation::Advanced {
+                channel,
+                mode,
+                python,
+            } => network.channel == *channel && network.mode == *mode && network.python == *python,
+            super::network_jobs::Operation::Managed(profile) => {
+                network.channel == format!("managed:{}", profile.adapter.serial)
+                    && network.mode == profile.mode
+            }
+        };
+        if matches {
+            Ok(true)
+        } else {
+            Err("CAN 网络已绑定另一通路/模式/解释器；拒绝替换现有 owner".into())
+        }
+    }
+    /// 仅显式的新任务可将无节点的终止通路交给 worker 释放；owner 不等待旧驱动 drop。
+    pub(super) fn service_take_retired_network(
+        &mut self,
+    ) -> Option<super::network_jobs::NetworkPrepared> {
+        if !self.can_nodes.is_empty()
+            || !self.can_network.as_ref().is_some_and(|network| {
+                matches!(
+                    network.network.status(),
+                    CanNetworkStatus::Terminated { .. }
+                )
+            })
+        {
+            return None;
+        }
+        self.can_network
+            .take()
+            .map(|state| super::network_jobs::NetworkPrepared {
+                network: state.network,
+                channel: state.channel,
+                mode: state.mode,
+                python: state.python,
+            })
+    }
+    pub(super) fn service_install_network(
+        &mut self,
+        prepared: super::network_jobs::NetworkPrepared,
+    ) -> Result<(), String> {
+        if self.can_network.is_some() {
+            return Err("CAN owner 已存在；拒绝替换".into());
+        }
+        self.can_network_generation = self
+            .can_network_generation
+            .checked_add(1)
+            .ok_or("网络代次耗尽")?;
+        self.can_network = Some(CanNetworkState {
+            network: prepared.network,
+            channel: prepared.channel,
+            mode: prepared.mode,
+            python: prepared.python,
+        });
+        Ok(())
+    }
+
+    pub(super) fn service_ensure_managed_network(
+        &mut self,
+        profile: &ConnectionProfile,
+    ) -> Result<(), SessionError> {
+        let key = format!("managed:{}", profile.adapter.serial);
+        if let Some(network) = self.can_network.as_ref() {
+            if network.channel == key && network.mode == profile.mode {
+                return Ok(());
+            }
+            return Err(session_error("CAN 网络已绑定另一通路；拒绝替换"));
+        }
+        let python = crate::runtime::python(None).map_err(session_error)?;
+        if let Some(network) = self.can_network.as_ref() {
+            if network.channel != key
+                || network.mode != profile.mode
+                || network.python.as_deref() != Some(&python)
+            {
+                return Err(session_error(
+                    "CAN 网络已绑定到另一连接档案；请先显式恢复原会话或重启 WebUI",
+                ));
+            }
+        } else {
+            let parsed = crate::session::parse_can_mode(&profile.mode)?;
+            let network = CanNetwork::new(
+                managed_factory(profile.adapter.serial.clone(), python.clone()),
+                parsed,
+            )
+            .map_err(session_error)?;
+            self.can_network_generation = self
+                .can_network_generation
+                .checked_add(1)
+                .ok_or_else(|| session_error("网络代次耗尽"))?;
+            self.can_network = Some(CanNetworkState {
+                network,
+                channel: key,
+                mode: profile.mode.clone(),
+                python: Some(python),
+            });
+        }
+        Ok(())
+    }
+
+    /// v2 新节点入口绝不采用旧 connect_can 的断连隐式重连分支。
+    pub(super) fn service_connect_new_node(
+        &mut self,
+        node: u8,
+        expected: Option<&Value>,
+    ) -> Result<Value, String> {
+        if self.can_nodes.contains_key(&node) {
+            return Err("binding_stale: 已有会话；请使用其当前身份和代次显式重连".into());
+        }
+        if self.service_connections().len() >= 16 {
+            return Err("busy: 已达会话上限".into());
+        }
+        if let Some(reason) = self.integration_global_read_blocker() {
+            return Err(format!("read_not_ready: {reason}"));
+        }
+        let network = self.can_network.as_ref().ok_or("CAN 网络未建立")?;
+        let request = if let Some(serial) = network.channel.strip_prefix("managed:") {
+            ConnectionRequest::ManagedCan {
+                serial: serial.into(),
+                node,
+                mode: network.mode.clone(),
+                python: None,
+                expected_uid: expected.and_then(|v| v["uid"].as_str()).map(str::to_owned),
+            }
+        } else {
+            ConnectionRequest::Can {
+                channel: network.channel.clone(),
+                node,
+                mode: network.mode.clone(),
+                python: network.python.clone(),
+            }
+        };
+        let connector = self.network_connector(node)?;
+        let mut session = new_session();
+        let result = session.connect_shared_can(request, connector);
+        if result.is_err() && session.snapshot().connection.is_none() {
+            return Err(result.expect_err("failed connect").to_string());
+        }
+        self.can_nodes.insert(node, session);
+        result.map_err(|error| {
+            serde_json::to_string(&error).unwrap_or_else(|_| error.message.to_string())
+        })?;
+        let session = self.can_nodes.get_mut(&node).expect("inserted session");
+        let value = super::p2::connection_value(&format!("can:{node}"), session);
+        if expected.is_some_and(|identity| value["identity"] != *identity) {
+            session
+                .disconnect()
+                .map_err(|error| error.message.to_string())?;
+            return Err("identity_changed: 首次连接身份与扫描结果不同；已断连".into());
+        }
+        Ok(value)
+    }
+
     pub(crate) fn bind_profile_identity(&mut self, id: &str, node: u8) -> Result<(), String> {
         let identity = self
             .identity_for(Transport::Can, Some(node))
@@ -261,7 +543,10 @@ impl Workbench {
         let uid = identity["uid"]
             .as_str()
             .ok_or("Identity 回复没有 EHA UID")?;
-        self.profiles.bind_identity(id, uid)
+        self.profiles
+            .as_mut()
+            .ok_or("连接档案写入正忙")?
+            .bind_identity(id, uid)
     }
 
     pub(crate) fn has_active_trial(&self) -> bool {
@@ -326,6 +611,10 @@ impl Workbench {
             );
         }
         let network = CanNetwork::new(python_factory(channel.clone(), python.clone())?, parsed)?;
+        self.can_network_generation = self
+            .can_network_generation
+            .checked_add(1)
+            .ok_or("网络代次耗尽")?;
         self.can_network = Some(CanNetworkState {
             network,
             channel,
@@ -337,13 +626,15 @@ impl Workbench {
 
     pub(crate) fn connect(&mut self, request: ConnectionRequest) -> Result<Value, SessionError> {
         match request {
-            ConnectionRequest::Usb { .. } => {
+            ConnectionRequest::Usb { ref serial } => {
+                let serial = serial.clone();
                 if self.has_pending_interrupted_trial() {
                     return Err(session_error(
                         "中断试验等待同一会话重连；不能新建或切换连接",
                     ));
                 }
                 self.usb.connect(request)?;
+                self.service_check_usb_identity(&serial)?;
                 Ok(json!({"connected": true}))
             }
             ConnectionRequest::Can {
@@ -475,6 +766,11 @@ impl Workbench {
             }
         }
         self.session_mut(transport, node)?.reconnect()?;
+        if transport == Transport::Usb
+            && let Some(ConnectionRequest::Usb { serial }) = self.usb.snapshot().connection
+        {
+            self.service_check_usb_identity(&serial)?;
+        }
         Ok(())
     }
 
@@ -1356,5 +1652,155 @@ mod tests {
         );
         assert_eq!(probe.observed.lock().expect("observations").targets, 2);
         assert_eq!(probe.observed.lock().expect("observations").stops, 1);
+    }
+
+    #[test]
+    fn review_new_node_failure_retries_empty_terminated_network_in_worker() {
+        use eha_sdk::can::{CanChannel, CanChannelFactory, CanNetwork, CanNetworkStatus};
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+        struct Channel {
+            broken: bool,
+        }
+        impl CanChannel for Channel {
+            fn send(
+                &mut self,
+                _: &eha_sdk::transport::can::Frame,
+                _: Duration,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn receive(
+                &mut self,
+                _: Duration,
+            ) -> Result<Option<eha_sdk::transport::can::Frame>, String> {
+                if self.broken {
+                    Err("fixture disconnected".into())
+                } else {
+                    std::thread::sleep(Duration::from_millis(1));
+                    Ok(None)
+                }
+            }
+        }
+        struct Factory(AtomicUsize);
+        impl CanChannelFactory for Factory {
+            fn open(&self) -> Result<Box<dyn CanChannel>, String> {
+                Ok(Box::new(Channel {
+                    broken: self.0.fetch_add(1, Ordering::SeqCst) == 0,
+                }))
+            }
+        }
+        let factory = Arc::new(Factory(AtomicUsize::new(0)));
+        let network = CanNetwork::new(
+            factory.clone(),
+            crate::session::parse_can_mode("fd").expect("mode"),
+        )
+        .expect("network");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !matches!(network.status(), CanNetworkStatus::Terminated { .. }) {
+            assert!(Instant::now() < deadline, "network terminal");
+            std::thread::yield_now();
+        }
+        let mut owner = Workbench::new(std::env::temp_dir());
+        owner
+            .service_install_network(super::super::network_jobs::NetworkPrepared {
+                network,
+                channel: "fixture".into(),
+                mode: "fd".into(),
+                python: None,
+            })
+            .expect("install");
+        assert!(owner.service_connect_new_node(2, None).is_err());
+        assert!(!owner.can_nodes.contains_key(&2));
+        let first_generation = owner
+            .service_network_generation()
+            .expect("first generation");
+        let operation = super::super::network_jobs::Operation::Advanced {
+            channel: "fixture".into(),
+            mode: "fd".into(),
+            python: None,
+        };
+        assert!(
+            !owner
+                .service_network_matches(&operation)
+                .expect("requires explicit prepare")
+        );
+        let worker_factory = factory.clone();
+        let jobs = super::super::network_jobs::NetworkJobs::with_test_runner(Box::new(move |_| {
+            let network = CanNetwork::new(
+                worker_factory.clone(),
+                crate::session::parse_can_mode("fd").expect("mode"),
+            )?;
+            Ok(super::super::network_jobs::NetworkPrepared {
+                network,
+                channel: "fixture".into(),
+                mode: "fd".into(),
+                python: None,
+            })
+        }));
+        let retired = owner.service_take_retired_network();
+        assert!(retired.is_some());
+        jobs.start_replacing(operation.clone(), retired)
+            .map_err(|(error, _)| error)
+            .expect("explicit retry task");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let prepared = loop {
+            if let Some(result) = jobs.take_completed() {
+                break result.expect("reopened");
+            }
+            assert!(Instant::now() < deadline, "worker completion");
+            std::thread::yield_now();
+        };
+        owner
+            .service_install_network(prepared)
+            .expect("install new owner");
+        assert_eq!(factory.0.load(Ordering::SeqCst), 2);
+        assert!(owner.service_network_generation().expect("new generation") > first_generation);
+        assert!(
+            owner
+                .service_network_matches(&operation)
+                .expect("same explicit config")
+        );
+        assert!(matches!(
+            owner
+                .can_network
+                .as_ref()
+                .expect("network")
+                .network
+                .status(),
+            CanNetworkStatus::Active
+        ));
+    }
+    #[test]
+    fn review_usb_owner_pin_survives_failed_candidate_and_rejects_mismatched_identity() {
+        let (mut usb, probe) = session_fixture(0, [7; 12], FixtureBehavior::Ready);
+        usb.test_usb_request("serial-A");
+        let mut owner = Workbench::with_test_sessions(usb, BTreeMap::new());
+        owner
+            .service_pin_usb_identity("serial-A", "080808080808080808080808")
+            .expect("pin A");
+        owner
+            .service_pin_usb_identity("serial-B", "090909090909090909090909")
+            .expect("candidate B");
+        assert_eq!(owner.usb_expected_identity.len(), 2);
+        assert!(owner.usb_expected_identity.contains_key("serial-A"));
+        // B 未取得 Identity，A 仍是当前上下文；另一候选也不得删除 A 的约束。
+        owner
+            .service_pin_usb_identity("serial-C", "101010101010101010101010")
+            .expect("candidate C");
+        assert_eq!(owner.usb_expected_identity.len(), 2);
+        assert!(!owner.usb_expected_identity.contains_key("serial-B"));
+        let error = owner
+            .service_check_usb_identity("serial-A")
+            .expect_err("A mismatch");
+        assert_eq!(error.kind.as_ref(), "identity_changed");
+        assert!(!owner.usb.integration_connected());
+        assert_eq!(probe.observed.lock().expect("probe").stops, 0);
+        assert_eq!(probe.observed.lock().expect("probe").targets, 0);
     }
 }

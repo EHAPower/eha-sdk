@@ -43,14 +43,28 @@ pub(super) fn describe(instance_id: &str, response_bytes: usize, max_bindings: u
         "read_measurements",
         "read_diagnostics",
         "read_config_startup",
-        "read_config_user"
+        "read_config_user",
+        "managed_profiles",
+        "usb_profiles",
+        "advanced_can",
+        "selected_node_connections",
+        "adapter_discovery",
+        "connections",
+        "can_scan",
+        "events",
+        "recordings_read",
+        "odrive_read",
+        "read_jobs"
     ]);
     value["limits"] = json!({"request_bytes":65536,"response_bytes":response_bytes,
         "sdk_read_timeout_ms":5000,"max_bindings":max_bindings,"shutdown_response_grace_ms":500,
-        "binding_lease_min_ms":integration::MIN_LEASE_MS,"binding_lease_max_ms":integration::MAX_LEASE_MS});
+        "event_max_events":4096,"event_max_bytes":4194304,"event_max_batch":100,"event_retention_ms":30000,
+        "event_max_payload_bytes":8192,"max_connections":16,"scan_max_nodes":16,"job_history":16,
+        "recording_metadata_total_bytes":262144,"recording_max_runs":128,"recording_max_entries":1024,"recording_chunk_bytes":65536,
+        "http_max_connections":64,"http_body_wire_bytes":8388608,"http_header_bytes":16384,"http_response_workers":16,"http_pending_requests":64,"http_io_deadline_ms":super::http_io::IO_DEADLINE_MS,"binding_lease_min_ms":integration::MIN_LEASE_MS,"binding_lease_max_ms":integration::MAX_LEASE_MS});
     value["limitations"] = json!({
         "mutations_supported":false,"control_supported":false,
-        "can_connect_supported":false,"can_attach_existing_session_only":true,
+        "can_connect_supported":true,"can_attach_existing_session_only":false,"recording_write_supported":false,
         "read_gate":"existing_global_readonly_gate",
         "control_effect_evidence":"unresolved_target_latch_only",
         "sdk_read_execution":"synchronous_owner_loop",
@@ -107,6 +121,8 @@ pub(super) fn dispatch(
     request: tiny_http::Request,
     port: u16,
     workbench: &mut Workbench,
+    odrive: &mut super::OdriveView,
+    scan: &mut super::CanScanView,
     parsed_body: Option<Result<crate::RawFields, String>>,
 ) -> Result<(), String> {
     if let Err((status, code, message)) =
@@ -125,6 +141,23 @@ pub(super) fn dispatch(
             .and_then(|value| integration::respond(request, 200, value))
     } else if path == "/service/v2/shutdown" && method == Method::Post {
         shutdown(request, &mut state, workbench, parsed_body)
+    } else if super::p2::handles(&path) {
+        super::p2::dispatch(request, &state, workbench, odrive, scan, parsed_body)
+    } else if (scan.busy
+        || workbench
+            .p2
+            .as_ref()
+            .is_some_and(super::p2::State::connection_busy))
+        && method == Method::Post
+        && (path.ends_with("/reads") || path.ends_with("/bindings"))
+    {
+        integration::respond_error(
+            request,
+            Some(&state),
+            409,
+            "busy",
+            "CAN 扫描期间拒绝新读取或绑定连接",
+        )
     } else {
         state.route(request, workbench, parsed_body)
     };
@@ -230,7 +263,7 @@ fn shutdown(
     thread::Builder::new()
         .name("eha-tool-service-shutdown-response".into())
         .spawn(move || {
-            let _ = request.respond(response);
+            let _ = request.respond_and_close(response);
             let _ = completed.send(());
         })
         .map_err(|error| error.to_string())?;

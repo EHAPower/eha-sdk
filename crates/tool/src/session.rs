@@ -27,8 +27,14 @@ use serde_json::{Value, json};
 
 #[path = "recording.rs"]
 mod recording;
+#[path = "session_recording.rs"]
+mod recording_tasks;
+#[path = "session_scheduler.rs"]
+mod scheduler;
 #[path = "trial.rs"]
 mod trial;
+#[path = "session_trial_preflight.rs"]
+mod trial_preflight;
 
 use recording::Recording;
 use trial::{ActiveTrial, InterruptedTrial, PreparedTrial, TrialState};
@@ -437,6 +443,12 @@ pub struct ToolSession {
     trial: TrialState,
     connection_generation: u64,
     pending_target: bool,
+    pending_read: Option<scheduler::ReadTask>,
+    pending_preflight: Option<trial_preflight::PendingTrial>,
+    pending_recording_start: Option<recording_tasks::RecordingStart>,
+    pending_recording_finish: Option<recording_tasks::RecordingFinish>,
+    pending_trial_start: Option<recording_tasks::TrialStart>,
+    position_audit: Option<(f32, u64)>,
 }
 
 impl Default for ToolSession {
@@ -446,6 +458,14 @@ impl Default for ToolSession {
 }
 
 impl ToolSession {
+    /// Tests may label a synthetic backend as a USB scope without opening hardware.
+    #[cfg(test)]
+    pub(crate) fn test_usb_request(&mut self, serial: &str) {
+        self.request = Some(ConnectionRequest::Usb {
+            serial: serial.into(),
+        });
+    }
+
     pub fn new() -> Self {
         Self {
             connector: None,
@@ -467,6 +487,12 @@ impl ToolSession {
             trial: TrialState::default(),
             connection_generation: next_connection_generation(),
             pending_target: false,
+            pending_read: None,
+            pending_preflight: None,
+            pending_recording_start: None,
+            pending_recording_finish: None,
+            pending_trial_start: None,
+            position_audit: None,
         }
     }
 
@@ -584,6 +610,7 @@ impl ToolSession {
         if self.client.is_none() {
             return Err(invalid("当前没有活跃会话"));
         }
+        self.cancel_pending_operations("disconnect");
         self.connection_generation = next_connection_generation();
         self.finish_recording_boundary("disconnect");
         self.mark_interrupted_reconnect_required();
@@ -611,6 +638,7 @@ impl ToolSession {
         if self.client.is_none() && self.disconnected.is_none() {
             return Err(invalid("没有可恢复的断开会话"));
         }
+        self.cancel_pending_operations("reconnect");
         self.connection_generation = next_connection_generation();
         if self.trial.active.is_some() {
             self.interrupt_trial_unknown("reconnect_during_active_trial");
@@ -781,6 +809,7 @@ impl ToolSession {
     /// 执行普通 SDK 动作。试验活跃时，控制及阻塞查询必须通过试验入口协调。
     pub fn execute(&mut self, command: Command) -> Result<CommandResult, SessionError> {
         self.retire_disconnected_usb();
+        self.prepare_read_boundary(&command)?;
         if self.trial.active.is_some()
             || self
                 .trial
@@ -830,6 +859,7 @@ impl ToolSession {
     }
 
     fn execute_inner(&mut self, command: Command) -> Result<CommandResult, SessionError> {
+        self.prepare_read_boundary(&command)?;
         if let Command::ConfigValidate { record } = &command {
             eha_sdk::configuration::validate_json(record.as_bytes())
                 .map_err(|error| invalid(error.to_string()))?;
@@ -953,77 +983,30 @@ impl ToolSession {
 
     /// 开始一个独立目录的原始会话记录。记录启动不发送控制、心跳或维护动作。
     pub fn start_recording(&mut self, root: &Path) -> Result<Value, SessionError> {
-        if self.recording.is_some() {
-            return Err(invalid("已有进行中的记录"));
+        self.begin_recording_start(root)?;
+        loop {
+            match self.poll_recording_start() {
+                std::task::Poll::Ready(result) => return result,
+                std::task::Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+            }
         }
-        if self.client.is_none() || self.identity.is_none() {
-            return Err(invalid("记录需要已核对 Identity 的活跃会话"));
-        }
-        if self.trial.active.is_some() {
-            return Err(invalid("试验进行中不读取配置启动记录；请在试验前开始记录"));
-        }
-        let capacity = self.telemetry_queue_capacity.unwrap_or(1_024);
-        self.telemetry_queue_capacity = Some(capacity);
-        self.client
-            .as_mut()
-            .expect("checked connected client")
-            .enable_telemetry_queue(capacity)
-            .map_err(sdk_error)?;
-        let wait = self.wait();
-        let startup = self
-            .client
-            .as_mut()
-            .expect("checked connected client")
-            .read_config(ConfigView::Startup, &wait)
-            .map_err(sdk_error)
-            .and_then(|reply| reply_json(&reply))?;
-        let snapshot = self.snapshot();
-        let identity = snapshot.identity.clone().unwrap_or(Value::Null);
-        let metadata = json!({
-            "format": "eha-tool-recording-v1",
-            "tool_version": crate::build_metadata::TOOL_VERSION,
-            "connection": snapshot.connection.clone(),
-            "identity": identity.clone(),
-            "device_uid": identity["uid"].clone(),
-            "run_nonce": identity["sample"]["run_nonce"].clone(),
-            "startup_config_source": identity["config_source"].clone(),
-            "startup_config_source_label": identity["config_source_label"].clone(),
-            "startup_config": startup,
-        });
-        let mut recording = Recording::start(root, metadata).map_err(recording_error)?;
-        recording
-            .event(
-                "session_snapshot",
-                serde_json::to_value(&snapshot)
-                    .map_err(|error| recording_error(error.to_string()))?,
-            )
-            .map_err(recording_error)?;
-        let value = recording.snapshot();
-        self.recording = Some(recording);
-        self.recording_error = None;
-        Ok(value)
     }
 
-    /// 结束并刷新记录。写入失败时仍保留缺口，并收尾正在进行的试验。
+    /// Legacy synchronous wrapper; service owners use begin/poll_recording_stop.
     pub fn stop_recording(&mut self) -> Result<Value, SessionError> {
-        let recording = self
-            .recording
-            .take()
-            .ok_or_else(|| invalid("当前没有进行中的记录"))?;
-        let result = match &self.recording_error {
-            Some(error) => Err(error.clone()),
-            None => recording.finish(),
-        };
-        result.map_err(|error| {
-            self.recording_error = Some(error.clone());
-            if self.trial.active.is_some() {
-                let _ = self.submit_trial_stop("recording_failed");
+        self.begin_recording_stop()?;
+        loop {
+            match self.poll_recording_stop() {
+                std::task::Poll::Ready(result) => return result,
+                std::task::Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
             }
-            recording_error(error)
-        })
+        }
     }
 
     pub fn recording_snapshot(&self) -> Value {
+        if let Some(value) = self.pending_recording_snapshot() {
+            return value;
+        }
         match (&self.recording, &self.recording_error) {
             (Some(recording), Some(error)) => {
                 json!({"active": false, "failed": true, "error": error, "partial": recording.snapshot()})
@@ -1035,68 +1018,38 @@ impl ToolSession {
 
     /// 用本次读到的实际 Startup 配置和 Status 建立试验准入，不提交控制需求。
     pub fn prepare_trial(&mut self, request: &TrialRequest) -> Result<(), SessionError> {
-        if self.trial.active.is_some() {
-            return Err(invalid("已有进行中的试验"));
+        self.begin_trial_preflight(request.clone())?;
+        loop {
+            match self.poll_trial_preflight() {
+                std::task::Poll::Ready(result) => return result,
+                // Legacy callers remain synchronous. The service scheduler must use
+                // begin/poll so Stop and other trial deadlines can run between steps.
+                std::task::Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+            }
         }
-        if self
-            .trial
-            .interrupted
-            .as_ref()
-            .is_some_and(|trial| !trial.unrecoverable)
-        {
-            return Err(invalid(
-                "上次试验中断且结果未知；重连并核对同一运行实例后请显式 Stop",
-            ));
-        }
-        self.trial.interrupted = None;
-        validate_trial_request(request)?;
-        let wait = self.wait();
-        let (startup_reply, status_reply) = {
-            let client = self
-                .client
-                .as_mut()
-                .ok_or_else(|| invalid("请先 connect 并核对 Identity"))?;
-            let startup = client
-                .read_config(ConfigView::Startup, &wait)
-                .map_err(sdk_error)?;
-            let status = client.status(&wait).map_err(sdk_error)?;
-            (startup, status)
-        };
-        let startup = reply_json(&startup_reply)?;
-        let status = reply_json(&status_reply)?;
-        self.last_status = Some(status_reply);
-        validate_trial_facts(request, &startup, &status, self.request.as_ref())?;
-        self.record_event(
-            "trial_prepared",
-            json!({"request": request, "startup": startup, "status": status}),
-        );
-        self.trial.completed = None;
-        self.trial.prepared = Some(PreparedTrial {
-            request: request.clone(),
-            status,
-            startup,
-            identity: self
-                .identity
-                .as_ref()
-                .and_then(|reply| reply_json(reply).ok())
-                .ok_or_else(|| invalid("Identity 不可读"))?,
-            connection: self.request.clone(),
-        });
-        Ok(())
     }
 
     /// 对已预检且完全相同的单次请求提交一次持续需求。
     pub fn start_prepared_trial(&mut self, request: TrialRequest) -> Result<Value, SessionError> {
+        self.begin_trial_start(request)?;
+        loop {
+            match self.poll_trial_start() {
+                std::task::Poll::Ready(result) => return result,
+                std::task::Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
+    }
+
+    fn validate_prepared_trial_start(&self, request: &TrialRequest) -> Result<Reply, SessionError> {
         if self.trial.active.is_some() {
             return Err(invalid("已有进行中的试验"));
         }
         let prepared = self
             .trial
             .prepared
-            .take()
+            .as_ref()
             .ok_or_else(|| invalid("请先 prepare_trial"))?;
-        if serde_json::to_value(&prepared.request).ok() != serde_json::to_value(&request).ok() {
-            self.trial.prepared = Some(prepared);
+        if serde_json::to_value(&prepared.request).ok() != serde_json::to_value(request).ok() {
             return Err(invalid("试验请求与已预检范围不一致；请重新预检"));
         }
         let current_identity = self
@@ -1117,22 +1070,24 @@ impl ToolSession {
             .ok_or_else(|| invalid("开始试验前需要同一运行实例的新鲜被动遥测"))?;
         let fresh_value = reply_json(&fresh)?;
         validate_trial_facts(
-            &request,
+            request,
             &prepared.startup,
             &fresh_value,
             self.request.as_ref(),
         )?;
-        self.last_telemetry = Some(fresh);
-        self.record_event("trial_command_input", json!({"request": &request}));
-        self.flush_recording();
-        if self.recording.is_some()
-            && let Some(error) = &self.recording_error
-        {
-            return Err(SessionError {
-                local_stage: Some("not_submitted".into()),
-                ..recording_error(error.clone())
-            });
-        }
+        Ok(fresh)
+    }
+
+    fn start_prepared_trial_after_audit(
+        &mut self,
+        request: TrialRequest,
+    ) -> Result<Value, SessionError> {
+        self.last_telemetry = Some(self.validate_prepared_trial_start(&request)?);
+        let prepared = self
+            .trial
+            .prepared
+            .take()
+            .ok_or_else(|| invalid("请先 prepare_trial"))?;
         let started_sample_time_us = prepared.status["sample"]["snapshot_time_us"]
             .as_u64()
             .unwrap_or(0);
@@ -1202,6 +1157,7 @@ impl ToolSession {
             return Err(invalid("位置目标超出本次试验范围"));
         }
         active.pending_position_mm = Some(mm);
+        self.position_audit = None;
         self.record_event("trial_position_merged", json!({"mm": mm}));
         Ok(self.trial_snapshot())
     }
@@ -1219,12 +1175,22 @@ impl ToolSession {
 
     /// 服务后台每约 10 ms 调用。它只消费 SDK 的被动遥测队列和推进已授权试验。
     pub fn tick(&mut self) {
+        self.tick_with_clock(Instant::now);
+    }
+
+    #[cfg(test)]
+    fn tick_at(&mut self, now: Instant) {
+        self.tick_with_clock(|| now);
+    }
+
+    fn tick_with_clock(&mut self, mut now: impl FnMut() -> Instant) {
         self.retire_disconnected_usb();
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
             let disconnected = client.connection_status().disconnected;
             self.client = Some(client);
             if let Some(reason) = disconnected {
+                self.end_read(Failure::Disconnected(reason.clone()));
                 if self.disconnected_reason.is_none() {
                     self.connection_generation = next_connection_generation();
                     self.disconnected_reason = Some(reason.clone());
@@ -1234,13 +1200,14 @@ impl ToolSession {
             }
         }
         self.flush_recording();
-        let stop_reason = self.trial_stop_reason();
+        self.tick_recording_writer();
+        let stop_reason = self.trial_stop_reason(now());
         if let Some(reason) = stop_reason {
             let _ = self.submit_trial_stop(&reason);
         }
-        self.flush_trial_position();
+        self.flush_trial_position(now());
         self.observe_trial_stop();
-        self.observe_stop_confirmation_deadline();
+        self.observe_stop_confirmation_deadline_at(now());
         self.flush_recording();
     }
 
@@ -1257,6 +1224,7 @@ impl ToolSession {
         else {
             return;
         };
+        self.end_read(Failure::Disconnected(reason.clone()));
         let Some(client) = self.client.take() else {
             return;
         };
@@ -1273,7 +1241,7 @@ impl ToolSession {
         self.usb_owner = None;
     }
 
-    fn trial_stop_reason(&mut self) -> Option<String> {
+    fn trial_stop_reason(&mut self, now: Instant) -> Option<String> {
         let active = self.trial.active.as_mut()?;
         if active.stop_submission.is_some() {
             return None;
@@ -1281,7 +1249,7 @@ impl ToolSession {
         if self.recording.is_some() && self.recording_error.is_some() {
             return Some("recording_failed".into());
         }
-        if active.started_at.elapsed() >= active.duration {
+        if now.saturating_duration_since(active.started_at) >= active.duration {
             return Some("duration_elapsed".into());
         }
         let telemetry = match self
@@ -1290,7 +1258,9 @@ impl ToolSession {
             .and_then(|reply| reply_json(reply).ok())
         {
             Some(telemetry) => telemetry,
-            None if active.started_at.elapsed() > Duration::from_millis(500) => {
+            None if now.saturating_duration_since(active.started_at)
+                > Duration::from_millis(500) =>
+            {
                 return Some("telemetry_missing".into());
             }
             None => return None,
@@ -1348,21 +1318,20 @@ impl ToolSession {
             active.settled_since = None;
             return None;
         }
-        let now = Instant::now();
         let settled_since = active.settled_since.get_or_insert(now);
         (now.duration_since(*settled_since).as_millis() >= u128::from(reach.settle_ms))
             .then(|| "position_reached".into())
     }
 
-    fn flush_trial_position(&mut self) {
+    fn flush_trial_position(&mut self, now: Instant) {
         let position = {
             let Some(active) = self.trial.active.as_ref() else {
                 return;
             };
             if active.stop_submission.is_some()
-                || active
-                    .last_position_submit
-                    .is_some_and(|last| last.elapsed() < Duration::from_millis(50))
+                || active.last_position_submit.is_some_and(|last| {
+                    now.saturating_duration_since(last) < Duration::from_millis(50)
+                })
             {
                 return;
             }
@@ -1371,12 +1340,41 @@ impl ToolSession {
         let Some(mm) = position else {
             return;
         };
-        self.record_event("trial_position_submit", json!({"mm": mm}));
-        self.flush_recording();
-        if self.recording.is_some() && self.recording_error.is_some() {
-            let _ = self.submit_trial_stop("recording_failed");
-            return;
+        if self.recording.is_some() {
+            if self.position_audit.is_none() {
+                self.record_event("trial_position_submit", json!({"mm": mm}));
+                match self
+                    .recording
+                    .as_mut()
+                    .expect("recording checked")
+                    .barrier()
+                {
+                    Ok(barrier) => self.position_audit = Some((mm, barrier)),
+                    Err(error) => self.recording_error = Some(error),
+                }
+            }
+            if self.recording_error.is_some() {
+                let _ = self.submit_trial_stop("recording_failed");
+                return;
+            }
+            if let Some((_, barrier)) = self.position_audit {
+                match self
+                    .recording
+                    .as_mut()
+                    .expect("recording checked")
+                    .poll_barrier(barrier)
+                {
+                    std::task::Poll::Pending => return,
+                    std::task::Poll::Ready(Err(error)) => {
+                        self.recording_error = Some(error);
+                        let _ = self.submit_trial_stop("recording_failed");
+                        return;
+                    }
+                    std::task::Poll::Ready(Ok(())) => {}
+                }
+            }
         }
+        self.position_audit = None;
         let result = self.execute_trial_command(Command::Position { mm });
         match result {
             Ok(result) => {
@@ -1404,6 +1402,7 @@ impl ToolSession {
     }
 
     fn submit_trial_stop(&mut self, reason: &str) -> Result<(), SessionError> {
+        self.position_audit = None;
         let baseline = self
             .last_telemetry
             .as_ref()
@@ -1451,6 +1450,10 @@ impl ToolSession {
     }
 
     fn observe_stop_confirmation_deadline(&mut self) {
+        self.observe_stop_confirmation_deadline_at(Instant::now());
+    }
+
+    fn observe_stop_confirmation_deadline_at(&mut self, now: Instant) {
         let active = self.trial.active.as_mut().or_else(|| {
             self.trial
                 .interrupted
@@ -1461,9 +1464,9 @@ impl ToolSession {
             return;
         };
         if !active.stop_confirmation_overdue
-            && active
-                .stop_attempt_finished_at
-                .is_some_and(|finished| finished.elapsed() >= active.stop_confirmation_timeout)
+            && active.stop_attempt_finished_at.is_some_and(|finished| {
+                now.saturating_duration_since(finished) >= active.stop_confirmation_timeout
+            })
         {
             // 超期只留存事实；继续持有试验并等待被动证据，不重发 Stop 或解锁命令。
             active.stop_confirmation_overdue = true;
@@ -1764,16 +1767,7 @@ impl ToolSession {
     }
 
     fn finish_recording_boundary(&mut self, reason: &str) {
-        let Some(mut recording) = self.recording.take() else {
-            return;
-        };
-        if self.recording_error.is_some() {
-            return;
-        }
-        let result = recording.event("recording_boundary", json!({"reason": reason}));
-        if let Err(error) = result.and_then(|_| recording.finish()) {
-            self.recording_error = Some(error);
-        }
+        self.finish_recording_async_boundary(reason);
     }
 
     fn interrupt_trial_unknown(&mut self, reason: &str) {

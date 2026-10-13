@@ -2,6 +2,7 @@
 //! 桌面客户 API。`Client` 串行提交业务，独立 I/O 线程维持收发和显式心跳。
 //! 所有数据副本拥有自己的字节；本地提交绝不表示目标采用或设备执行。
 pub mod backend;
+mod submissions;
 
 use crate::session::{MutationKind, QueryKind, QueryMatch, Session};
 pub use backend::{AdapterStatus, Backend, HeartbeatStatus, TransportStatus};
@@ -138,7 +139,7 @@ mod tests {
         responses::encode_identity(&fields, &mut bytes).expect("identity encodes");
         bytes
     }
-    fn verified_client(run_nonce: [u8; 16]) -> Client {
+    pub(super) fn verified_client(run_nonce: [u8; 16]) -> Client {
         let backend = Backend::spawn("telemetry-queue-test", |receiver, _| {
             while let Ok(command) = receiver.recv() {
                 if matches!(command, crate::host::backend::Command::Close) {
@@ -448,6 +449,7 @@ pub struct ClientState {
 /// 一台设备的串行业务调用方；打开后须先核对身份，资源释放不发送控制或停止。
 pub struct Client {
     pending_query: Option<PendingQuery>,
+    pending_submission: Option<submissions::PendingSubmission>,
     backend: Backend,
     identity_verified: bool,
     session: Session,
@@ -484,6 +486,7 @@ impl Client {
     pub fn new(backend: Backend) -> Self {
         Self {
             pending_query: None,
+            pending_submission: None,
             backend,
             identity_verified: false,
             session: Session::new(),
@@ -499,6 +502,7 @@ impl Client {
     pub fn resume(backend: Backend, state: ClientState) -> Self {
         Self {
             pending_query: None,
+            pending_submission: None,
             backend,
             identity_verified: false,
             session: state.session,
@@ -532,7 +536,7 @@ impl Client {
 
     fn require_identity(&self) -> Result<(), Error> {
         if !self.identity_verified || self.session.identity().is_none() {
-            Err(self.error(
+            Err(self.query_error(
                 Failure::Session("请先 identify 核对身份".into()),
                 LocalStage::NotSubmitted,
             ))
@@ -542,11 +546,9 @@ impl Client {
     }
 
     fn require_idle(&self) -> Result<(), Error> {
-        if self.pending_query.is_some() {
+        if self.pending_query.is_some() || self.pending_submission.is_some() {
             Err(Error {
-                failure: Failure::Session(
-                    "已有查询等待中，请先 poll_query 完成或 cancel_query 取消".into(),
-                ),
+                failure: Failure::Session("已有业务等待中，请先 poll 或显式结束对应等待".into()),
                 local: LocalStage::NotSubmitted,
                 observed_transport: None,
             })
@@ -573,7 +575,7 @@ impl Client {
             .checked_add(wait.timeout)
             .ok_or_else(|| invalid("等待期限无法表示"))?;
         if wait.timeout.is_zero() || wait.cancellation.is_cancelled() {
-            return Err(self.error(Failure::Cancelled, LocalStage::NotSubmitted));
+            return Err(self.query_error(Failure::Cancelled, LocalStage::NotSubmitted));
         }
         let bytes = Self::encode(message)?;
         self.sequence = self
@@ -590,7 +592,7 @@ impl Client {
                 cancelled: cancelled.clone(),
             }))
             .map_err(|error| {
-                self.error(
+                self.query_error(
                     Failure::Disconnected(error.to_string()),
                     LocalStage::NotSubmitted,
                 )
@@ -831,10 +833,19 @@ impl Client {
         pending: &PendingQuery,
         now: Instant,
     ) -> Result<Option<Event>, Failure> {
-        if pending.wait.cancellation.is_cancelled() {
+        self.try_pending_event(&pending.wait, pending.deadline, now)
+    }
+
+    fn try_pending_event(
+        &self,
+        wait: &Wait,
+        deadline: Instant,
+        now: Instant,
+    ) -> Result<Option<Event>, Failure> {
+        if wait.cancellation.is_cancelled() {
             return Err(Failure::Cancelled);
         }
-        if now >= pending.deadline {
+        if now >= deadline {
             return Err(Failure::Timeout);
         }
         let mut inbox = match self.backend.sink.0.0.try_lock() {
@@ -1146,33 +1157,8 @@ impl Client {
         record: Option<&[u8]>,
         wait: &Wait,
     ) -> Result<LocalSubmission, Error> {
-        self.require_idle()?;
-        self.require_identity()?;
-        let matcher = self.session.next_mutation(kind).map_err(|error| {
-            self.error(
-                Failure::Session(format!("{error:?}")),
-                LocalStage::NotSubmitted,
-            )
-        })?;
-        let bytes = matcher.identity.to_bytes();
-        let identity =
-            ExpectedIdentity::new(&bytes).map_err(|error| invalid(format!("{error:?}")))?;
-        let message = match kind {
-            MutationKind::SaveAndRestart => Message::SaveAndRestart {
-                query_id: matcher.query_id,
-                identity,
-                record: record.ok_or_else(|| invalid("缺少完整记录"))?,
-            },
-            MutationKind::ResetApplication => Message::ResetApplication {
-                query_id: matcher.query_id,
-                identity,
-            },
-            MutationKind::EnterUpdate => Message::EnterUpdate {
-                query_id: matcher.query_id,
-                identity,
-            },
-        };
-        let (id, deadline, cancel) = self.send(&message, wait)?;
+        let (matcher, id, deadline, cancel) =
+            self.prepare_mutation_submission(kind, record, wait)?;
         self.await_submission(Some(matcher), id, deadline, cancel, wait, true)
     }
 }
