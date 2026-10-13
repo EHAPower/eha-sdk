@@ -696,7 +696,7 @@ fn handle_received_request(
         );
     }
     #[cfg(test)]
-    if workbench.p5_fixture.is_some() {
+    if let Some(fixture) = workbench.p5_fixture.as_ref() {
         if !p5_fixture::allowed_path(path, request_method(&request)) {
             return integration::respond_error(
                 request,
@@ -707,10 +707,7 @@ fn handle_received_request(
             );
         }
         if request_method(&request) != Method::Get {
-            workbench
-                .p5_fixture
-                .as_ref()
-                .expect("fixture checked")
+            fixture
                 .trace
                 .event("http_mutation", 0, None, json!({"path":path}));
         }

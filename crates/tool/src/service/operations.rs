@@ -396,6 +396,7 @@ pub(crate) struct Ledger {
     stop_capacity: usize,
     retention: Duration,
     records: BTreeMap<String, Record>,
+    current_trials: BTreeSet<String>,
     stop_slots: BTreeMap<OperationScope, StopSlot>,
 }
 
@@ -420,6 +421,7 @@ impl Ledger {
             stop_capacity,
             retention,
             records: BTreeMap::new(),
+            current_trials: BTreeSet::new(),
             stop_slots: BTreeMap::new(),
         })
     }
@@ -720,12 +722,25 @@ impl Ledger {
         self.records.get(id)
     }
 
+    /// 聚合所有 owner 当前试验引用；不复制回执、不改变容量或未知结果语义。
+    pub(crate) fn retain_current_trials<'a>(&mut self, ids: impl Iterator<Item = &'a str>) {
+        self.current_trials = ids
+            .filter(|id| {
+                self.records
+                    .get(*id)
+                    .is_some_and(|record| record.intent.action == Action::TrialStart)
+            })
+            .map(str::to_owned)
+            .collect();
+    }
+
     pub(crate) fn prune(&mut self, now: Instant) {
-        self.records.retain(|_, record| {
-            !(record.reclaimable()
-                && record
-                    .finished_at
-                    .is_some_and(|time| now.saturating_duration_since(time) >= self.retention))
+        self.records.retain(|id, record| {
+            self.current_trials.contains(id)
+                || !(record.reclaimable()
+                    && record
+                        .finished_at
+                        .is_some_and(|time| now.saturating_duration_since(time) >= self.retention))
         });
     }
 
@@ -889,6 +904,64 @@ mod tests {
             ledger.get(&id).expect("test invariant").effect,
             Effect::Unresolved
         );
+    }
+
+    #[test]
+    fn current_trial_retention_counts_capacity_and_preserves_shared_references_and_unknown() {
+        for unresolved in [false, true] {
+            let now = Instant::now();
+            let mut ids = ids();
+            let mut ledger = Ledger::new("instance", 1, 2, Duration::from_secs(1)).expect("ledger");
+            let scope = scope();
+            ledger
+                .reserve_stop_scope(scope.clone(), &mut ids)
+                .expect("stop scope");
+            let id = ids.issue_normal(scope.clone(), now).expect("trial ticket");
+            let mut trial = intent(scope.clone(), "1");
+            trial.action = Action::TrialStart;
+            ledger
+                .admit_normal(&id, trial, "operator", &mut ids, now)
+                .expect("trial");
+            ledger.begin_attempt(&id).expect("attempt");
+            ledger
+                .finish_attempt(
+                    &id,
+                    if unresolved {
+                        Submission::Unknown
+                    } else {
+                        Submission::LocallySubmitted
+                    },
+                    if unresolved {
+                        Effect::Unresolved
+                    } else {
+                        Effect::Known
+                    },
+                    now,
+                )
+                .expect("finish");
+            let original = ledger.get(&id).expect("record").clone();
+            // 两个 owner 引用同一记录；解除一个仍保留，且不复制记录或改变容量。
+            ledger.retain_current_trials([id.as_str(), id.as_str()].into_iter());
+            ledger.prune(now + Duration::from_secs(2));
+            ledger.retain_current_trials([id.as_str()].into_iter());
+            ledger.prune(now + Duration::from_secs(2));
+            assert_eq!(ledger.get(&id), Some(&original));
+            let next = ids.issue_normal(scope.clone(), now).expect("next ticket");
+            assert_eq!(
+                ledger.admit_normal(&next, intent(scope, "2"), "operator", &mut ids, now),
+                Err(if unresolved {
+                    Error::Unresolved
+                } else {
+                    Error::Capacity
+                })
+            );
+            ledger.retain_current_trials(std::iter::empty());
+            ledger.prune(now + Duration::from_secs(2));
+            assert_eq!(
+                ledger.get(&id),
+                if unresolved { Some(&original) } else { None }
+            );
+        }
     }
 
     #[test]

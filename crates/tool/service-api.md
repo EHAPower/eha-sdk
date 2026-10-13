@@ -226,6 +226,7 @@ P2 增量 capability：`managed_profiles`、`adapter_discovery`、`connections`�
   已断开的会话须显式 reconnect，不能通过 connect 隐式恢复。
   成功返回 `{connection_id,target_id,identity,connection_generation,connected,snapshot_json_text,telemetry_received_age_ms:null|DECIMAL}`；
   connection_id 当前等于 target_id（`usb:SERIAL` 或 `can:N`），不能替代身份/代次。
+  路径中的 `{id}` 按单个 URI 段进行 UTF-8 百分号编码，例如 `usb%3ASERIAL`；服务只在分离该段后解码一次，`+` 保持字面含义。非法 `%HH`、非法 UTF-8、解码后的 `/`、反斜线或控制字符返回 400，不解码整个路径或二次解码；响应 ID 仍为原始字符串。
   `GET /connections` 返回 `{connections:[同一对象]}`，仅投影缓存，包含断开会话事实。
   reconnect/disconnect body 精确为 `{api_version,instance_id,expected_identity,connection_generation}`；
   完成返回更新后的上述对象，旧代次立即失效。失败不重连/回落/重发。
@@ -397,7 +398,7 @@ HTTP 限定 literal loopback IP、固定路径、无代理/Origin/redirect、16 
 
 业务数字在 JSON 中是原始 number token；消费者编辑器可保留十进制文本，但发送时必须经严格 JSON 数字词法验证后直接拼接原 token，不经 JS Number 或 binary64。SDK 对 f32 仅一次量化，参数全文参与同 request_id 的一致性判断。
 
-`GET /bindings/{id}/trials/{trial_id}` 返回 `{trial_id,operation,trial:{native_json_text,state,stop_observed,stop_confirmation_overdue,elapsed_ms}}`，elapsed_ms 为字符串或 null；其他白名单字段只投影 SDK 原事实。`GET /bindings/{id}/recording` 返回 `{native_json_text,active,failed,recording_id}`。UI 不重建试验或配置计算。
+`GET /bindings/{id}/trials/{trial_id}` 返回 `{trial_id,operation,trial:{native_json_text,state,stop_observed,stop_confirmation_overdue,elapsed_ms}}`，elapsed_ms 为字符串或 null；其他白名单字段只投影 SDK 原事实。`GET /bindings/{id}/recording` 返回 `{native_json_text,active,failed,recording_id}`。UI 不重建试验或配置计算。 当前 owner 每个 target 最多保留一个成功成为当前的试验开始回执，活动、完成或人工释放占用后仍保留原账本 projection，超过普通 30 秒保留期也不改写其提交/效果事实。仅同 target 的新试验成功成为当前或该目标会话移出 owner 后解除旧引用；同 UID 的其他 target alias 不互相替换，多成员引用同一回执时须全部解除才可回收。保留回执仍计入 32 个普通操作容量，容量满时拒绝新普通准入；未知原回执无论引用是否解除均按既有规则永久保留。
 
 群组创建 `POST /groups {claimant_id,members:[{binding_id,...R}]}` 必须包含 1..16 个不同物理 UID。一次原子 Book reserve 全部成员；设备提交仍逐台，非原子。响应 `{group_id,reservation_id,claimant_id,stop_request_id,members:[{binding_id,target_id,...R,control_epoch,stop_request_id}]}`，每成员有独立 epoch/canonical Stop；群组 Stop ID 只聚合这些预留范围。
 

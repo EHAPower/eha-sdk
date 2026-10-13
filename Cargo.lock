@@ -255,6 +255,7 @@ dependencies = [
  "eha-sdk",
  "getrandom",
  "nix",
+ "percent-encoding",
  "rustix",
  "rustyline",
  "serde",

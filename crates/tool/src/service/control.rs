@@ -362,6 +362,15 @@ impl State {
     }
     /// Stop 在准入后获得首次尝试。普通续执行每次推进一个成员。
     pub(super) fn poll(&mut self, common: &mut mutations::State, workbench: &mut Workbench) {
+        // 断连/授权释放仍可能持有当前试验；仅目标会话已移出 owner 才解除引用。
+        self.trials.retain(|member, _| {
+            workbench
+                .integration_session_mut(&member.target_id)
+                .is_some()
+        });
+        common
+            .ledger
+            .retain_current_trials(self.trials.values().map(String::as_str));
         self.cleanup_tickets.retain(|id, ticket| {
             let valid = ticket.expires > Instant::now()
                 && common
@@ -554,7 +563,13 @@ impl State {
             }
             Poll::Ready(result) => {
                 if result.is_ok() && matches!(job.task, Task::Trial(_)) {
+                    // 新试验真正成为当前后才替换；同 UID 的其他 target alias 保留原证据。
+                    self.trials
+                        .retain(|member, _| member.target_id != job.member.target_id);
                     self.trials.insert(job.member.clone(), job.id.clone());
+                    common
+                        .ledger
+                        .retain_current_trials(self.trials.values().map(String::as_str));
                     common
                         .control_facts
                         .entry(job.id.clone())
@@ -1889,6 +1904,118 @@ mod tests {
             .expect("background owner consumed actual finish terminal");
         drop(wb);
         std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn current_trial_receipt_survives_ttl_and_completed_release() {
+        let (mut wb, mut control, mut common, member, scope, reservation, probe) = fixture();
+        wb.v2 = Some(integration::IntegrationState::for_test().for_v2());
+        let (status, binding) = integration::tests::call(&mut wb, "POST", "/service/v2/bindings", Some(json!({"api_version":2,"instance_id":"i-test","target_id":member.target_id,"intent":"attach","expected_identity":{"uid":member.uid,"run_nonce":member.run_nonce},"connection_generation":member.connection_generation})), true, false).expect("attach");
+        assert_eq!(status, 200, "{binding}");
+        let mut bindings = wb.v2.take().expect("bindings");
+        let id = common
+            .issue_reservation_ticket(&reservation, "operator", scope.clone(), Instant::now())
+            .expect("ticket");
+        let fields = RawFields::parse(r#"{"trial":{"command":{"action":"position","mm":1},"envelope":{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":2,"force_abs_max_n":10,"stiffness_max_n_per_mm":10,"damping_max_ns_per_mm":10,"duration_max_s":60},"duration_s":60}}"#).expect("trial JSON");
+        let (task, params) = decode_task("trials", &fields).expect("trial");
+        control
+            .admit(
+                &mut common,
+                &mut wb,
+                member.clone(),
+                scope.clone(),
+                Some(reservation.clone()),
+                "operator",
+                &id,
+                task,
+                params,
+                None,
+            )
+            .expect("admit");
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while control.busy() && Instant::now() < deadline {
+            control.poll(&mut common, &mut wb);
+            wb.tick();
+            std::thread::yield_now();
+        }
+        assert_eq!(control.trials.get(&member), Some(&id));
+        assert_eq!(probe.observed.lock().expect("observed").targets, 1);
+        let original = common.projection(&id).expect("original operation");
+        let path = format!(
+            "/service/v2/bindings/{}/trials/{id}",
+            binding["binding_id"].as_str().expect("binding id")
+        );
+        common
+            .ledger
+            .prune(Instant::now() + std::time::Duration::from_secs(31));
+        let (_, active) = route(
+            &path,
+            Method::Get,
+            &RawFields::parse("{}").expect("fields"),
+            &mut bindings,
+            &mut common,
+            &mut control,
+            &mut wb,
+        )
+        .expect("active trial keeps original receipt past TTL");
+        assert_eq!(active["operation"], original);
+        let stop = common.ledger.stop_id(&scope).expect("stop").to_owned();
+        control
+            .admit(
+                &mut common,
+                &mut wb,
+                member,
+                scope,
+                None,
+                "operator",
+                &stop,
+                Task::Stop,
+                Vec::new(),
+                None,
+            )
+            .expect("stop admission");
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+        while Instant::now() < deadline {
+            control.poll(&mut common, &mut wb);
+            probe.complete_stop();
+            wb.tick();
+            if !control.busy()
+                && wb
+                    .integration_session_mut("can:1")
+                    .expect("session")
+                    .trial_snapshot()["state"]
+                    == "completed"
+            {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            wb.integration_session_mut("can:1")
+                .expect("session")
+                .trial_snapshot()["state"],
+            "completed"
+        );
+        common
+            .book
+            .release(&reservation, "operator")
+            .expect("explicit release");
+        control.poll(&mut common, &mut wb);
+        common
+            .ledger
+            .prune(Instant::now() + std::time::Duration::from_secs(31));
+        let (_, completed) = route(
+            &path,
+            Method::Get,
+            &RawFields::parse("{}").expect("fields"),
+            &mut bindings,
+            &mut common,
+            &mut control,
+            &mut wb,
+        )
+        .expect("completed current trial keeps receipt after release");
+        assert_eq!(completed["trial"]["state"], "completed");
+        assert_eq!(completed["operation"], original);
     }
 
     #[test]

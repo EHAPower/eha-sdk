@@ -533,6 +533,30 @@ struct Identity {
     uid: String,
     run_nonce: String,
 }
+/// 仅解码已分离的连接 ID 段一次；不改变路径分隔或查询边界。
+fn connection_segment(encoded: &str) -> Result<std::borrow::Cow<'_, str>, ApiError> {
+    let mut bytes = encoded.bytes();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%'
+            && !(bytes.next().is_some_and(|value| value.is_ascii_hexdigit())
+                && bytes.next().is_some_and(|value| value.is_ascii_hexdigit()))
+        {
+            return Err(ApiError::bad("连接 ID 包含非法百分号转义"));
+        }
+    }
+    let decoded = percent_encoding::percent_decode_str(encoded)
+        .decode_utf8()
+        .map_err(|_| ApiError::bad("连接 ID 必须是有效 UTF-8"))?;
+    if decoded.is_empty()
+        || decoded
+            .chars()
+            .any(|value| matches!(value, '/' | '\\') || value.is_control())
+    {
+        return Err(ApiError::bad("连接 ID 不能含路径分隔符或控制字符"));
+    }
+    Ok(decoded)
+}
+
 fn checked_connection<'a>(
     workbench: &'a mut Workbench,
     target: &str,
@@ -1031,6 +1055,8 @@ fn route(
         if !matches!(action, "reconnect" | "disconnect") {
             return Err(ApiError::missing());
         }
+        let target = connection_segment(target)?;
+        let target = target.as_ref();
         fields.reject_unknown(&["instance_id", "expected_identity", "connection_generation"])?;
         if scan.busy || p2.connection_busy() {
             return Err(ApiError::conflict("busy", "扫描或连接批次期间不能改变连接"));
@@ -1378,6 +1404,108 @@ mod tests {
         json!({"api_version":2,"instance_id":"i-test","expected_identity":{"uid":uid,"run_nonce":run_nonce},
             "connection_generation":session.connection_generation().to_string()})
     }
+    #[test]
+    fn encoded_connection_segments_reach_usb_and_can_lifecycle_routes() {
+        for (target, encoded) in [
+            ("can:1", "can%3A1"),
+            ("usb:SERIAL", "usb%3ASERIAL"),
+            ("usb:A+B%3A", "usb%3AA%2BB%253A"),
+            ("usb:A+B%3A", "usb%3aA+B%253A"),
+        ] {
+            let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+            let mut owner = if let Some(serial) = target.strip_prefix("usb:") {
+                session.test_usb_request(serial);
+                Workbench::with_test_sessions(session, BTreeMap::new())
+            } else {
+                Workbench::with_test_sessions(ToolSession::new(), BTreeMap::from([(1, session)]))
+            };
+            owner.v2 = Some(IntegrationState::for_test().for_v2());
+            owner.legacy_routes = false;
+            let session = owner.integration_session_mut(target).expect("原会话");
+            let (uid, run_nonce) = session.integration_identity().expect("identity");
+            let original = json!({"api_version":2,"instance_id":"i-test","expected_identity":{"uid":uid,"run_nonce":run_nonce},"connection_generation":session.connection_generation().to_string()});
+            let mut stale = original.clone();
+            stale["connection_generation"] = json!("0");
+            for action in ["reconnect", "disconnect"] {
+                let (status, value) = call(
+                    &mut owner,
+                    "POST",
+                    &format!("/service/v2/connections/{encoded}/{action}"),
+                    Some(stale.clone()),
+                    true,
+                    false,
+                )
+                .expect("真实HTTP身份门");
+                assert_eq!(status, 409, "{target} {action}: {value}");
+                assert_eq!(value["code"], "binding_stale");
+            }
+            let (status, value) = call(
+                &mut owner,
+                "POST",
+                &format!("/service/v2/connections/{encoded}/disconnect"),
+                Some(original),
+                true,
+                false,
+            )
+            .expect("真实HTTP断开");
+            assert_eq!(status, 200, "{target}: {value}");
+            assert_eq!(value["connection_id"], target);
+            assert_eq!(value["connected"], false);
+            assert_eq!(probe.observed.lock().expect("probe").stops, 0);
+            assert_eq!(probe.observed.lock().expect("probe").targets, 0);
+        }
+    }
+
+    #[test]
+    fn invalid_connection_segments_are_rejected_before_session_lookup() {
+        let (mut owner, probe) = fixture();
+        let body = lifecycle(&mut owner);
+        for segment in [
+            "",
+            "can%",
+            "can%3",
+            "can%GG1",
+            "can%FF1",
+            "can%3A1%2Freconnect",
+            "can%3A1%5Cextra",
+            "can%3A1%00",
+            "can%3A1%0A",
+            "can:1/extra",
+        ] {
+            for action in ["reconnect", "disconnect"] {
+                let (status, _) = call(
+                    &mut owner,
+                    "POST",
+                    &format!("/service/v2/connections/{segment}/{action}"),
+                    Some(body.clone()),
+                    true,
+                    false,
+                )
+                .expect("非法路径HTTP响应");
+                assert_eq!(status, 400, "{segment} {action}");
+            }
+        }
+        let (status, value) = call(
+            &mut owner,
+            "POST",
+            "/service/v2/connections/can%253A1/disconnect",
+            Some(body),
+            true,
+            false,
+        )
+        .expect("重复编码HTTP响应");
+        assert_eq!(status, 404);
+        assert_eq!(value["code"], "not_found");
+        assert!(
+            owner
+                .integration_session_mut("can:1")
+                .expect("原会话")
+                .integration_connected()
+        );
+        assert_eq!(probe.observed.lock().expect("probe").stops, 0);
+        assert_eq!(probe.observed.lock().expect("probe").targets, 0);
+    }
+
     #[test]
     fn lifecycle_scope_rejections_do_not_stop_or_invalidate_owner() {
         let (mut owner, probe) = fixture();

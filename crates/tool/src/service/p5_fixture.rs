@@ -282,6 +282,8 @@ mod tests {
         worker: Option<thread::JoinHandle<Result<(), String>>>,
     }
     impl Running {
+        // 测试启动失败保留线程的原始错误诊断。
+        #[allow(clippy::panic)]
         fn start(scenario: Scenario, ttl: Duration) -> Self {
             let root = fs::canonicalize(std::env::temp_dir())
                 .expect("canonical system temporary directory")
