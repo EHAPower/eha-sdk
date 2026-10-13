@@ -2,8 +2,10 @@
 
 import json
 import math
+import os
 import sys
 import time
+import traceback
 
 
 USB_VENDOR = 0x1209
@@ -248,5 +250,22 @@ def main(argv):
     return 0
 
 
+def run_once():
+    # 只读一次性子进程：先交付完整结果，再跳过 Fibre/libusb 的解释器退出清理。
+    # 不调用第三方私有关闭接口；操作中的异常仍以非零状态交给父进程。
+    code = 1
+    try:
+        code = main(sys.argv)
+    except BaseException:
+        traceback.print_exc()
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except BaseException:
+                code = 1
+        os._exit(code)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv))
+    run_once()

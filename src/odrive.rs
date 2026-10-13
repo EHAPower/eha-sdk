@@ -8,7 +8,7 @@ use std::{
     fmt,
     io::Read,
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, ExitStatus, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -54,7 +54,7 @@ impl ErrorKind {
     }
 }
 
-/// ODrive USB 只读调用失败；`detail` 保留桥接层的原始异常文本。
+/// ODrive USB 只读调用失败；`detail` 保留桥接异常、进程退出状态与结果标记。
 #[derive(Debug)]
 pub struct Error {
     pub kind: ErrorKind,
@@ -185,11 +185,7 @@ fn run_bridge_script(
     let response: Value = serde_json::from_slice(&stdout).map_err(|error| Error {
         kind: ErrorKind::Bridge,
         message: format!("ODrive 只读进程未返回 JSON：{error}"),
-        detail: if stderr.is_empty() {
-            None
-        } else {
-            Some(stderr.clone())
-        },
+        detail: Some(bridge_diagnostic(&status, None, &stderr, None)),
     })?;
 
     if response.get("ok") == Some(&Value::Bool(true)) && status.success() {
@@ -209,13 +205,54 @@ fn run_bridge_script(
     let detail = bridge_error
         .and_then(|error| error.get("detail"))
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .or_else(|| (!stderr.is_empty()).then_some(stderr));
+        .map(str::to_owned);
+    let detail = Some(bridge_diagnostic(
+        &status,
+        Some(&response),
+        &stderr,
+        detail.as_deref(),
+    ));
     Err(Error {
         kind,
         message,
         detail,
     })
+}
+
+fn bridge_diagnostic(
+    status: &ExitStatus,
+    response: Option<&Value>,
+    stderr: &str,
+    bridge_detail: Option<&str>,
+) -> String {
+    #[cfg(unix)]
+    let signal = {
+        use std::os::unix::process::ExitStatusExt;
+        status
+            .signal()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".into())
+    };
+    #[cfg(not(unix))]
+    let signal = "unavailable";
+    let code = status
+        .code()
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".into());
+    let ok = response
+        .and_then(|value| value.get("ok"))
+        .and_then(Value::as_bool)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "missing_or_invalid".into());
+    let mut detail =
+        format!("status={status}; exit_code={code}; signal={signal}; response.ok={ok}");
+    if let Some(original) = bridge_detail {
+        detail.push_str(&format!("; bridge_detail={original}"));
+    }
+    if !stderr.is_empty() {
+        detail.push_str(&format!("; stderr={stderr}"));
+    }
+    detail
 }
 
 fn bridge_kind(kind: &str) -> ErrorKind {
@@ -257,6 +294,109 @@ mod tests {
         )
         .expect_err("有效序列号应在解释器启动处失败");
         assert_eq!(error.kind, ErrorKind::Interpreter);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn abnormal_exit_never_accepts_success_payload_and_keeps_status() {
+        let success = run_bridge_script(
+            Path::new("/bin/sh"),
+            "printf '{\"ok\":true}'",
+            "unused",
+            "unused",
+            Duration::from_secs(1),
+        )
+        .expect("零退出成功载荷仍可采用");
+        assert_eq!(success["ok"], true);
+        for (script, expected) in [
+            ("printf '{\"ok\":true}'; exit 7", "exit_code=7"),
+            ("printf '{\"ok\":true}'; kill -TERM $$", "signal=15"),
+            ("exit 7", "exit_code=7"),
+        ] {
+            let error = run_bridge_script(
+                Path::new("/bin/sh"),
+                script,
+                "unused",
+                "unused",
+                Duration::from_secs(1),
+            )
+            .expect_err("非零退出不能采纳成功载荷");
+            assert_eq!(error.kind, ErrorKind::Bridge);
+            let detail = error.detail.expect("退出诊断不可为空");
+            assert!(detail.contains(expected), "{detail}");
+            if script.starts_with("printf") {
+                assert!(detail.contains("response.ok=true"), "{detail}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn structured_failure_keeps_category_detail_stderr_and_exit_status() {
+        for code in [0, 1] {
+            let script = format!(
+                "printf '%s' '{{\"ok\":false,\"error\":{{\"kind\":\"dependency\",\"message\":\"missing dependency\",\"detail\":\"original detail\"}}}}'; printf 'original stderr' >&2; exit {code}"
+            );
+            let error = run_bridge_script(
+                Path::new("/bin/sh"),
+                &script,
+                "unused",
+                "unused",
+                Duration::from_secs(1),
+            )
+            .expect_err("失败载荷不能采用");
+            assert_eq!(error.kind, ErrorKind::Dependency);
+            assert_eq!(error.message, "missing dependency");
+            let detail = error.detail.expect("原始诊断");
+            for expected in [
+                "original detail",
+                "original stderr",
+                "response.ok=false",
+                &format!("exit_code={code}"),
+            ] {
+                assert!(detail.contains(expected), "{detail}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_entry_flushes_streams_preserves_code_and_skips_atexit() {
+        let encoded = serde_json::to_string(BRIDGE).expect("脚本文本");
+        for code in [0, 7] {
+            let script = format!(
+                "namespace={{'__name__':'test_bridge'}}\nexec({encoded}, namespace)\nimport atexit,sys\natexit.register(lambda: sys.stderr.write('atexit-ran'))\ndef main(argv):\n sys.stdout.write('{{\"ok\":true}}')\n sys.stderr.write('flushed-stderr')\n return {code}\nnamespace['main']=main\nnamespace['run_once']()\n"
+            );
+            let output = Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("合成 Python 入口");
+            assert_eq!(output.status.code(), Some(code));
+            assert_eq!(output.stdout, br#"{"ok":true}"#);
+            assert_eq!(output.stderr, b"flushed-stderr");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_entry_main_or_flush_failure_is_nonzero() {
+        let encoded = serde_json::to_string(BRIDGE).expect("脚本文本");
+        for setup in [
+            "def main(argv):\n raise RuntimeError('main failed')\nnamespace['main']=main",
+            "class BadFlush:\n def write(self, value): return len(value)\n def flush(self): raise RuntimeError('flush failed')\nsys.stdout=BadFlush()\nnamespace['main']=lambda argv:0",
+        ] {
+            let script = format!(
+                "namespace={{'__name__':'test_bridge'}}\nexec({encoded}, namespace)\nimport atexit,sys\natexit.register(lambda: sys.stderr.write('atexit-ran'))\n{setup}\nnamespace['run_once']()\n"
+            );
+            let output = Command::new("python3")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("合成失败入口");
+            assert_eq!(output.status.code(), Some(1));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains("atexit-ran"));
+        }
     }
 
     #[cfg(unix)]
