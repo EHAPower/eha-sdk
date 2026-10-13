@@ -191,6 +191,9 @@ pub struct SendRequest {
     pub id: u64,
     pub bytes: Vec<u8>,
     pub deadline: Instant,
+    /// 查询在 Pump::take 移交前可由等待方取消；移交后使用独立标志，原期限不变。
+    /// 尚未开始发送而 put_back 的查询恢复原等待取消关联。
+    /// 控制和维护请求保持原在途取消语义。
     pub cancelled: Arc<AtomicBool>,
 }
 impl SendRequest {
@@ -217,6 +220,7 @@ pub struct Pump {
     rx: Receiver<Command>,
     pub sink: EventSink,
     pending: [Option<SendRequest>; 3],
+    returned_query_cancellation: [Option<(u64, Arc<AtomicBool>)>; 3],
     period: Option<Duration>,
     next: Instant,
     epoch: Instant,
@@ -228,6 +232,7 @@ impl Pump {
             rx,
             sink,
             pending: [None, None, None],
+            returned_query_cancellation: [None, None, None],
             period: None,
             next: Instant::now(),
             epoch: Instant::now(),
@@ -250,6 +255,13 @@ impl Pump {
             match self.rx.try_recv() {
                 Ok(Command::Send(req)) => {
                     let lane = req.lane();
+                    if self.pending[lane]
+                        .as_ref()
+                        .is_some_and(SendRequest::expired)
+                        && let Some(expired) = self.pending[lane].take()
+                    {
+                        self.sink.failed(expired.id, "发送前已取消或到期", false);
+                    }
                     if self.pending[lane].is_some() {
                         self.sink.failed(req.id, "本地发送槽占用", false);
                     } else {
@@ -301,17 +313,39 @@ impl Pump {
         }
         !self.closed
     }
+    /// 每 lane 的 worker 完成或退回上一请求后再取下一请求；最多保留三份退回关联。
     pub fn take(&mut self, lane: usize) -> Option<SendRequest> {
-        let req = self.pending[lane].take()?;
+        let mut req = self.pending[lane].take()?;
+        self.returned_query_cancellation[lane] = None;
         if req.expired() {
             self.sink.failed(req.id, "发送前已取消或到期", false);
             None
         } else {
+            // 取出后隔离等待取消，避免中止已开始的 USB/CAN 发送；未能开始而退回
+            // 的请求在 put_back 恢复排队取消。真实 I/O 期限始终保留。
+            if matches!(
+                req.bytes
+                    .get(1)
+                    .copied()
+                    .and_then(protocol::MessageKind::from_byte),
+                Some(protocol::MessageKind::Query | protocol::MessageKind::ReadConfig)
+            ) {
+                self.returned_query_cancellation[lane] = Some((req.id, req.cancelled.clone()));
+                req.cancelled = Arc::new(AtomicBool::new(false));
+            }
             Some(req)
         }
     }
-    pub fn put_back(&mut self, req: SendRequest) {
+    /// 仅退回尚未开始发送的请求；只读查询重新关联等待取消，允许随后 Stop 回收槽位。
+    pub fn put_back(&mut self, mut req: SendRequest) {
         let lane = req.lane();
+        if self.returned_query_cancellation[lane]
+            .as_ref()
+            .is_some_and(|(id, _)| *id == req.id)
+            && let Some((_, cancelled)) = self.returned_query_cancellation[lane].take()
+        {
+            req.cancelled = cancelled;
+        }
         self.pending[lane] = Some(req);
     }
     pub fn disconnected(&self, reason: impl Into<String>) {
@@ -379,6 +413,197 @@ impl Drop for Backend {
         let _ = self.tx.send(Command::Close);
         if let Some(join) = self.join.take() {
             let _ = join.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(id: u64) -> SendRequest {
+        SendRequest {
+            id,
+            bytes: vec![0; 8],
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn cancelled_or_expired_slot_accepts_next_send_but_live_slot_stays_owned() {
+        for state in 0..3 {
+            let (backend, commands, sink) = Backend::endpoint();
+            let mut pump = Pump::new(commands, sink.clone());
+            backend
+                .tx
+                .try_send(Command::Send(request(1)))
+                .expect("first send");
+            assert!(pump.poll());
+            let pending = pump.pending[1].as_mut().expect("first occupies slot");
+            match state {
+                0 => pending.cancelled.store(true, Ordering::Release),
+                1 => pending.deadline = Instant::now(),
+                _ => {}
+            }
+            backend
+                .tx
+                .try_send(Command::Send(request(2)))
+                .expect("second send");
+            assert!(pump.poll());
+            assert_eq!(
+                pump.take(1).expect("valid request stays").id,
+                if state < 2 { 2 } else { 1 }
+            );
+            let inbox = sink.0.0.lock().expect("inbox");
+            assert!(
+                matches!(inbox.events.front(), Some(Event::Failed(id, failure)) if *id == if state < 2 { 1 } else { 2 } && !failure.may_have_sent)
+            );
+            assert_eq!(inbox.events.len(), 1);
+        }
+    }
+
+    #[test]
+    fn cancelling_a_taken_request_does_not_retract_it_or_occupy_the_next_slot() {
+        let (backend, commands, sink) = Backend::endpoint();
+        let mut pump = Pump::new(commands, sink.clone());
+        backend
+            .tx
+            .try_send(Command::Send(request(1)))
+            .expect("first send");
+        assert!(pump.poll());
+        let taken = pump.take(1).expect("worker owns first request");
+        taken.cancelled.store(true, Ordering::Release);
+        backend
+            .tx
+            .try_send(Command::Send(request(2)))
+            .expect("second send");
+        assert!(pump.poll());
+        assert_eq!(pump.take(1).expect("next request").id, 2);
+        assert_eq!(taken.id, 1);
+        assert_eq!(taken.bytes, vec![0; 8]);
+        assert!(sink.0.0.lock().expect("inbox").events.is_empty());
+    }
+
+    #[test]
+    fn returned_read_query_restores_cancellation_before_or_after_put_back() {
+        for kind in [
+            protocol::MessageKind::Query,
+            protocol::MessageKind::ReadConfig,
+        ] {
+            for cancel_before_return in [false, true] {
+                let (backend, commands, sink) = Backend::endpoint();
+                let mut pump = Pump::new(commands, sink.clone());
+                let mut query = request(1);
+                query.bytes[1] = kind as u8;
+                let cancelled = query.cancelled.clone();
+                backend
+                    .tx
+                    .try_send(Command::Send(query))
+                    .expect("enqueue query");
+                assert!(pump.poll());
+                let taken = pump.take(1).expect("take query");
+                assert!(!Arc::ptr_eq(&cancelled, &taken.cancelled));
+                if cancel_before_return {
+                    cancelled.store(true, Ordering::Release);
+                }
+                pump.put_back(taken);
+                if !cancel_before_return {
+                    cancelled.store(true, Ordering::Release);
+                }
+                let mut stop = request(2);
+                stop.bytes[1] = protocol::MessageKind::Stop as u8;
+                backend
+                    .tx
+                    .try_send(Command::Send(stop))
+                    .expect("enqueue Stop");
+                assert!(pump.poll());
+                assert_eq!(pump.take(1).expect("Stop owns released slot").id, 2);
+                let inbox = sink.0.0.lock().expect("inbox");
+                assert_eq!(inbox.events.len(), 1);
+                assert!(
+                    matches!(inbox.events.front(), Some(Event::Failed(1, failure)) if !failure.may_have_sent)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn returned_query_associations_do_not_cross_requests_and_are_released() {
+        let (backend, commands, sink) = Backend::endpoint();
+        let mut pump = Pump::new(commands, sink);
+        let enqueue = |id| {
+            let mut query = request(id);
+            query.bytes[1] = protocol::MessageKind::Query as u8;
+            let cancelled = query.cancelled.clone();
+            backend
+                .tx
+                .try_send(Command::Send(query))
+                .expect("enqueue query");
+            cancelled
+        };
+        let first_cancelled = enqueue(1);
+        assert!(pump.poll());
+        let first = pump.take(1).expect("first taken");
+        first_cancelled.store(true, Ordering::Release);
+        assert!(!first.expired());
+        drop(first); // worker 已完成；下一笔必须替换旧关联。
+        let second_cancelled = enqueue(2);
+        assert!(pump.poll());
+        let second = pump.take(1).expect("second taken");
+        assert_eq!(Arc::strong_count(&first_cancelled), 1);
+        pump.put_back(second);
+        let queued = pump.pending[1].as_ref().expect("second queued");
+        assert!(Arc::ptr_eq(&queued.cancelled, &second_cancelled));
+        assert!(!queued.expired(), "上一笔取消不得污染下一笔退回请求");
+        let second = pump.take(1).expect("take second again");
+        second_cancelled.store(true, Ordering::Release);
+        assert!(!second.expired());
+        pump.put_back(second);
+        assert!(pump.take(1).is_none(), "取消的退回请求不发送");
+        assert!(pump.returned_query_cancellation[1].is_none());
+        assert_eq!(Arc::strong_count(&second_cancelled), 1);
+        let third_cancelled = enqueue(3);
+        assert!(pump.poll());
+        let third = pump.take(1).expect("third taken");
+        assert_eq!(Arc::strong_count(&third_cancelled), 2);
+        drop(pump);
+        assert_eq!(Arc::strong_count(&third_cancelled), 1);
+        third_cancelled.store(true, Ordering::Release);
+        assert!(!third.expired(), "释放 Pump 也不重新关联在途 token");
+    }
+
+    #[test]
+    fn only_read_queries_detach_wait_cancellation_at_take_and_keep_io_deadline() {
+        use protocol::MessageKind;
+        for kind in [
+            MessageKind::Query,
+            MessageKind::ReadConfig,
+            MessageKind::Position,
+            MessageKind::Stop,
+            MessageKind::Heartbeat,
+            MessageKind::SaveAndRestart,
+            MessageKind::ResetApplication,
+            MessageKind::EnterUpdate,
+        ] {
+            let (backend, commands, sink) = Backend::endpoint();
+            let mut pump = Pump::new(commands, sink);
+            let mut req = request(1);
+            req.bytes[1] = kind as u8;
+            let lane = req.lane();
+            let deadline = req.deadline;
+            let wait_cancelled = req.cancelled.clone();
+            backend.tx.try_send(Command::Send(req)).expect("enqueue");
+            assert!(pump.poll());
+            let mut taken = pump.take(lane).expect("take before cancel");
+            // 取消在 take 与驱动发送之间到达；只读发送不再被等待方中止。
+            wait_cancelled.store(true, Ordering::Release);
+            let read = matches!(kind, MessageKind::Query | MessageKind::ReadConfig);
+            assert_eq!(taken.expired(), !read);
+            assert_eq!(Arc::ptr_eq(&wait_cancelled, &taken.cancelled), !read);
+            assert_eq!(taken.deadline, deadline);
+            taken.deadline = Instant::now();
+            assert!(taken.expired(), "真实发送期限保持有效");
         }
     }
 }

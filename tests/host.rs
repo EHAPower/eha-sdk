@@ -3,8 +3,10 @@
 #![cfg(feature = "desktop")]
 #![allow(clippy::panic)]
 
+use eha_sdk::session::QueryKind;
 use std::{
     sync::{Arc, Mutex},
+    task::Poll,
     thread,
     time::{Duration, Instant},
 };
@@ -174,6 +176,370 @@ fn identify_client(client: &mut Client) {
         .expect("identity succeeds");
 }
 
+// 按测试步骤交付事件，查询永不自动回复；不靠 sleep 或墙钟上限判断 poll 是否有界。
+fn controlled_client() -> (
+    Client,
+    EventSink,
+    std::sync::mpsc::Receiver<eha_sdk::host::backend::SendRequest>,
+) {
+    use eha_sdk::host::backend::Command;
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+    let (request_tx, request_rx) = std::sync::mpsc::sync_channel(8);
+    let backend = Backend::spawn("eha-sdk-poll-test", move |commands, sink| {
+        ready_tx.send(sink.clone()).expect("publish sink");
+        while let Ok(command) = commands.recv() {
+            match command {
+                Command::Send(request) => {
+                    match protocol::decode(&request.bytes, Direction::HostToFirmware)
+                        .expect("valid request")
+                    {
+                        Message::Query {
+                            query_id,
+                            category: 0,
+                        } => {
+                            sink.submitted(request.id);
+                            sink.received(identity(query_id));
+                        }
+                        Message::Stop => sink.submitted(request.id),
+                        _ => request_tx.send(request).expect("publish request"),
+                    }
+                }
+                Command::Close => break,
+                Command::Heartbeat(_) => {}
+            }
+        }
+    })
+    .expect("backend starts");
+    let sink = ready_rx.recv().expect("sink ready");
+    let mut client = Client::new(backend);
+    identify_client(&mut client);
+    (client, sink, request_rx)
+}
+
+fn query_id(request: &eha_sdk::host::backend::SendRequest) -> u32 {
+    match protocol::decode(&request.bytes, Direction::HostToFirmware).expect("request decodes") {
+        Message::Query { query_id, .. } | Message::ReadConfig { query_id, .. } => query_id,
+        other => panic!("expected query, got {other:?}"),
+    }
+}
+
+#[test]
+fn polling_cancel_releases_stop_and_ignores_late_query_events() {
+    let (mut client, sink, requests) = controlled_client();
+    let wait = Wait::default();
+    client.begin_query(QueryKind::Status, &wait).expect("begin");
+    let old = requests.recv().expect("query handed to worker");
+    assert!(client.poll_query().is_pending());
+    assert!(client.poll_query().is_pending());
+    assert_eq!(
+        client.cancel_query().expect("cancel"),
+        LocalStage::MayHaveBeenSubmitted
+    );
+    assert!(old.expired());
+    sink.submitted(old.id);
+    sink.failed(old.id, "late cancellation result", false);
+    sink.received(unavailable(query_id(&old), UnavailableSubject::Status));
+    let stop = client
+        .stop_control(&wait)
+        .expect("next call submits explicit Stop");
+    assert!(stop.id > old.id);
+
+    client
+        .begin_query(QueryKind::Status, &wait)
+        .expect("next query");
+    let next = requests.recv().expect("next request");
+    sink.received(unavailable(query_id(&old), UnavailableSubject::Status));
+    sink.submitted(next.id);
+    assert!(client.poll_query().is_pending());
+    sink.received(unavailable_with(
+        query_id(&next),
+        NONCE,
+        UnavailableSubject::Status,
+        0x0104,
+    ));
+    let Poll::Ready(Err(error)) = client.poll_query() else {
+        panic!("matching reply completes")
+    };
+    assert!(matches!(error.failure, Failure::DataUnavailable(fields) if fields.reason == 0x0104));
+    assert_eq!(error.local, LocalStage::FullySubmitted);
+}
+
+#[test]
+fn pending_query_rejects_other_consumers_without_changing_identity_or_losing_events() {
+    let (mut client, sink, requests) = controlled_client();
+    let wait = Wait::default();
+    client
+        .begin_query(QueryKind::Measurements, &wait)
+        .expect("begin");
+    let request = requests.recv().expect("query request");
+    let errors = [
+        client
+            .begin_query(QueryKind::Status, &wait)
+            .expect_err("one pending"),
+        client
+            .identify(None, &wait)
+            .expect_err("identity cannot change"),
+        client.status(&wait).expect_err("sync query cannot consume"),
+        client
+            .measurements(&wait)
+            .expect_err("sync query cannot consume"),
+        client
+            .diagnostics(&wait)
+            .expect_err("sync query cannot consume"),
+        client
+            .read_config(ConfigView::Factory, &wait)
+            .expect_err("config cannot consume"),
+        client.stop_control(&wait).expect_err("cancel first"),
+        client
+            .heartbeat(&wait)
+            .expect_err("manual heartbeat cannot consume"),
+        client
+            .position(1.0, &wait)
+            .expect_err("control cannot consume"),
+        client
+            .velocity(1.0, &wait)
+            .expect_err("control cannot consume"),
+        client
+            .force(1.0, &wait)
+            .expect_err("control cannot consume"),
+        client
+            .impedance(1.0, 1.0, 1.0, &wait)
+            .expect_err("control cannot consume"),
+        client
+            .reset_application(&wait)
+            .expect_err("mutation cannot consume"),
+        client
+            .enter_update(&wait)
+            .expect_err("mutation cannot consume"),
+        client
+            .save_and_restart(VALID_CONFIG, &wait)
+            .expect_err("save cannot consume"),
+        client
+            .restore_factory_and_restart(&wait)
+            .expect_err("restore cannot consume"),
+    ];
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error.failure, Failure::Session(_))
+                && error.local == LocalStage::NotSubmitted)
+    );
+    client
+        .start_heartbeat()
+        .expect("background heartbeat allowed");
+    client
+        .stop_heartbeat()
+        .expect("background heartbeat switch allowed");
+    client
+        .enable_telemetry_queue(2)
+        .expect("cache configuration allowed");
+    let _ = (
+        client.telemetry(),
+        client.drain_telemetry(),
+        client.connection_status(),
+        client.transport_status(),
+        client.adapter_status(),
+        client.heartbeat_status(),
+        client.session(),
+    );
+    sink.submitted(request.id);
+    sink.received(unavailable(
+        query_id(&request),
+        UnavailableSubject::Measurements,
+    ));
+    assert!(
+        matches!(client.poll_query(), Poll::Ready(Err(error)) if matches!(error.failure, Failure::DataUnavailable(_)))
+    );
+    client.stop_control(&wait).expect("identity still verified");
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn polling_matches_nonce_subject_and_id_and_retains_early_reply_until_submission() {
+    let (mut client, sink, requests) = controlled_client();
+    client
+        .begin_query(QueryKind::Status, &Wait::default())
+        .expect("begin");
+    let request = requests.recv().expect("query request");
+    let id = query_id(&request);
+    sink.received(unavailable_with(id, [8; 16], UnavailableSubject::Status, 1));
+    sink.received(unavailable_with(
+        id - 1,
+        NONCE,
+        UnavailableSubject::Status,
+        2,
+    ));
+    sink.received(unavailable_with(
+        id,
+        NONCE,
+        UnavailableSubject::Diagnostics,
+        3,
+    ));
+    assert!(client.poll_query().is_pending());
+    sink.received(unavailable_with(id, NONCE, UnavailableSubject::Status, 4));
+    assert!(client.poll_query().is_pending());
+    sink.submitted(request.id);
+    let Poll::Ready(Err(error)) = client.poll_query() else {
+        panic!("early reply completes after Submitted")
+    };
+    assert!(matches!(error.failure, Failure::DataUnavailable(fields) if fields.reason == 4));
+    assert_eq!(error.local, LocalStage::FullySubmitted);
+    assert!(
+        matches!(client.poll_query(), Poll::Ready(Err(error)) if matches!(error.failure, Failure::InvalidInput(_)))
+    );
+}
+
+#[test]
+fn polling_covers_all_read_topics_and_validates_public_kinds() {
+    let (mut client, sink, requests) = controlled_client();
+    let wait = Wait::default();
+    assert!(client.begin_query(QueryKind::Identity, &wait).is_err());
+    assert!(client.begin_query(QueryKind::Config(3), &wait).is_err());
+    for (kind, subject) in [
+        (QueryKind::Status, UnavailableSubject::Status),
+        (QueryKind::Measurements, UnavailableSubject::Measurements),
+        (QueryKind::Diagnostics, UnavailableSubject::Diagnostics),
+    ] {
+        client.begin_query(kind, &wait).expect("begin topic");
+        let request = requests.recv().expect("query request");
+        sink.submitted(request.id);
+        sink.received(unavailable(query_id(&request), subject));
+        assert!(
+            matches!(client.poll_query(), Poll::Ready(Err(error)) if matches!(error.failure, Failure::DataUnavailable(fields) if fields.subject == subject))
+        );
+    }
+    for view in [
+        ConfigView::Factory,
+        ConfigView::Startup,
+        ConfigView::UserRecord,
+    ] {
+        client
+            .begin_query(QueryKind::Config(view as u8), &wait)
+            .expect("begin config");
+        let request = requests.recv().expect("config request");
+        sink.submitted(request.id);
+        sink.received(config(query_id(&request), view, VALID_CONFIG));
+        let Poll::Ready(Ok(reply)) = client.poll_query() else {
+            panic!("matching config reply")
+        };
+        assert!(
+            matches!(reply.response().expect("reply decodes"), protocol::Response::ConfigData(data) if data.fields().view == view && data.data() == VALID_CONFIG)
+        );
+    }
+}
+
+#[test]
+fn polling_cancel_and_transport_failures_preserve_submission_stage() {
+    for submitted in [false, true] {
+        let (mut client, sink, requests) = controlled_client();
+        let wait = Wait::default();
+        client.begin_query(QueryKind::Status, &wait).expect("begin");
+        let request = requests.recv().expect("query request");
+        if submitted {
+            sink.submitted(request.id);
+        }
+        assert!(client.poll_query().is_pending());
+        wait.cancellation.cancel();
+        let Poll::Ready(Err(error)) = client.poll_query() else {
+            panic!("cancel completes")
+        };
+        assert!(matches!(error.failure, Failure::Cancelled));
+        assert_eq!(
+            error.local,
+            if submitted {
+                LocalStage::FullySubmitted
+            } else {
+                LocalStage::MayHaveBeenSubmitted
+            }
+        );
+        assert!(request.expired());
+        assert!(client.cancel_query().is_err());
+    }
+    for event in [
+        Event::Failed(
+            2,
+            eha_sdk::host::backend::IoFailure {
+                detail: "not sent".into(),
+                may_have_sent: false,
+            },
+        ),
+        Event::Failed(
+            2,
+            eha_sdk::host::backend::IoFailure {
+                detail: "partly sent".into(),
+                may_have_sent: true,
+            },
+        ),
+        Event::TransportError {
+            detail: "framing".into(),
+            raw: vec![1, 2],
+        },
+        Event::Disconnected("gone".into()),
+    ] {
+        let (mut client, sink, requests) = controlled_client();
+        client
+            .begin_query(QueryKind::Status, &Wait::default())
+            .expect("begin");
+        let request = requests.recv().expect("query request");
+        let expected_stage = if matches!(event, Event::Failed(_, ref failure) if !failure.may_have_sent)
+        {
+            LocalStage::NotSubmitted
+        } else {
+            LocalStage::MayHaveBeenSubmitted
+        };
+        let disconnected = matches!(event, Event::Disconnected(_));
+        sink.event(event);
+        let Poll::Ready(Err(error)) = client.poll_query() else {
+            panic!("transport failure completes")
+        };
+        assert_eq!(error.local, expected_stage);
+        assert_eq!(
+            matches!(error.failure, Failure::Disconnected(_)),
+            disconnected
+        );
+        assert!(request.expired());
+    }
+}
+
+#[test]
+fn pending_state_is_not_transferable_to_another_or_resumed_client() {
+    let (mut client, _, requests) = controlled_client();
+    client
+        .begin_query(QueryKind::Status, &Wait::default())
+        .expect("begin");
+    let request = requests.recv().expect("query request");
+    let (mut other, _, _) = controlled_client();
+    assert!(matches!(other.poll_query(), Poll::Ready(Err(_))));
+    let state = client.disconnect();
+    assert!(request.expired());
+    let backend = backend_with(Seen::default(), |message, sink, id| {
+        if let Message::Query {
+            query_id,
+            category: 0,
+        } = message
+        {
+            sink.submitted(id);
+            sink.received(identity_with(query_id, UID, [6; 16], 1));
+        }
+    });
+    let mut resumed = Client::resume(backend, state);
+    assert!(matches!(resumed.poll_query(), Poll::Ready(Err(_))));
+    assert!(
+        resumed
+            .begin_query(QueryKind::Status, &Wait::default())
+            .is_err()
+    );
+    identify_client(&mut resumed);
+    assert!(matches!(resumed.poll_query(), Poll::Ready(Err(_))));
+    let (mut closing, _, requests) = controlled_client();
+    closing
+        .begin_query(QueryKind::Status, &Wait::default())
+        .expect("begin");
+    let closing_request = requests.recv().expect("query request");
+    closing.close();
+    assert!(closing_request.expired());
+}
+
 #[test]
 fn query_ignores_late_and_wrong_subject_replies_before_the_matching_reply() {
     let seen = Seen::default();
@@ -256,6 +622,48 @@ fn matching_reply_before_local_submission_is_preserved() {
 }
 
 #[test]
+fn synchronous_query_cancel_after_take_keeps_stage_and_allows_explicit_stop() {
+    let wait = Wait::default();
+    let cancel = wait.cancellation.clone();
+    let (taken_tx, taken_rx) = std::sync::mpsc::sync_channel(1);
+    let backend = Backend::spawn("eha-sdk-sync-cancel-test", move |commands, sink| {
+        let mut pump = Pump::new(commands, sink);
+        while pump.poll() {
+            while let Some(request) = pump.take(1) {
+                match protocol::decode(&request.bytes, Direction::HostToFirmware).expect("request")
+                {
+                    Message::Query {
+                        query_id,
+                        category: 0,
+                    } => {
+                        pump.sink.submitted(request.id);
+                        pump.sink.received(identity(query_id));
+                    }
+                    Message::Query { category: 1, .. } => {
+                        cancel.cancel();
+                        taken_tx.send(request).expect("record taken request");
+                    }
+                    Message::Stop => pump.sink.submitted(request.id),
+                    other => panic!("unexpected request: {other:?}"),
+                }
+            }
+            thread::yield_now();
+        }
+    })
+    .expect("backend starts");
+    let mut client = Client::new(backend);
+    identify_client(&mut client);
+    let error = client.status(&wait).expect_err("wait cancelled after take");
+    assert!(matches!(error.failure, Failure::Cancelled));
+    assert_eq!(error.local, LocalStage::MayHaveBeenSubmitted);
+    let taken = taken_rx.recv().expect("worker owns request");
+    assert!(!taken.expired(), "查询等待取消不能中止在途 I/O");
+    client
+        .stop_control(&Wait::default())
+        .expect("explicit stop remains available");
+}
+
+#[test]
 fn unmatched_events_do_not_extend_deadline() {
     let backend = Backend::spawn("eha-sdk-deadline-test", move |commands, sink| {
         let mut pump = Pump::new(commands, sink);
@@ -305,6 +713,7 @@ fn unmatched_events_do_not_extend_deadline() {
         .status(&Wait::new(Duration::from_millis(25)))
         .expect_err("unmatched replies must not keep this query alive");
     assert!(matches!(error.failure, Failure::Timeout));
+    assert_eq!(error.local, LocalStage::FullySubmitted);
     assert!(started.elapsed() < Duration::from_millis(100));
 }
 

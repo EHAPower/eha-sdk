@@ -1034,6 +1034,97 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_taken_query_wait_does_not_expire_usb_active_or_block_stop() {
+        use crate::host::backend::{Command, SendRequest};
+        let (backend, commands, sink) = Backend::endpoint();
+        let mut pump = Pump::new(commands, sink);
+        let wait_cancelled = Arc::new(AtomicBool::new(false));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut heartbeat = [0; 8];
+        let mut short = [0; 256];
+        let mut long = [0; MAX_MESSAGE_LEN];
+        let mut sender = transport::usb::Sender::new(
+            protocol::Direction::HostToFirmware,
+            &mut heartbeat,
+            &mut short,
+            &mut long,
+        );
+        for (id, message) in [
+            (
+                1,
+                protocol::Message::Query {
+                    query_id: 1,
+                    category: 1,
+                },
+            ),
+            (2, protocol::Message::Stop),
+        ] {
+            let mut bytes = vec![0; message.encoded_len().expect("length")];
+            protocol::encode(message, &mut bytes).expect("encode");
+            backend
+                .tx
+                .try_send(Command::Send(SendRequest {
+                    id,
+                    bytes,
+                    deadline,
+                    cancelled: if id == 1 {
+                        wait_cancelled.clone()
+                    } else {
+                        Arc::new(AtomicBool::new(false))
+                    },
+                }))
+                .expect("enqueue");
+            assert!(pump.poll());
+            let request = pump.take(1).expect("worker takes request");
+            let mut active = [
+                None,
+                Some(ActiveRequest {
+                    id: request.id,
+                    deadline: request.deadline,
+                    cancelled: request.cancelled,
+                }),
+                None,
+            ];
+            let buffer = sender
+                .buffer_mut(transport::usb::Lane::Short)
+                .expect("idle lane");
+            buffer[..request.bytes.len()].copy_from_slice(&request.bytes);
+            sender
+                .begin_buffer(transport::usb::Lane::Short, request.bytes.len(), 0)
+                .expect("freeze request");
+            let mut packet = [0; transport::usb::PACKET_LEN];
+            let (prepared, lane) = prepare_next(&mut sender, &mut packet)
+                .expect("prepare")
+                .expect("packet");
+            assert_eq!(lane, 1);
+            assert_eq!(
+                sender.accepted(prepared.token),
+                transport::usb::SendEvent::PacketAccepted
+            );
+            // 真实 worker 的窗口：Bulk OUT 已接受，本地 completion 尚未返回。
+            wait_cancelled.store(true, Ordering::Release);
+            assert!(!active_request_expired(&active), "取消查询等待不得关闭 USB");
+            assert!(matches!(
+                sender.completed(prepared.token, 0),
+                transport::usb::SendEvent::MessageCommitted { .. }
+            ));
+            pump.sink.submitted(id);
+            active[1] = None;
+            assert!(!active_request_expired(&active));
+        }
+        let inbox = backend.sink.0.0.lock().expect("inbox");
+        assert!(inbox.disconnected.is_none());
+        assert!(matches!(
+            inbox.events.front(),
+            Some(crate::host::backend::Event::Submitted(1))
+        ));
+        assert!(matches!(
+            inbox.events.back(),
+            Some(crate::host::backend::Event::Submitted(2))
+        ));
+    }
+
+    #[test]
     fn expired_periodic_heartbeat_does_not_close_worker_but_business_requests_do() {
         let expired = Instant::now() - Duration::from_millis(1);
         let future = Instant::now() + Duration::from_secs(1);
