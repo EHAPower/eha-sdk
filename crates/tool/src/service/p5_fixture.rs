@@ -144,7 +144,7 @@ pub(super) fn allowed_path(path: &str, method: Method) -> bool {
             || rest.starts_with("operations/")
             || rest.starts_with("recordings")
             || rest.starts_with("groups/")
-            || rest.starts_with("read-jobs/");
+            || rest.starts_with("jobs/");
     }
     matches!(
         rest,
@@ -283,11 +283,13 @@ mod tests {
     }
     impl Running {
         fn start(scenario: Scenario, ttl: Duration) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "eha-p5-{}-{}",
-                std::process::id(),
-                integration::random_hex::<8>().expect("random")
-            ));
+            let root = fs::canonicalize(std::env::temp_dir())
+                .expect("canonical system temporary directory")
+                .join(format!(
+                    "eha-p5-{}-{}",
+                    std::process::id(),
+                    integration::random_hex::<8>().expect("random")
+                ));
             let listener = TcpListener::bind("127.0.0.1:0").expect("unused port");
             let port = listener.local_addr().expect("port").port();
             drop(listener);
@@ -298,7 +300,9 @@ mod tests {
                 if let Ok(bytes) = fs::read(root.join(format!("port-{port}.json"))) {
                     break serde_json::from_slice::<Value>(&bytes).expect("descriptor");
                 }
-                assert!(!worker.is_finished(), "fixture startup failed");
+                if worker.is_finished() {
+                    panic!("fixture startup failed: {:?}", worker.join());
+                }
                 assert!(Instant::now() < deadline, "ready deadline");
                 thread::sleep(Duration::from_millis(5));
             };
@@ -379,6 +383,41 @@ mod tests {
             .parse()
             .expect("status integer");
         (status, serde_json::from_str(body).expect("JSON response"))
+    }
+
+    #[test]
+    fn recordings_job_is_readable_without_opening_physical_job_creation() {
+        assert!(allowed_path("/service/v2/jobs/read-1", Method::Get));
+        assert!(!allowed_path("/service/v2/jobs/read-1", Method::Post));
+        assert!(!allowed_path("/service/v2/read-jobs/read-1", Method::Get));
+        for (path, method) in [
+            ("/service/v2/profiles", Method::Get),
+            ("/service/v2/adapters", Method::Get),
+            ("/service/v2/odrive/devices", Method::Get),
+            ("/service/v2/odrive/read", Method::Post),
+        ] {
+            assert!(!allowed_path(path, method), "physical creation {path}");
+        }
+        let service = Running::start(Scenario::Healthy, Duration::from_secs(10));
+        let (status, queued) = service.request("GET", "/service/v2/recordings", None);
+        assert_eq!(status, 202, "{queued}");
+        assert_eq!(queued["state"], "queued");
+        let id = queued["job_id"].as_str().expect("actual recordings job ID");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (status, value) = service.request("GET", &format!("/service/v2/jobs/{id}"), None);
+            assert_eq!(status, 200, "{value}");
+            assert_eq!(value["job_id"], id);
+            if value["state"] == "completed" {
+                assert_eq!(value["data"]["runs"], json!([]));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "recordings job did not complete: {value}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
