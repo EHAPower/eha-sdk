@@ -38,6 +38,8 @@ mod mutations;
 mod network_jobs;
 mod operations;
 mod p2;
+#[cfg(test)]
+pub(crate) mod p5_fixture;
 mod read_jobs;
 mod reservations;
 mod stop_body;
@@ -477,6 +479,31 @@ fn run(
     instance_file: Option<PathBuf>,
     legacy_routes: bool,
 ) -> Result<(), String> {
+    run_with_workbench(
+        port,
+        odrive_python,
+        runs_dir,
+        token_file,
+        instance_file,
+        legacy_routes,
+        prepare_workbench,
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // 保留既有启动参数，测试仅替换会话构造器。
+fn run_with_workbench(
+    port: u16,
+    odrive_python: Option<PathBuf>,
+    runs_dir: Option<PathBuf>,
+    token_file: Option<PathBuf>,
+    instance_file: Option<PathBuf>,
+    legacy_routes: bool,
+    make_workbench: impl FnOnce(
+        Option<PathBuf>,
+        Option<integration::IntegrationState>,
+        bool,
+    ) -> Workbench,
+) -> Result<(), String> {
     let instance_file = if legacy_routes {
         None
     } else {
@@ -507,7 +534,7 @@ fn run(
         credentials.endpoint = format!("http://127.0.0.1:{port}");
     }
     let server = http_io::server(port)?;
-    let mut workbench = prepare_workbench(runs_dir, credentials, legacy_routes);
+    let mut workbench = make_workbench(runs_dir, credentials, legacy_routes);
     let mut odrive = OdriveView::new(odrive_python);
     let mut scan = CanScanView::new();
     let mut io_deadlines = http_io::Deadlines::default();
@@ -544,6 +571,14 @@ fn run(
     };
     http_io::write_ready(&mut std::io::stdout().lock(), &ready);
     loop {
+        #[cfg(test)]
+        if workbench
+            .p5_fixture
+            .as_ref()
+            .is_some_and(p5_fixture::Context::expired)
+        {
+            return Ok(());
+        }
         io_deadlines.poll();
         if workbench
             .v2
@@ -659,6 +694,26 @@ fn handle_received_request(
             code,
             message,
         );
+    }
+    #[cfg(test)]
+    if workbench.p5_fixture.is_some() {
+        if !p5_fixture::allowed_path(path, request_method(&request)) {
+            return integration::respond_error(
+                request,
+                workbench.v2.as_ref(),
+                403,
+                "fixture_physical_access_forbidden",
+                "UI_SYNTHETIC 测试入口禁止物理发现、连接与维护",
+            );
+        }
+        if request_method(&request) != Method::Get {
+            workbench
+                .p5_fixture
+                .as_ref()
+                .expect("fixture checked")
+                .trace
+                .event("http_mutation", 0, None, json!({"path":path}));
+        }
     }
     if !service_v2
         && workbench.control_blocks_sync()

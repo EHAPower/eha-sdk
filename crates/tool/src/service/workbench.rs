@@ -63,6 +63,8 @@ pub(crate) struct Workbench {
     pub(super) control_groups: Option<super::control_groups::State>,
     pub(super) control_reads: Option<super::control_reads::State>,
     pub(super) legacy_routes: bool,
+    #[cfg(test)]
+    pub(super) p5_fixture: Option<super::p5_fixture::Context>,
 }
 
 impl Workbench {
@@ -85,6 +87,8 @@ impl Workbench {
             control_groups: Some(super::control_groups::State::new()),
             control_reads: Some(super::control_reads::State::new()),
             legacy_routes: true,
+            #[cfg(test)]
+            p5_fixture: None,
         }
     }
 
@@ -92,6 +96,23 @@ impl Workbench {
     pub(crate) fn with_test_sessions(
         usb: ToolSession,
         can_nodes: BTreeMap<u8, ToolSession>,
+    ) -> Self {
+        Self::with_test_sessions_in(
+            usb,
+            can_nodes,
+            std::env::temp_dir().join("eha-tool-webui-tests"),
+            Some(ConnectionStore::load(
+                std::env::temp_dir().join("eha-tool-webui-tests-connections.json"),
+            )),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_sessions_in(
+        usb: ToolSession,
+        can_nodes: BTreeMap<u8, ToolSession>,
+        runs_dir: PathBuf,
+        profiles: Option<ConnectionStore>,
     ) -> Self {
         let default_can_node = can_nodes.keys().next().copied();
         Self {
@@ -102,13 +123,9 @@ impl Workbench {
             can_network_generation: 0,
             default_can_node,
             group_nodes: BTreeSet::new(),
-            runs_dir: std::env::temp_dir().join("eha-tool-webui-tests"),
-            profiles: Some(ConnectionStore::load(
-                std::env::temp_dir().join("eha-tool-webui-tests-connections.json"),
-            )),
-            p2: Some(super::p2::State::new(
-                std::env::temp_dir().join("eha-tool-webui-tests"),
-            )),
+            p2: Some(super::p2::State::new(runs_dir.clone())),
+            runs_dir,
+            profiles,
             integration: None,
             v2: None,
             mutations: None,
@@ -116,6 +133,22 @@ impl Workbench {
             control_groups: Some(super::control_groups::State::new()),
             control_reads: Some(super::control_reads::State::new()),
             legacy_routes: true,
+            #[cfg(test)]
+            p5_fixture: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn configure_p5_fixture(&mut self, context: super::p5_fixture::Context) {
+        self.legacy_routes = false;
+        self.p5_fixture = Some(context);
+    }
+
+    #[cfg(test)]
+    fn observe_p5_fixture(&mut self) {
+        if let Some(mut context) = self.p5_fixture.take() {
+            context.capture(self);
+            self.p5_fixture = Some(context);
         }
     }
 
@@ -185,6 +218,8 @@ impl Workbench {
     }
 
     pub(crate) fn tick(&mut self) {
+        #[cfg(test)]
+        self.observe_p5_fixture();
         if let Some(mut state) = self.mutations.take() {
             if let Some(mut control) = self.control.take() {
                 control.poll(&mut state, self);
@@ -219,6 +254,8 @@ impl Workbench {
             self.group_nodes.clear();
         }
         self.capture_service_events();
+        #[cfg(test)]
+        self.observe_p5_fixture();
     }
 
     pub(super) fn capture_service_events(&mut self) {
@@ -1244,7 +1281,15 @@ impl Workbench {
             self.integration_global_read_blocker()
         };
         if discovery_reason.is_none() {
-            for device in crate::devices::discover()? {
+            #[cfg(test)]
+            let discovered = if self.p5_fixture.is_some() {
+                Vec::new()
+            } else {
+                crate::devices::discover()?
+            };
+            #[cfg(not(test))]
+            let discovered = crate::devices::discover()?;
+            for device in discovered {
                 let Some(serial) = device.serial else {
                     continue;
                 };

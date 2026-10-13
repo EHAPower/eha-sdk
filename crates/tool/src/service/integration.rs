@@ -459,6 +459,15 @@ impl IntegrationState {
                 Ok(value) => value,
                 Err(message) => return self.error(request, 400, "bad_request", message),
             };
+            #[cfg(test)]
+            if workbench.p5_fixture.is_some() && intent != "attach" {
+                return self.error(
+                    request,
+                    403,
+                    "fixture_physical_access_forbidden",
+                    "UI_SYNTHETIC 仅允许附着合成会话",
+                );
+            }
             let lease_ms = if body.contains("lease_ms") {
                 match body.decode_field::<u64>("lease_ms") {
                     Ok(value) if (MIN_LEASE_MS..=MAX_LEASE_MS).contains(&value) => Some(value),

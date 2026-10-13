@@ -47,6 +47,7 @@ pub(crate) enum FixtureBehavior {
     PreflightFails,
     StartUnknown,
     StopUnknown,
+    UiLive,
 }
 
 struct TrialHarness {
@@ -83,6 +84,16 @@ fn identity_bytes_with_nonce_for(
     node: u8,
     run_nonce: [u8; 16],
 ) -> Vec<u8> {
+    identity_bytes_named(query_id, uid, node, run_nonce, "trial-test")
+}
+
+fn identity_bytes_named(
+    query_id: u32,
+    uid: [u8; 12],
+    node: u8,
+    run_nonce: [u8; 16],
+    version: &str,
+) -> Vec<u8> {
     let fields = IdentityFields {
         sample: SampleData {
             query_id,
@@ -105,7 +116,7 @@ fn identity_bytes_with_nonce_for(
         odrive_evidence: EvidenceState::Unavailable,
         brt27_evidence: EvidenceState::Unavailable,
         text: IdentityText {
-            version: "trial-test",
+            version,
             source_revision: "",
             build_information: "",
             odrive_binding: "",
@@ -373,6 +384,24 @@ fn readonly_observation_bytes(query_id: u32, category: u8) -> Vec<u8> {
 }
 
 fn can_observation_bytes(query_id: u32, sequence: u32, qualified: bool) -> Vec<u8> {
+    can_ui_observation(
+        query_id,
+        sequence,
+        qualified,
+        TargetMode::None,
+        [0.0; 3],
+        false,
+    )
+}
+
+fn can_ui_observation(
+    query_id: u32,
+    sequence: u32,
+    qualified: bool,
+    target: TargetMode,
+    values: [f32; 3],
+    unknown: bool,
+) -> Vec<u8> {
     let fields = TelemetryFields {
         sample: SampleData {
             query_id,
@@ -381,10 +410,18 @@ fn can_observation_bytes(query_id: u32, sequence: u32, qualified: bool) -> Vec<u
             snapshot_time_us: u64::from(sequence) * 1_000,
         },
         decision_age_us: 0,
-        target_mode: TargetMode::None,
-        target_ingress: TargetIngress::None,
-        facts: TelemetryFacts::default(),
-        target_values: [0.0; 3],
+        target_mode: target,
+        target_ingress: if target == TargetMode::None {
+            TargetIngress::None
+        } else {
+            TargetIngress::Can
+        },
+        facts: TelemetryFacts {
+            output_allowed: target != TargetMode::None,
+            unknown_effect: unknown,
+            ..Default::default()
+        },
+        target_values: values,
         can_adoption_blockers: 0,
         usb_adoption_blockers: 0,
         output_blockers: 0,
@@ -399,7 +436,7 @@ fn can_observation_bytes(query_id: u32, sequence: u32, qualified: bool) -> Vec<u
         candidate_rpm: value(0.0),
         last_submitted_rpm: value(0.0),
         submitted_age_us: 0,
-        axis_state_raw: 1,
+        axis_state_raw: if target == TargetMode::None { 1 } else { 8 },
         axis_error_raw: 0,
         driver_age_us: 0,
         driver_state: DriverState {
@@ -408,7 +445,11 @@ fn can_observation_bytes(query_id: u32, sequence: u32, qualified: bool) -> Vec<u
             stale: false,
             faulted: false,
         },
-        desired_axis: DesiredAxis::Idle,
+        desired_axis: if target == TargetMode::None {
+            DesiredAxis::Idle
+        } else {
+            DesiredAxis::ClosedLoop
+        },
         can_heartbeat_age_us: 0,
         usb_heartbeat_age_us: u32::MAX,
         can_contact: ContactState::Active,
@@ -476,26 +517,149 @@ pub(crate) fn session_fixture(
     uid: [u8; 12],
     behavior: FixtureBehavior,
 ) -> (ToolSession, FixtureProbe) {
+    let live = if behavior == FixtureBehavior::UiLive {
+        let (trace, _) = crate::service::p5_fixture::Trace::new(Duration::from_secs(15));
+        Some(UiOptions {
+            scenario: crate::service::p5_fixture::Scenario::Healthy,
+            trace,
+        })
+    } else {
+        None
+    };
+    session_fixture_configured(node, uid, behavior, live)
+}
+
+pub(crate) struct UiOptions {
+    pub(crate) scenario: crate::service::p5_fixture::Scenario,
+    pub(crate) trace: crate::service::p5_fixture::Trace,
+}
+
+pub(crate) fn ui_session_fixture(
+    node: u8,
+    uid: [u8; 12],
+    options: UiOptions,
+) -> (ToolSession, FixtureProbe) {
+    session_fixture_configured(node, uid, FixtureBehavior::UiLive, Some(options))
+}
+
+fn session_fixture_configured(
+    node: u8,
+    uid: [u8; 12],
+    behavior: FixtureBehavior,
+    live: Option<UiOptions>,
+) -> (ToolSession, FixtureProbe) {
+    let is_live = live.is_some();
     let observed = Arc::new(Mutex::new(Observed::default()));
     let sink_slot = Arc::new(Mutex::new(None));
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(30));
     let backend_observed = Arc::clone(&observed);
     let backend_sink_slot = Arc::clone(&sink_slot);
+    let backend_sequence = Arc::clone(&sequence);
     let backend = Backend::spawn("eha-tool-group-fixture", move |commands, sink| {
         *backend_sink_slot.lock().expect("fixture sink lock") = Some(sink.clone());
         let mut pump = Pump::new(commands, sink);
+        let mut next_passive = Instant::now();
+        let mut delayed_reads = std::collections::VecDeque::<(Instant, Vec<u8>, u64)>::new();
+        let mut target = TargetMode::None;
+        let mut target_values = [0.0; 3];
+        let mut target_unknown = false;
+        let mut pending_stop_observation = false;
+        let mut queued_noted = false;
         while pump.poll() {
+            if let Some(live) = &live {
+                if Instant::now() >= next_passive {
+                    let seq = backend_sequence.fetch_add(1, Ordering::Relaxed) as u32;
+                    pump.sink.received(can_ui_observation(
+                        0,
+                        seq,
+                        true,
+                        target,
+                        target_values,
+                        target_unknown,
+                    ));
+                    if pending_stop_observation {
+                        live.trace.event(
+                            "synthetic_post_stop_observation",
+                            node,
+                            None,
+                            json!({"sequence":seq,"target_mode":"none","driver":"idle"}),
+                        );
+                        pending_stop_observation = false;
+                    }
+                    next_passive = Instant::now() + Duration::from_millis(50);
+                }
+                while delayed_reads
+                    .front()
+                    .is_some_and(|(due, _, _)| Instant::now() >= *due)
+                {
+                    let (_, bytes, id) = delayed_reads.pop_front().expect("due reply");
+                    pump.sink.received(bytes);
+                    live.trace
+                        .event("read_reply", node, Some(id), json!({"delayed":true}));
+                }
+            }
             for lane in 0..3 {
                 while let Some(request) = pump.take(lane) {
                     let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
                         .expect("tool emits contract-valid request");
+                    if let Some(live) = &live {
+                        use crate::service::p5_fixture::Scenario;
+                        let is_target = matches!(
+                            message,
+                            Message::Position(_)
+                                | Message::Velocity(_)
+                                | Message::Force(_)
+                                | Message::Impedance { .. }
+                        );
+                        if is_target && live.scenario == Scenario::QueuedTarget {
+                            if !queued_noted {
+                                live.trace.event(
+                                    "target_returned_unsent",
+                                    node,
+                                    Some(request.id),
+                                    json!({"handoff_to_driver":false}),
+                                );
+                                queued_noted = true;
+                            }
+                            pump.put_back(request);
+                            break;
+                        }
+                        let action = match message {
+                            Message::Position(_) => "position",
+                            Message::Velocity(_) => "velocity",
+                            Message::Force(_) => "force",
+                            Message::Impedance { .. } => "impedance",
+                            Message::Stop => "stop",
+                            Message::Heartbeat => "heartbeat",
+                            _ => "read",
+                        };
+                        live.trace.event(
+                            "pump_taken",
+                            node,
+                            Some(request.id),
+                            json!({"action":action}),
+                        );
+                        if is_target && live.scenario == Scenario::TakenTarget {
+                            live.trace.event(
+                                "target_receipt_held",
+                                node,
+                                Some(request.id),
+                                json!({"handoff_to_driver":true,"submission_receipt":false}),
+                            );
+                            continue;
+                        }
+                    }
                     match message {
                         Message::Query {
                             query_id,
                             category: 0,
                         } => {
                             pump.sink.submitted(request.id);
-                            pump.sink.received(identity_bytes_for(query_id, uid, node));
+                            pump.sink.received(if is_live {
+                                identity_bytes_named(query_id, uid, node, [9; 16], "UI_SYNTHETIC")
+                            } else {
+                                identity_bytes_for(query_id, uid, node)
+                            });
                         }
                         Message::ReadConfig { query_id, view: 2 } => {
                             pump.sink.submitted(request.id);
@@ -515,9 +679,42 @@ pub(crate) fn session_fixture(
                             query_id,
                             category: category @ (2 | 3),
                         } => {
+                            if delayed_reads.len() >= 2 {
+                                pump.sink.failed(
+                                    request.id,
+                                    "UI_SYNTHETIC 延迟回复容量已满",
+                                    false,
+                                );
+                                if let Some(live) = &live {
+                                    live.trace.event(
+                                        "read_capacity_rejected",
+                                        node,
+                                        Some(request.id),
+                                        json!({"query_id":query_id.to_string()}),
+                                    );
+                                }
+                                continue;
+                            }
                             pump.sink.submitted(request.id);
-                            pump.sink
-                                .received(readonly_observation_bytes(query_id, category));
+                            let bytes = readonly_observation_bytes(query_id, category);
+                            if live.as_ref().is_some_and(|options| {
+                                options.scenario == crate::service::p5_fixture::Scenario::SlowRead
+                            }) {
+                                // 已取消等待的旧 query 仍可迟到；两个固定槽保留各自原 wire ID。
+                                delayed_reads.push_back((
+                                    Instant::now() + Duration::from_secs(3),
+                                    bytes,
+                                    request.id,
+                                ));
+                                live.as_ref().expect("live").trace.event(
+                                    "read_reply_held",
+                                    node,
+                                    Some(request.id),
+                                    json!({"delay_ms":3000,"query_id":query_id.to_string()}),
+                                );
+                            } else {
+                                pump.sink.received(bytes);
+                            }
                         }
                         Message::Query {
                             query_id,
@@ -527,9 +724,29 @@ pub(crate) fn session_fixture(
                             let qualified = behavior != FixtureBehavior::PreflightFails;
                             // 先交付启动所需的被动事实，再唤醒 Status 等待者；测试不依赖
                             // 两次 EventSink 写入之间的线程调度。设备快照时间仍晚于 Status。
-                            pump.sink.received(can_observation_bytes(0, 11, qualified));
-                            pump.sink
-                                .received(can_observation_bytes(query_id, 10, qualified));
+                            if is_live {
+                                let seq = backend_sequence.fetch_add(2, Ordering::Relaxed) as u32;
+                                pump.sink.received(can_ui_observation(
+                                    0,
+                                    seq + 1,
+                                    qualified,
+                                    target,
+                                    target_values,
+                                    target_unknown,
+                                ));
+                                pump.sink.received(can_ui_observation(
+                                    query_id,
+                                    seq,
+                                    qualified,
+                                    target,
+                                    target_values,
+                                    target_unknown,
+                                ));
+                            } else {
+                                pump.sink.received(can_observation_bytes(0, 11, qualified));
+                                pump.sink
+                                    .received(can_observation_bytes(query_id, 10, qualified));
+                            }
                         }
                         Message::Position(mm) | Message::Velocity(mm) | Message::Force(mm) => {
                             let mut observed = backend_observed.lock().expect("observed lock");
@@ -538,7 +755,21 @@ pub(crate) fn session_fixture(
                                 observed.positions.push(mm);
                             }
                             drop(observed);
-                            if behavior == FixtureBehavior::StartUnknown {
+                            if is_live {
+                                target = match message {
+                                    Message::Position(_) => TargetMode::Position,
+                                    Message::Velocity(_) => TargetMode::Velocity,
+                                    _ => TargetMode::Force,
+                                };
+                                target_values = [mm, 0.0, 0.0];
+                            }
+                            if behavior == FixtureBehavior::StartUnknown
+                                || live.as_ref().is_some_and(|options| {
+                                    options.scenario
+                                        == crate::service::p5_fixture::Scenario::TargetUnknown
+                                })
+                            {
+                                target_unknown = true;
                                 pump.sink.failed(request.id, "synthetic target loss", true);
                             } else {
                                 pump.sink.submitted(request.id);
@@ -546,7 +777,16 @@ pub(crate) fn session_fixture(
                         }
                         Message::Impedance { .. } => {
                             backend_observed.lock().expect("observed lock").targets += 1;
-                            if behavior == FixtureBehavior::StartUnknown {
+                            if is_live {
+                                target = TargetMode::Impedance;
+                            }
+                            if behavior == FixtureBehavior::StartUnknown
+                                || live.as_ref().is_some_and(|options| {
+                                    options.scenario
+                                        == crate::service::p5_fixture::Scenario::TargetUnknown
+                                })
+                            {
+                                target_unknown = true;
                                 pump.sink.failed(request.id, "synthetic target loss", true);
                             } else {
                                 pump.sink.submitted(request.id);
@@ -554,13 +794,58 @@ pub(crate) fn session_fixture(
                         }
                         Message::Stop => {
                             backend_observed.lock().expect("observed lock").stops += 1;
-                            if behavior == FixtureBehavior::StopUnknown {
+                            if behavior == FixtureBehavior::StopUnknown
+                                || live.as_ref().is_some_and(|options| {
+                                    options.scenario
+                                        == crate::service::p5_fixture::Scenario::StopUnknown
+                                })
+                            {
                                 pump.sink.failed(request.id, "synthetic stop loss", true);
                             } else {
                                 pump.sink.submitted(request.id);
+                                if is_live {
+                                    target = TargetMode::None;
+                                    target_values = [0.0; 3];
+                                    target_unknown = false;
+                                    pending_stop_observation = true;
+                                }
                             }
                         }
+                        Message::Heartbeat if is_live => {
+                            pump.sink.submitted(request.id);
+                        }
                         other => panic!("unexpected group fixture request: {other:?}"),
+                    }
+                    if let Some(live) = &live {
+                        let failed = matches!(message, Message::Stop)
+                            && live.scenario == crate::service::p5_fixture::Scenario::StopUnknown
+                            || matches!(
+                                message,
+                                Message::Position(_)
+                                    | Message::Velocity(_)
+                                    | Message::Force(_)
+                                    | Message::Impedance { .. }
+                            ) && live.scenario
+                                == crate::service::p5_fixture::Scenario::TargetUnknown;
+                        let action = match message {
+                            Message::Position(_) => "position",
+                            Message::Velocity(_) => "velocity",
+                            Message::Force(_) => "force",
+                            Message::Impedance { .. } => "impedance",
+                            Message::Stop => "stop",
+                            Message::Heartbeat => "heartbeat",
+                            _ => "read",
+                        };
+                        live.trace.event(
+                            if failed {
+                                "submission_unknown"
+                            } else {
+                                "local_submitted"
+                            },
+                            node,
+                            Some(request.id),
+                            json!({"action":action,"device_execution_confirmed":false}),
+                        );
                     }
                 }
             }
@@ -572,9 +857,17 @@ pub(crate) fn session_fixture(
     let identity = client
         .identify(None, &eha_sdk::host::Wait::new(Duration::from_millis(100)))
         .expect("fixture Identity succeeds");
-    let mut session = ToolSession::new().with_timeout(Duration::from_millis(100));
+    let mut session = ToolSession::new().with_timeout(if is_live {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(100)
+    });
     session.request = Some(ConnectionRequest::Can {
-        channel: format!("fixture-{node}"),
+        channel: if is_live {
+            format!("UI_SYNTHETIC-{node}")
+        } else {
+            format!("fixture-{node}")
+        },
         node,
         mode: "fd".into(),
         python: None,
@@ -589,6 +882,109 @@ pub(crate) fn session_fixture(
             next_sequence: sequence,
         },
     )
+}
+
+#[test]
+fn ui_live_fixture_keeps_fresh_observations_without_polling_from_ui() {
+    let (mut session, _probe) = session_fixture(1, [0xa1; 12], FixtureBehavior::UiLive);
+    session
+        .execute(Command::Status)
+        .expect("initial observation");
+    thread::sleep(Duration::from_millis(350));
+    let snapshot = session.snapshot();
+    let age = snapshot.telemetry.expect("passive telemetry")["received_age_ms"]
+        .as_u64()
+        .expect("integer age");
+    assert!(age < 150, "UI-independent observation stale: {age}ms");
+    assert_eq!(
+        snapshot.identity.expect("identity")["text"]["version"],
+        "UI_SYNTHETIC"
+    );
+}
+
+#[test]
+fn ui_live_fixture_trial_deadline_advances_without_ui_reads() {
+    let (mut session, probe) = session_fixture(2, [0xa2; 12], FixtureBehavior::UiLive);
+    let mut request = trial_request(Command::Position { mm: 1.0 });
+    request.duration_s = Some(0.3);
+    session
+        .start_trial(request)
+        .expect("real preflight and local target");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        session.tick();
+        let trial = session.trial_snapshot();
+        if trial["stop_reason"] == "duration_elapsed" && trial["stop_observed"] == true {
+            break;
+        }
+        assert!(Instant::now() < deadline, "trial {trial}");
+        thread::sleep(Duration::from_millis(5));
+    }
+    let observed = probe.observed.lock().expect("counts");
+    assert_eq!(observed.targets, 1);
+    assert_eq!(observed.stops, 1);
+}
+
+#[test]
+fn ui_slow_read_cancel_then_new_query_keeps_late_reply_ownership() {
+    use crate::service::p5_fixture::{Scenario, Trace};
+    use eha_sdk::{host::Wait, session::QueryKind};
+    use std::task::Poll;
+    let (trace, events) = Trace::new(Duration::from_secs(10));
+    let (mut session, _probe) = ui_session_fixture(
+        1,
+        [0xa1; 12],
+        UiOptions {
+            scenario: Scenario::SlowRead,
+            trace,
+        },
+    );
+    let client = session.client.as_mut().expect("unique actual Client");
+    let wait = Wait::new(Duration::from_secs(5));
+    client
+        .begin_query(QueryKind::Diagnostics, &wait)
+        .expect("first query");
+    let held = |events: &std::sync::mpsc::Receiver<Value>| {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let event = events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("read held stage");
+            if event["kind"] == "read_reply_held" {
+                break event;
+            }
+        }
+    };
+    let first = held(&events);
+    client
+        .cancel_query()
+        .expect("cancel waiting, not old bytes");
+    client
+        .begin_query(QueryKind::Diagnostics, &wait)
+        .expect("second query");
+    let second = held(&events);
+    assert_ne!(first["transport_local_id"], second["transport_local_id"]);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let reply = loop {
+        match client.poll_query() {
+            Poll::Ready(result) => {
+                break result.expect("second reply, backend survives old cancellation");
+            }
+            Poll::Pending => {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+        }
+    };
+    let Response::Diagnostics(data) = reply.response().expect("official diagnostics") else {
+        panic!("wrong kind");
+    };
+    assert_eq!(
+        data.sample().query_id().to_string(),
+        second["facts"]["query_id"]
+            .as_str()
+            .expect("second actual wire query ID")
+    );
 }
 
 fn harness() -> (ToolSession, TrialHarness) {

@@ -855,8 +855,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recordings_reject_run_and_fixed_file_symlinks() {
+        #[cfg(not(target_vendor = "apple"))]
         use rustix::fs::{Mode, mkfifoat};
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{FileTypeExt, symlink};
 
         let root = temporary_root("symlinks");
         let run = root.join("run_1");
@@ -864,9 +865,28 @@ mod tests {
         let outside = root.join("outside");
         fs::write(&outside, b"outside").expect("outside file");
         symlink(&outside, run.join("events.jsonl")).expect("file symlink");
+        #[cfg(not(target_vendor = "apple"))]
         let run_directory = fs::File::open(&run).expect("run directory");
-        mkfifoat(&run_directory, "metadata.json", Mode::RUSR | Mode::WUSR).expect("metadata FIFO");
-        mkfifoat(&run_directory, "telemetry.csv", Mode::RUSR | Mode::WUSR).expect("telemetry FIFO");
+        for name in ["metadata.json", "telemetry.csv"] {
+            #[cfg(not(target_vendor = "apple"))]
+            mkfifoat(&run_directory, name, Mode::RUSR | Mode::WUSR).expect("fixture FIFO");
+            // rustix 在 Apple 平台不提供 mkfifoat；固定系统工具只构造测试 FIFO。
+            #[cfg(target_vendor = "apple")]
+            assert!(
+                std::process::Command::new("/usr/bin/mkfifo")
+                    .args(["-m", "600"])
+                    .arg(run.join(name))
+                    .status()
+                    .expect("system mkfifo")
+                    .success()
+            );
+            assert!(
+                fs::symlink_metadata(run.join(name))
+                    .expect("FIFO metadata")
+                    .file_type()
+                    .is_fifo()
+            );
+        }
         symlink(&run, root.join("run_link")).expect("directory symlink");
 
         let mut listed = BTreeSet::new();
