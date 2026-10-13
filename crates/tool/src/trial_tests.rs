@@ -529,6 +529,16 @@ pub(crate) fn session_fixture(
     session_fixture_configured(node, uid, behavior, live)
 }
 
+impl ToolSession {
+    pub(crate) fn arm_ui_trial_audit_failure(&mut self) -> bool {
+        let Some(recording) = self.recording.as_mut() else {
+            return false;
+        };
+        recording.arm_trial_audit_failure();
+        true
+    }
+}
+
 pub(crate) struct UiOptions {
     pub(crate) scenario: crate::service::p5_fixture::Scenario,
     pub(crate) trace: crate::service::p5_fixture::Trace,

@@ -29,6 +29,7 @@ pub(crate) enum Scenario {
     TakenTarget,
     TargetUnknown,
     StopUnknown,
+    RecordingAuditFailure,
 }
 impl Scenario {
     fn parse(value: &str) -> Result<Self, String> {
@@ -39,8 +40,9 @@ impl Scenario {
             "taken_target" => Ok(Self::TakenTarget),
             "target_unknown" => Ok(Self::TargetUnknown),
             "stop_unknown" => Ok(Self::StopUnknown),
+            "recording_audit_failure" => Ok(Self::RecordingAuditFailure),
             _ => Err(
-                "仅允许 healthy/slow_read/queued_target/taken_target/target_unknown/stop_unknown"
+                "仅允许 healthy/slow_read/queued_target/taken_target/target_unknown/stop_unknown/recording_audit_failure"
                     .into(),
             ),
         }
@@ -80,18 +82,34 @@ impl Trace {
 pub(super) struct Context {
     pub(super) trace: Trace,
     last: BTreeMap<String, Value>,
+    audit_failure_pending: bool,
 }
 impl Context {
-    fn new(trace: Trace) -> Self {
+    fn new(trace: Trace, scenario: Scenario) -> Self {
         Self {
             trace,
             last: BTreeMap::new(),
+            audit_failure_pending: scenario == Scenario::RecordingAuditFailure,
         }
     }
     pub(super) fn expired(&self) -> bool {
         Instant::now() >= self.trace.deadline
     }
     pub(super) fn capture(&mut self, workbench: &mut Workbench) {
+        if self.audit_failure_pending
+            && workbench
+                .integration_session_mut("can:1")
+                .is_some_and(ToolSession::arm_ui_trial_audit_failure)
+        {
+            self.audit_failure_pending = false;
+            self.trace.event(
+                "recording_fault_armed",
+                1,
+                None,
+                json!({"trigger":"trial_command_input", "failure":"readonly_event_file_flush"}),
+            );
+        }
+
         let mut current = BTreeMap::new();
         if let Some(common) = workbench.mutations.as_ref() {
             for id in common.receipts.keys() {
@@ -175,7 +193,7 @@ fn workbench(
         nodes.insert(node, session);
     }
     let mut workbench = Workbench::with_test_sessions_in(ToolSession::new(), nodes, runs, None);
-    workbench.configure_p5_fixture(Context::new(trace.clone()));
+    workbench.configure_p5_fixture(Context::new(trace.clone(), scenario));
     workbench.mutations =
         Some(mutations::State::new(&credentials.instance_id).expect("fixed limits"));
     workbench.v2 = Some(credentials.for_v2());
@@ -420,6 +438,111 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn recording_audit_failure_blocks_first_target_with_real_writer_error() {
+        let service = Running::start(Scenario::RecordingAuditFailure, Duration::from_secs(10));
+        let (binding, base) = service.attach(1);
+        let mut permission = base.clone();
+        permission["permissions"] = json!({"maintenance":false,"control":true});
+        permission["expected_grant_id"] = Value::Null;
+        assert_eq!(
+            service
+                .request(
+                    "POST",
+                    &format!("/service/v2/bindings/{binding}/permissions"),
+                    Some(permission)
+                )
+                .0,
+            200
+        );
+        let (status, held) = service.request("POST", "/service/v2/control-reservations", Some(json!({"api_version":2,"instance_id":service.instance,"claimant_id":"UI_SYNTHETIC_operator","permission":"control","members":[{"binding_id":binding,"expected_identity":base["expected_identity"],"connection_generation":base["connection_generation"]}]})));
+        assert_eq!(status, 200, "{held}");
+        let reservation = held["reservation_id"].as_str().expect("reservation");
+        let execute = |suffix: &str, trial: Option<Value>| {
+            let (status, ticket) = service.request("POST", "/service/v2/operation-ids", Some(json!({"api_version":2,"instance_id":service.instance,"claimant_id":"UI_SYNTHETIC_operator","reservation_id":reservation})));
+            assert_eq!(status, 200, "{ticket}");
+            let id = ticket["request_id"].as_str().expect("ticket");
+            let mut body = base.clone();
+            body["claimant_id"] = json!("UI_SYNTHETIC_operator");
+            body["reservation_id"] = json!(reservation);
+            body["request_id"] = json!(id);
+            if let Some(trial) = trial {
+                body["trial"] = trial;
+            }
+            let (status, queued) = service.request(
+                "POST",
+                &format!("/service/v2/bindings/{binding}/{suffix}"),
+                Some(body),
+            );
+            assert_eq!(status, 202, "{queued}");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let (status, value) =
+                    service.request("GET", &format!("/service/v2/operations/{id}"), None);
+                assert_eq!(status, 200, "{value}");
+                if value["operation"]["admission"] == "finished" {
+                    break value["operation"].clone();
+                }
+                assert!(Instant::now() < deadline, "operation deadline: {value}");
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let started = execute("recording/start", None);
+        assert_eq!(started["submission"], "locally_submitted", "{started}");
+        let operation = execute(
+            "trials",
+            Some(
+                json!({"command":{"action":"position","mm":1},"envelope":{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":2,"force_abs_max_n":10,"stiffness_max_n_per_mm":10,"damping_max_ns_per_mm":10,"duration_max_s":5},"duration_s":5}),
+            ),
+        );
+        assert_eq!(operation["submission"], "not_submitted", "{operation}");
+        assert_eq!(operation["control_effect"], "not_attempted");
+        assert_eq!(operation["error"]["code"], "recording");
+        let native: Value = serde_json::from_str(
+            operation["native_json_text"]
+                .as_str()
+                .expect("native error"),
+        )
+        .expect("native JSON");
+        assert_eq!(native["unknown"], false);
+        assert_eq!(native["local_stage"], "not_submitted");
+        assert!(
+            native["message"]
+                .as_str()
+                .expect("IO error")
+                .contains("Bad file descriptor"),
+            "{native}"
+        );
+        let stopped = execute("recording/stop", None);
+        assert_eq!(stopped["submission"], "not_submitted", "{stopped}");
+        assert_eq!(stopped["error"]["code"], "recording");
+        let events = service.events();
+        assert!(
+            events
+                .iter()
+                .any(|entry| entry["kind"] == "recording_fault_armed")
+        );
+        assert!(!events.iter().any(|entry| entry["kind"] == "pump_taken"
+            && matches!(
+                entry["facts"]["action"].as_str(),
+                Some("position" | "velocity" | "force" | "impedance" | "stop")
+            )));
+        let runs: Vec<_> = fs::read_dir(service.root.join("runs"))
+            .expect("runs")
+            .map(|entry| entry.expect("run").path())
+            .collect();
+        assert_eq!(runs.len(), 1);
+        let metadata: Value =
+            serde_json::from_slice(&fs::read(runs[0].join("metadata.json")).expect("metadata"))
+                .expect("metadata JSON");
+        assert!(metadata.get("completion").is_none());
+        assert!(
+            !fs::read_to_string(runs[0].join("events.jsonl"))
+                .expect("partial events")
+                .contains("trial_started")
+        );
     }
 
     #[test]

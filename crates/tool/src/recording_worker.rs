@@ -217,6 +217,8 @@ pub(crate) struct Recording {
     started_at: Instant,
     #[cfg(test)]
     flush_probe: Arc<AtomicUsize>,
+    #[cfg(test)]
+    fail_trial_audit: bool,
 }
 
 impl Drop for Recording {
@@ -295,6 +297,8 @@ impl Recording {
             started_at: Instant::now(),
             #[cfg(test)]
             flush_probe: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            fail_trial_audit: false,
         };
         recording.enqueue(Action::Start {
             root: root.into(),
@@ -345,7 +349,19 @@ impl Recording {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn arm_trial_audit_failure(&mut self) {
+        self.fail_trial_audit = true;
+    }
+
     pub(crate) fn event(&mut self, kind: &str, data: Value) -> Result<(), String> {
+        // 仅测试 UI 场景：在初始试验审计刷新前使真实事件文件写入失败。
+        // 队列顺序保留此前全部写入；owner 不等待磁盘。
+        #[cfg(test)]
+        if kind == "trial_command_input" && std::mem::take(&mut self.fail_trial_audit) {
+            self.enqueue(Action::FailEventWrites)?;
+        }
+
         self.enqueue(Action::Event(json!({"event":kind,"unix_time_ms":unix_time_ms(),"elapsed_ms":self.started_at.elapsed().as_millis(),"data":data})))
     }
 
