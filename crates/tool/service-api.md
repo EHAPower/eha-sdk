@@ -434,7 +434,7 @@ HTTP 限定 literal loopback IP、固定路径、无代理/Origin/redirect、16 
 
 operation:{request_id,reservation_id,claimant_id,action,control_epoch,members:[{target_id,expected_identity,connection_generation}],admission:"queued"|"attempting"|"finished",submission:"not_attempted"|"not_submitted"|"locally_submitted"|"unknown",control_effect:"not_attempted"|"not_applicable"|"unresolved",observation:"unconfirmed",phase:"factory_read"|"submission"|null,native_json_text:string|null,follow_up:{reconnect_required:boolean,readback_views:["user","startup"]},error:{code,message}|null}。
 
-native_json_text 保留 SDK ToolSession CommandResult 或 SessionError 的完整 JSON 原文（含 local_stage、raw SDK failure 与 transport），不得把 bigint 转 JS number；插件只投影白名单字段。queued 无 native。Factory query 的 MayHaveBeenSubmitted 只是读请求：FactoryRead 失败映射维护 submission:not_submitted/control_effect:not_attempted，原错误保留。真正 mutation 的 MayHaveBeenSubmitted/ResultUnknown => submission:unknown/control_effect:unresolved，原 operation+blockedclaim 永久 pin；取消本地等待不撤回 bytes、不重发。身份变化撤销旧 grant/未消费票据，但不删未知审计。后续 Idle/readback 不自动清未知。
+native_json_text 保留 SDK ToolSession CommandResult 或 SessionError 的完整 JSON 原文（含 local_stage、raw SDK failure 与 transport），不得把 bigint 转 JS number；插件只投影白名单字段。queued 无 native。Factory query 的 MayHaveBeenSubmitted 只是读请求：FactoryRead 失败映射维护 submission:not_submitted/control_effect:not_attempted，原错误保留。真正 mutation 的 MayHaveBeenSubmitted/ResultUnknown => submission:unknown/control_effect:unresolved，原 operation+blockedclaim 永久 pin；取消本地等待不撤回 bytes、不重发。身份变化撤销旧 grant/未消费票据，但不删未知审计。后续 Idle/readback 不自动清未知。 维护等待取消（包括被动断连引起的自动撤权）前，只能从原 Client 已入队的有界 FIFO 中领取原提交 ID 的终态：匹配本地 Submitted 先于断连终态时保留原本地提交回执，仍不确认设备执行；断连在先或无匹配证据时保持未知。锁暂忙时 owner 不等待，原 Client/任务暂留待下一调度步处理；不得借新 nonce、Idle 或迟到事件改写已结束的 unknown，也不重发维护。显式 Stop 仍立即取消本地等待，不因领取证据而等待 Inbox 锁。
 
 成功 local submission => control_effect:not_applicable，仅表示无持续控制需求；observation:unconfirmed，绝不宣称设备保存/复位完成。四维护已知提交都要求操作者明确重连，并读取同一明确选定设备的 User/Startup 作为后续证据；旧 nonce/generation 的授权、reservation、未消费票据不能迁入新连接。EnterUpdate 后不可读时诚实说明不可用，不自动找新设备。有限 retention 只回收已结束且非真实 SDK unknown 的 receipt；未决记录不改名淘汰。
 
@@ -444,7 +444,7 @@ native_json_text 保留 SDK ToolSession CommandResult 或 SessionError 的完整
 
 固定 Factory 读取通过现 v2 bindings/{id}/reads action:config_factory；User/Startup保持现有固定actions。v1能力不扩大，读取原门禁不放松。
 
-维护已知提交的后续读回是 SDK 准入门槛：固定原 target_id、同 UID 的新 connection_generation 与重新核对的 run_nonce，成功 User 和 Startup 两固定读取必须属于同一完整新 MemberKey，才解除后续维护授权/占用阻挡。跨 alias 或旧代次读不解除；读取不修改原 operation observation/unresolved，不判断配置等于保存原文，差异完整保留供操作员核对。义务按 UID 有界（max_stop_scopes），不增加无限审计。未发送队列工作被显式释放/撤销后，精确 operation_id 的 NotSubmitted 完成可安全回收 released claim；真正 submitted/unknown 与 prior unresolved 保持原保留规则。
+维护已知提交的后续读回是 SDK 准入门槛：固定原 target_id、同 UID 的新 connection_generation 与重新核对的 run_nonce，成功 User 和 Startup 两固定读取必须属于同一完整新 MemberKey，才解除后续维护授权/占用阻挡。跨 alias 或旧代次读不解除；读取不修改原 operation observation/unresolved，不判断配置等于保存原文，差异完整保留供操作员核对。义务按 UID 有界（max_stop_scopes），不增加无限审计。未发送队列工作被显式释放/撤销后，精确 operation_id 的 NotSubmitted 完成可安全回收 released claim；已知维护提交的 released claim 仅在上述完整双读后可回收，原 operation 回执保持；unknown 与 prior unresolved 保持原保留规则。
 
 P4共享权限响应：control开启且门槛完成时由服务提前预留canonical Stopslot，permissions响应control_epoch/stop_request_id可在无reservation情况下供显式人工Stop；P3control=false时两者null。双权限属于同一个服务grant，任何权限变更更换编号并使旧占用/票据失效，不能合并成两个独立授权。
 

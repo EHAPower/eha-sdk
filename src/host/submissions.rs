@@ -211,6 +211,96 @@ impl Client {
         self.query_error(failure, local)
     }
 
+    /// 取消/退役前仅领取当前提交已排队的终态，不等待 I/O，也不重新发送。
+    /// 一次 try_lock、最多检查普通 FIFO 的 64 项；无关事件保持原序。
+    /// Pending 仅表示锁忙；Ready(None) 表示未找到终态，两者均保留原槽位。
+    /// 已存在的证据不受当前等待期限/取消标志影响；断连之前的本地提交
+    /// 只证明该消息的本地 I/O 完成，绝不证明设备采用或维护执行。
+    pub fn try_finish_submission(&mut self) -> Poll<Option<Result<LocalSubmission, Error>>> {
+        let Some(pending) = self.pending_submission.as_ref() else {
+            return Poll::Ready(Some(Err(invalid("没有等待中的维护提交"))));
+        };
+        let mut inbox = match self.backend.sink.0.0.try_lock() {
+            Ok(inbox) => inbox,
+            Err(std::sync::TryLockError::WouldBlock) => return Poll::Pending,
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                self.pending_submission = None;
+                return Poll::Ready(Some(Err(self.submission_poll_error(
+                    Failure::Disconnected("I/O 状态锁失效".into()),
+                    LocalStage::MayHaveBeenSubmitted,
+                ))));
+            }
+        };
+        let terminal = inbox
+            .events
+            .iter()
+            .take(64)
+            .enumerate()
+            .find_map(|(index, event)| {
+                let result = match event {
+                    Event::Submitted(id) if *id == pending.id => Ok(LocalSubmission {
+                        id: pending.id,
+                        submitted_at: Instant::now(),
+                        boundary: self.backend.boundary,
+                    }),
+                    Event::Failed(id, failure) if *id == pending.id => Err((
+                        Failure::Transport {
+                            detail: failure.detail.clone(),
+                            raw: Vec::new(),
+                        },
+                        if failure.may_have_sent {
+                            LocalStage::MayHaveBeenSubmitted
+                        } else {
+                            LocalStage::NotSubmitted
+                        },
+                    )),
+                    Event::Message(received) => {
+                        let Ok(Message::Response(response @ Response::DataUnavailable(value))) =
+                            protocol::decode(&received.bytes, Direction::FirmwareToHost)
+                        else {
+                            return None;
+                        };
+                        if !pending
+                            .matcher
+                            .is_some_and(|matcher| matcher.matches(&response))
+                        {
+                            return None;
+                        }
+                        Err((
+                            Failure::DataUnavailable(value.fields()),
+                            LocalStage::MayHaveBeenSubmitted,
+                        ))
+                    }
+                    Event::Disconnected(reason) => Err((
+                        Failure::Disconnected(reason.clone()),
+                        LocalStage::MayHaveBeenSubmitted,
+                    )),
+                    Event::TransportError { detail, raw } => Err((
+                        Failure::Transport {
+                            detail: detail.clone(),
+                            raw: raw.clone(),
+                        },
+                        LocalStage::MayHaveBeenSubmitted,
+                    )),
+                    _ => return None,
+                };
+                Some((index, result))
+            });
+        let Some((index, result)) = terminal else {
+            return Poll::Ready(None);
+        };
+        inbox.events.remove(index);
+        drop(inbox);
+        self.pending_submission = None;
+        Poll::Ready(Some(result.map_err(|(failure, local)| {
+            if matches!(failure, Failure::DataUnavailable(_)) {
+                self.query_error(failure, local)
+            } else {
+                self.submission_poll_error(failure, local)
+            }
+        })))
+    }
+
     /// End this local wait. Maintenance bytes are never retracted and retain their send deadline.
     /// A fixed control send can be cancelled only before driver handoff: then NotSubmitted is
     /// returned. Once taken, MayHaveBeenSubmitted remains unknown; neither path replays a send.
@@ -240,6 +330,120 @@ mod tests {
         let (backend, commands, sink) = Backend::endpoint();
         client.backend = backend;
         (client, commands, sink)
+    }
+
+    #[test]
+    fn submission_evidence_precedes_disconnect_even_after_deadline_and_cancellation() {
+        let (mut client, commands, sink) = client();
+        let wait = Wait::default();
+        client.begin_reset_application(&wait).expect("begin");
+        let Command::Send(request) = commands.try_recv().expect("send") else {
+            panic!("send expected");
+        };
+        for id in 100..162 {
+            sink.submitted(id);
+        }
+        sink.submitted(request.id);
+        sink.disconnected("reset transport closed");
+        wait.cancellation.cancel();
+        client
+            .pending_submission
+            .as_mut()
+            .expect("pending")
+            .deadline = Instant::now();
+        let Poll::Ready(Some(Ok(local))) = client.try_finish_submission() else {
+            panic!("queued local completion must survive disconnect");
+        };
+        assert_eq!(local.id, request.id);
+        assert_eq!(local.boundary, client.backend.boundary);
+        assert!(client.pending_submission.is_none());
+        let inbox = sink.0.0.lock().expect("inbox");
+        assert_eq!(inbox.events.len(), 63);
+        assert!(matches!(inbox.events.front(), Some(Event::Submitted(100))));
+        assert!(matches!(inbox.events.back(), Some(Event::Disconnected(_))));
+        assert!(!request.cancelled.load(Ordering::Acquire));
+        assert!(commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn submission_evidence_disconnect_before_completion_stays_unknown() {
+        let (mut client, commands, sink) = client();
+        client
+            .begin_reset_application(&Wait::default())
+            .expect("begin");
+        let Command::Send(request) = commands.try_recv().expect("send") else {
+            panic!("send expected");
+        };
+        sink.disconnected("transport closed before receipt");
+        sink.submitted(request.id);
+        let Poll::Ready(Some(Err(error))) = client.try_finish_submission() else {
+            panic!("first terminal must be retained");
+        };
+        assert!(matches!(error.failure, Failure::ResultUnknown(_)));
+        assert_eq!(error.local, LocalStage::MayHaveBeenSubmitted);
+        assert!(client.pending_submission.is_none());
+        assert!(
+            matches!(sink.0.0.lock().expect("inbox").events.front(), Some(Event::Submitted(id)) if *id == request.id)
+        );
+    }
+
+    #[test]
+    fn submission_evidence_preserves_precise_failed_send_stage() {
+        for may_have_sent in [false, true] {
+            let (mut client, commands, sink) = client();
+            client
+                .begin_reset_application(&Wait::default())
+                .expect("begin");
+            let Command::Send(request) = commands.try_recv().expect("send") else {
+                panic!("send expected");
+            };
+            sink.failed(request.id + 100, "another attempt", !may_have_sent);
+            sink.failed(request.id, "actual attempt failed", may_have_sent);
+            sink.disconnected("later disconnect");
+            let Poll::Ready(Some(Err(error))) = client.try_finish_submission() else {
+                panic!("original failed receipt expected");
+            };
+            if may_have_sent {
+                assert_eq!(error.local, LocalStage::MayHaveBeenSubmitted);
+                assert!(matches!(error.failure, Failure::ResultUnknown(_)));
+            } else {
+                assert_eq!(error.local, LocalStage::NotSubmitted);
+                assert!(matches!(error.failure, Failure::Transport { .. }));
+            }
+            assert_eq!(sink.0.0.lock().expect("inbox").events.len(), 2);
+            assert!(!request.cancelled.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
+    fn submission_evidence_lock_busy_and_absent_terminal_preserve_original_slot() {
+        let (mut client, commands, sink) = client();
+        client
+            .begin_reset_application(&Wait::default())
+            .expect("begin");
+        let Command::Send(request) = commands.try_recv().expect("send") else {
+            panic!("send expected");
+        };
+        sink.submitted(request.id + 100);
+        assert!(matches!(client.try_finish_submission(), Poll::Ready(None)));
+        assert_eq!(
+            client.pending_submission.as_ref().expect("pending").id,
+            request.id
+        );
+        let inbox = sink.0.clone();
+        let mut held = inbox.0.lock().expect("inbox");
+        held.events.push_back(Event::Submitted(request.id));
+        assert!(client.try_finish_submission().is_pending());
+        assert_eq!(
+            client.pending_submission.as_ref().expect("pending").id,
+            request.id
+        );
+        drop(held);
+        assert!(
+            matches!(client.try_finish_submission(), Poll::Ready(Some(Ok(local))) if local.id == request.id)
+        );
+        assert_eq!(sink.0.0.lock().expect("inbox").events.len(), 1);
+        assert!(commands.try_recv().is_err());
     }
 
     #[test]

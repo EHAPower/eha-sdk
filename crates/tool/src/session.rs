@@ -1252,7 +1252,7 @@ impl ToolSession {
             if let Some(reason) = disconnected {
                 self.end_read(Failure::Disconnected(reason.clone()));
                 self.fence_control("transport_disconnected");
-                if self.disconnected_reason.is_none() {
+                if !self.maintenance_pending() && self.disconnected_reason.is_none() {
                     self.connection_generation = next_connection_generation();
                     self.disconnected_reason = Some(reason.clone());
                 }
@@ -1323,6 +1323,10 @@ impl ToolSession {
         };
         self.end_read(Failure::Disconnected(reason.clone()));
         self.fence_control("transport_disconnected");
+        // Inbox 暂忙时保留原 Client/owner，下一 tick 继续领取维护终态；不阻塞退役调用。
+        if self.maintenance_pending() {
+            return;
+        }
         if self.disconnected_reason.is_none() {
             self.connection_generation = next_connection_generation();
         }

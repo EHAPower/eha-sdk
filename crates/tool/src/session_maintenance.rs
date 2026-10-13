@@ -23,6 +23,7 @@ pub(super) struct Pending {
     phase: MaintenancePhase,
     deadline: Instant,
     completion: Option<MaintenanceCompletion>,
+    cancellation_reason: Option<String>,
 }
 
 impl ToolSession {
@@ -90,12 +91,25 @@ impl ToolSession {
             phase,
             deadline,
             completion: None,
+            cancellation_reason: None,
         });
         Ok(())
     }
 
     /// 槽位持续保留所有权，直到原操作消费该完成结果。
     pub(crate) fn poll_maintenance(&mut self) -> Poll<MaintenanceCompletion> {
+        // 锁忙后继续原取消，不回到期限优先的普通 poll 丢失已排队证据。
+        if let Some(reason) = self
+            .maintenance_pending
+            .as_ref()
+            .and_then(|task| task.cancellation_reason.clone())
+        {
+            self.cancel_maintenance(&reason);
+            if self.maintenance_pending() {
+                return Poll::Pending;
+            }
+        }
+
         if self
             .maintenance_pending
             .as_ref()
@@ -232,6 +246,44 @@ impl ToolSession {
             self.maintenance_pending = Some(task);
             return false;
         }
+        // 先领取当前提交已入队的真实终态；断连缓存不能覆盖更早的本地提交证据。
+        if !matches!(reason, "explicit_stop" | "operator_stop")
+            && task.phase == MaintenancePhase::Submission
+            && let Some(client) = self.client.as_mut()
+        {
+            match client.try_finish_submission() {
+                Poll::Pending => {
+                    task.cancellation_reason
+                        .get_or_insert_with(|| reason.to_owned());
+                    self.maintenance_pending = Some(task);
+                    return false;
+                }
+                Poll::Ready(Some(result)) => {
+                    let result = result.map_err(sdk_error).map(|local| {
+                        let mut local_submission = None;
+                        let data = submission_data(local, &mut local_submission);
+                        CommandResult {
+                            action: command_name(&task.command).into(),
+                            local_submission,
+                            data,
+                            // 取消可能由 USB 退役调用，不能重入 snapshot 的退役路径。
+                            snapshot: self.snapshot_cached(),
+                        }
+                    });
+                    match &result {
+                        Ok(value) => self.record_event("command_completed", json!({"action":value.action,"local_submission":value.local_submission,"data":value.data})),
+                        Err(error) => self.record_event("command_error", json!({"action":command_name(&task.command),"error":error})),
+                    }
+                    task.completion = Some(MaintenanceCompletion {
+                        phase: task.phase,
+                        result,
+                    });
+                    self.maintenance_pending = Some(task);
+                    return true;
+                }
+                Poll::Ready(None) => {}
+            }
+        }
         let result = match self.client.as_mut() {
             Some(client) => {
                 if task.phase == MaintenancePhase::FactoryRead {
@@ -364,6 +416,119 @@ mod tests {
         };
         request
     }
+    #[test]
+    fn disconnect_after_queued_submission_preserves_original_local_receipt() {
+        for usb_retirement in [false, true] {
+            let (mut session, commands, sink) = fixture();
+            if usb_retirement {
+                let key = crate::owner_lock::ResourceKey::usb(&format!(
+                    "maintenance-retire-test-{}",
+                    std::process::id()
+                ))
+                .expect("synthetic owner key");
+                session.usb_owner = Some(
+                    crate::owner_lock::OwnerGuard::acquire(&key).expect("synthetic owner guard"),
+                );
+            }
+            session
+                .begin_maintenance(Command::ResetApplication)
+                .expect("begin reset");
+            let request = sent(&commands);
+            sink.submitted(request.id);
+            sink.disconnected("synthetic reset transport close");
+            session.tick();
+            let Poll::Ready(completion) = session.poll_maintenance() else {
+                panic!("cancelled completion retained");
+            };
+            let result = completion
+                .result
+                .expect("already queued local submission survives disconnect fence");
+            assert_eq!(completion.phase, MaintenancePhase::Submission);
+            assert_eq!(
+                result.local_submission.expect("original local receipt").id,
+                request.id
+            );
+            assert!(!request.cancelled.load(Ordering::Acquire));
+            assert!(
+                commands.try_recv().is_err(),
+                "disconnect cannot resend reset"
+            );
+            if usb_retirement {
+                assert!(
+                    session.client.is_none(),
+                    "Client handed off only after receipt retained"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn disconnect_without_prior_matching_submission_keeps_unknown() {
+        for wrong_id in [false, true] {
+            let (mut session, commands, sink) = fixture();
+            session
+                .begin_maintenance(Command::ResetApplication)
+                .expect("begin reset");
+            let request = sent(&commands);
+            if wrong_id {
+                sink.submitted(request.id + 100);
+            }
+            sink.disconnected("synthetic close without original receipt");
+            sink.submitted(request.id);
+            session.tick();
+            let Poll::Ready(completion) = session.poll_maintenance() else {
+                panic!("terminal error retained");
+            };
+            let error = completion
+                .result
+                .expect_err("late receipt cannot cross earlier disconnect terminal");
+            assert!(error.unknown);
+            assert_eq!(
+                error.local_stage.as_deref(),
+                Some("may_have_been_submitted")
+            );
+            assert!(!request.cancelled.load(Ordering::Acquire));
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn deferred_cancel_preserves_evidence_through_revocation_and_expired_poll() {
+        for revoked in [false, true] {
+            let (mut session, commands, sink) = fixture();
+            session.timeout = Duration::from_millis(1);
+            session
+                .begin_maintenance(Command::ResetApplication)
+                .expect("reset");
+            let request = sent(&commands);
+            // 对应 try_finish_submission 锁忙返回后的唯一原任务状态。
+            session
+                .maintenance_pending
+                .as_mut()
+                .expect("pending")
+                .cancellation_reason = Some("transport_disconnected".into());
+            std::thread::sleep(Duration::from_millis(2));
+            sink.submitted(request.id);
+            sink.disconnected("same original disconnect");
+            if revoked {
+                session.cancel_maintenance("permission_revoked");
+            }
+            let Poll::Ready(completion) = session.poll_maintenance() else {
+                panic!("original terminal");
+            };
+            assert_eq!(
+                completion
+                    .result
+                    .expect("queued evidence before timeout cancellation")
+                    .local_submission
+                    .expect("local receipt")
+                    .id,
+                request.id
+            );
+            assert!(commands.try_recv().is_err());
+        }
+    }
+
     #[test]
     fn maintenance_submission_cancel_retains_original_receipt_without_retraction() {
         let (mut session, commands, sink) = fixture();

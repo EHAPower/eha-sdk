@@ -480,6 +480,17 @@ impl ReservationBook {
         Ok(())
     }
 
+    /// 已知维护提交完成其固定新连接的双视图读回后，才可退役原已释放声明。
+    /// 调用方负责证明读回义务；此处绝不清理未决、未知或不同原成员的声明。
+    pub(crate) fn retire_released_claim_after_readback(&mut self, original: &MemberKey) {
+        let retire = self.claims.get(&original.uid).is_some_and(|claim| {
+            claim.member == *original && claim.released && !claim.pending && !claim.unresolved
+        });
+        if retire {
+            self.claims.remove(&original.uid);
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn mark_unresolved(&mut self, id: &str, member: &MemberKey) -> Result<(), Error> {
         self.matching_claim(id, member)?.unresolved = true;
@@ -717,6 +728,56 @@ mod tests {
             book.reserve("two", vec![a], Access::Control),
             Err(Error::Busy)
         );
+    }
+
+    #[test]
+    fn readback_retirement_requires_exact_released_known_claim() {
+        let mut book = book();
+        let a = member("usb:a", "uid-a");
+        grant(&mut book, &a);
+        let held = book
+            .reserve("one", vec![a.clone()], Access::Maintenance)
+            .expect("test invariant");
+        book.begin_pending(
+            &held.id,
+            "op-a",
+            "one",
+            std::slice::from_ref(&a),
+            Access::Maintenance,
+        )
+        .expect("test invariant");
+        book.release(&held.id, "one").expect("test invariant");
+        book.retire_released_claim_after_readback(&a);
+        assert!(book.claim(&a.uid).is_some(), "pending claim stays pinned");
+        book.finish_pending(&held.id, "op-a", &a, EffectDisposition::KnownEffect)
+            .expect("test invariant");
+        let alias = member("can:a", "uid-a");
+        book.retire_released_claim_after_readback(&alias);
+        assert!(
+            book.claim(&a.uid).is_some(),
+            "a different original MemberKey cannot retire the claim"
+        );
+        book.retire_released_claim_after_readback(&a);
+        assert!(book.claim(&a.uid).is_none());
+
+        let b = member("usb:b", "uid-b");
+        grant(&mut book, &b);
+        let held = book
+            .reserve("one", vec![b.clone()], Access::Maintenance)
+            .expect("test invariant");
+        book.begin_pending(
+            &held.id,
+            "op-b",
+            "one",
+            std::slice::from_ref(&b),
+            Access::Maintenance,
+        )
+        .expect("test invariant");
+        book.release(&held.id, "one").expect("test invariant");
+        book.finish_pending(&held.id, "op-b", &b, EffectDisposition::Unresolved)
+            .expect("test invariant");
+        book.retire_released_claim_after_readback(&b);
+        assert!(book.claim(&b.uid).is_some(), "unknown claim stays pinned");
     }
 
     #[test]

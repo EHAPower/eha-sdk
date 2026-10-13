@@ -776,6 +776,82 @@ mod tests {
         let (_, _, _) = prepared(&mut f);
     }
     #[test]
+    fn owner_disconnect_revocation_preserves_prior_local_submission() {
+        let mut f = fixture();
+        let (_, id, request) = prepared(&mut f);
+        let path = format!("/service/v2/bindings/{}/maintenance", f.binding_id);
+        call(&mut f, &path, Method::Post, request).expect("admitted reset");
+        f.owner.mutations = Some(f.state);
+        f.owner.tick();
+        let BackendCommand::Send(sent) = f
+            .commands
+            .recv_timeout(Duration::from_secs(1))
+            .expect("started reset")
+        else {
+            panic!("maintenance send expected");
+        };
+        f.sink.submitted(sent.id);
+        f.sink
+            .disconnected("synthetic reset closes original transport");
+        f.owner.tick();
+        let state = f.owner.mutations.as_mut().expect("common owner state");
+        let receipt = state.projection(&id).expect("original operation");
+        assert_eq!(receipt["submission"], "locally_submitted", "{receipt}");
+        assert_eq!(receipt["control_effect"], "not_applicable");
+        assert_eq!(receipt["observation"], "unconfirmed");
+        let native: Value = serde_json::from_str(
+            receipt["native_json_text"]
+                .as_str()
+                .expect("native evidence"),
+        )
+        .expect("native JSON");
+        assert_eq!(native["local_submission"]["id"], sent.id);
+        assert!(state.jobs.is_empty());
+        let original = state
+            .ledger
+            .get(&id)
+            .expect("original operation")
+            .intent
+            .scope
+            .members[0]
+            .clone();
+        assert!(state.book.claim(&original.uid).is_some());
+        let mut fresh = original.clone();
+        fresh.connection_generation = "after-reset".into();
+        fresh.run_nonce = "after-reset".into();
+        state.note_config_read(&fresh, "user");
+        assert!(
+            state.book.claim(&original.uid).is_some(),
+            "one view cannot release the known maintenance claim"
+        );
+        state.note_config_read(&fresh, "startup");
+        assert!(
+            state.book.claim(&original.uid).is_none(),
+            "the required new MemberKey User/Startup pair releases only this known claim"
+        );
+        assert_eq!(
+            state.projection(&id).expect("retained operation")["submission"],
+            "locally_submitted",
+            "readback releases occupancy, never the original receipt"
+        );
+        state
+            .book
+            .set_permissions(
+                fresh.clone(),
+                Permissions {
+                    maintenance: true,
+                    control: false,
+                },
+            )
+            .expect("new manual grant");
+        state
+            .book
+            .reserve("trusted-agent", vec![fresh], Access::Maintenance)
+            .expect("known claim no longer blocks a new reservation");
+        assert!(f.commands.try_recv().is_err(), "no resend");
+    }
+
+    #[test]
     fn cancelled_real_submission_pins_unknown_and_late_submitted_cannot_resolve_it() {
         let mut f = fixture();
         let (reservation, id, request) = prepared(&mut f);

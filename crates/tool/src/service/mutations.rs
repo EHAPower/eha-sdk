@@ -327,8 +327,10 @@ impl State {
         } else {
             obligation.startup = true;
         }
-        if obligation.user && obligation.startup {
+        let original = (obligation.user && obligation.startup).then(|| obligation.original.clone());
+        if let Some(original) = original {
             self.readbacks.remove(&member.uid);
+            self.book.retire_released_claim_after_readback(&original);
         }
     }
 
