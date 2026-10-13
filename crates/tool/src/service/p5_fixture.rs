@@ -30,6 +30,7 @@ pub(crate) enum Scenario {
     TargetUnknown,
     StopUnknown,
     RecordingAuditFailure,
+    NotIdle,
 }
 impl Scenario {
     fn parse(value: &str) -> Result<Self, String> {
@@ -41,8 +42,9 @@ impl Scenario {
             "target_unknown" => Ok(Self::TargetUnknown),
             "stop_unknown" => Ok(Self::StopUnknown),
             "recording_audit_failure" => Ok(Self::RecordingAuditFailure),
+            "not_idle" => Ok(Self::NotIdle),
             _ => Err(
-                "仅允许 healthy/slow_read/queued_target/taken_target/target_unknown/stop_unknown/recording_audit_failure"
+                "仅允许 healthy/slow_read/queued_target/taken_target/target_unknown/stop_unknown/recording_audit_failure/not_idle"
                     .into(),
             ),
         }
@@ -222,7 +224,7 @@ fn serve(directory: PathBuf, port: u16, scenario: Scenario, ttl: Duration) -> Re
         let mut entries = 0;
         loop {
             match receiver.recv_timeout(Duration::from_millis(50)) {
-                Ok(entry) if entries < 4096 => {
+                Ok(entry) if entries < 32768 => {
                     writeln!(file, "{entry}").map_err(|error| error.to_string())?;
                     entries += 1;
                 }
@@ -438,6 +440,89 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn not_idle_scene_rejects_read_without_target_trial_or_heartbeat() {
+        let service = Running::start(Scenario::NotIdle, Duration::from_secs(10));
+        let (binding, mut fields) = service.attach(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let snapshot = loop {
+            let (status, value) = service.request(
+                "GET",
+                &format!("/service/v2/bindings/{binding}/snapshot"),
+                None,
+            );
+            assert_eq!(status, 200, "{value}");
+            if value["read_permit"]["reason_code"] == "not_idle" {
+                break value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected independent not_idle: {value}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(snapshot["read_permit"]["ready"], false);
+        assert_eq!(snapshot["control_effect"]["state"], "not_observed");
+        assert!(
+            snapshot["telemetry_received_age_ms"]
+                .as_str()
+                .expect("age")
+                .parse::<u64>()
+                .expect("age integer")
+                < 3000
+        );
+        let native: Value =
+            serde_json::from_str(snapshot["native_json_text"].as_str().expect("snapshot"))
+                .expect("native JSON");
+        assert_eq!(native["heartbeat"]["enabled"], false);
+        assert_eq!(native["telemetry"]["target_mode"], 0);
+        assert_eq!(native["telemetry"]["axis_state_raw"], 8);
+        assert_eq!(native["telemetry"]["facts"]["unknown_effect"], false);
+        assert_eq!(
+            native["telemetry"]["facts"]["device_operation_pending"],
+            false
+        );
+        let before = service
+            .events()
+            .iter()
+            .filter(|entry| entry["kind"] == "pump_taken")
+            .count();
+        fields["action"] = json!("status");
+        let (status, error) = service.request(
+            "POST",
+            &format!("/service/v2/bindings/{binding}/reads"),
+            Some(fields),
+        );
+        assert_eq!(status, 409, "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .expect("gate reason")
+                .contains("not_idle")
+        );
+        let events = service.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|entry| entry["kind"] == "pump_taken")
+                .count(),
+            before,
+            "gate must precede query submission"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|entry| entry["kind"] == "pump_taken" && entry["facts"]["action"] != "read")
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|entry| entry["kind"] == "owner_transition"
+                    && entry["facts"]["target_id"] == "can:1")
+                .all(|entry| entry["facts"]["state"] == "idle")
+        );
     }
 
     #[test]

@@ -391,6 +391,7 @@ fn can_observation_bytes(query_id: u32, sequence: u32, qualified: bool) -> Vec<u
         TargetMode::None,
         [0.0; 3],
         false,
+        false,
     )
 }
 
@@ -401,6 +402,7 @@ fn can_ui_observation(
     target: TargetMode,
     values: [f32; 3],
     unknown: bool,
+    non_idle: bool,
 ) -> Vec<u8> {
     let fields = TelemetryFields {
         sample: SampleData {
@@ -436,7 +438,11 @@ fn can_ui_observation(
         candidate_rpm: value(0.0),
         last_submitted_rpm: value(0.0),
         submitted_age_us: 0,
-        axis_state_raw: if target == TargetMode::None { 1 } else { 8 },
+        axis_state_raw: if target == TargetMode::None && !non_idle {
+            1
+        } else {
+            8
+        },
         axis_error_raw: 0,
         driver_age_us: 0,
         driver_state: DriverState {
@@ -445,7 +451,7 @@ fn can_ui_observation(
             stale: false,
             faulted: false,
         },
-        desired_axis: if target == TargetMode::None {
+        desired_axis: if target == TargetMode::None && !non_idle {
             DesiredAxis::Idle
         } else {
             DesiredAxis::ClosedLoop
@@ -559,6 +565,10 @@ fn session_fixture_configured(
     live: Option<UiOptions>,
 ) -> (ToolSession, FixtureProbe) {
     let is_live = live.is_some();
+    // 只改变合成观测轴状态，不生成目标、心跳或未决效果。
+    let non_idle = live
+        .as_ref()
+        .is_some_and(|options| options.scenario == crate::service::p5_fixture::Scenario::NotIdle);
     let observed = Arc::new(Mutex::new(Observed::default()));
     let sink_slot = Arc::new(Mutex::new(None));
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(30));
@@ -586,13 +596,14 @@ fn session_fixture_configured(
                         target,
                         target_values,
                         target_unknown,
+                        non_idle,
                     ));
                     if pending_stop_observation {
                         live.trace.event(
                             "synthetic_post_stop_observation",
                             node,
                             None,
-                            json!({"sequence":seq,"target_mode":"none","driver":"idle"}),
+                            json!({"sequence":seq,"target_mode":"none","driver":if non_idle { "closed_loop" } else { "idle" }}),
                         );
                         pending_stop_observation = false;
                     }
@@ -743,6 +754,7 @@ fn session_fixture_configured(
                                     target,
                                     target_values,
                                     target_unknown,
+                                    non_idle,
                                 ));
                                 pump.sink.received(can_ui_observation(
                                     query_id,
@@ -751,6 +763,7 @@ fn session_fixture_configured(
                                     target,
                                     target_values,
                                     target_unknown,
+                                    non_idle,
                                 ));
                             } else {
                                 pump.sink.received(can_observation_bytes(0, 11, qualified));
