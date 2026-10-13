@@ -139,7 +139,7 @@ pub(super) fn allowed_path(path: &str, method: Method) -> bool {
     if method == Method::Get {
         return matches!(
             rest,
-            "describe" | "instance" | "targets" | "connections" | "events"
+            "describe" | "instance" | "targets" | "connections" | "events" | "control-scopes"
         ) || rest.starts_with("bindings/") && !rest.ends_with("/maintenance")
             || rest.starts_with("operations/")
             || rest.starts_with("recordings")
@@ -379,6 +379,24 @@ mod tests {
             .parse()
             .expect("status integer");
         (status, serde_json::from_str(body).expect("JSON response"))
+    }
+
+    #[test]
+    fn fixture_guard_allows_fixed_control_scope_listing_only() {
+        assert!(allowed_path("/service/v2/control-scopes", Method::Get));
+        for path in [
+            "/service/v2/control-scopes/arbitrary",
+            "/service/v2/profiles",
+            "/service/v2/adapters",
+            "/service/v2/bindings/fixed/maintenance",
+        ] {
+            assert!(!allowed_path(path, Method::Get), "restricted read {path}");
+        }
+        assert!(!allowed_path("/service/v2/control-scopes", Method::Post));
+        let service = Running::start(Scenario::Healthy, Duration::from_secs(10));
+        let (status, value) = service.request("GET", "/service/v2/control-scopes", None);
+        assert_eq!(status, 200, "{value}");
+        assert_eq!(value["scopes"], json!([]));
     }
 
     #[test]
