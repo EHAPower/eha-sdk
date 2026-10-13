@@ -475,6 +475,12 @@ impl Workbench {
         &self,
         operation: &super::network_jobs::Operation,
     ) -> Result<bool, String> {
+        #[cfg(test)]
+        if self.p5_fixture.is_some() {
+            return Err(
+                "UI_SYNTHETIC 仅允许已连接合成目标的内存扫描，禁止档案/高级网络构造".into(),
+            );
+        }
         let Some(network) = self.can_network.as_ref() else {
             return Ok(false);
         };
@@ -730,6 +736,10 @@ impl Workbench {
     }
 
     pub(crate) fn connect(&mut self, request: ConnectionRequest) -> Result<Value, SessionError> {
+        #[cfg(test)]
+        if self.p5_fixture.is_some() && matches!(request, ConnectionRequest::Usb { .. }) {
+            return Err(session_error("UI_SYNTHETIC 禁止打开任何真实 USB 设备"));
+        }
         match request {
             ConnectionRequest::Usb { ref serial } => {
                 let serial = serial.clone();
@@ -1282,8 +1292,8 @@ impl Workbench {
         };
         if discovery_reason.is_none() {
             #[cfg(test)]
-            let discovered = if self.p5_fixture.is_some() {
-                Vec::new()
+            let discovered = if let Some(fixture) = self.p5_fixture.as_ref() {
+                fixture.usb_devices()
             } else {
                 crate::devices::discover()?
             };

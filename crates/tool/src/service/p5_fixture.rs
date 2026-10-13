@@ -31,6 +31,7 @@ pub(crate) enum Scenario {
     StopUnknown,
     RecordingAuditFailure,
     NotIdle,
+    DuplicateUsbSerial,
 }
 impl Scenario {
     fn parse(value: &str) -> Result<Self, String> {
@@ -43,8 +44,9 @@ impl Scenario {
             "stop_unknown" => Ok(Self::StopUnknown),
             "recording_audit_failure" => Ok(Self::RecordingAuditFailure),
             "not_idle" => Ok(Self::NotIdle),
+            "duplicate_usb_serial" => Ok(Self::DuplicateUsbSerial),
             _ => Err(
-                "仅允许 healthy/slow_read/queued_target/taken_target/target_unknown/stop_unknown/recording_audit_failure/not_idle"
+                "仅允许 healthy/slow_read/queued_target/taken_target/target_unknown/stop_unknown/recording_audit_failure/not_idle/duplicate_usb_serial"
                     .into(),
             ),
         }
@@ -85,6 +87,7 @@ pub(super) struct Context {
     pub(super) trace: Trace,
     last: BTreeMap<String, Value>,
     audit_failure_pending: bool,
+    duplicate_usb_serial: bool,
 }
 impl Context {
     fn new(trace: Trace, scenario: Scenario) -> Self {
@@ -92,7 +95,31 @@ impl Context {
             trace,
             last: BTreeMap::new(),
             audit_failure_pending: scenario == Scenario::RecordingAuditFailure,
+            duplicate_usb_serial: scenario == Scenario::DuplicateUsbSerial,
         }
+    }
+    pub(super) fn permits_usb_selection(&self, target_id: &str, intent: &str) -> bool {
+        self.duplicate_usb_serial
+            && target_id == "usb:UI_SYNTHETIC_DUPLICATE_USB"
+            && intent == "connect"
+    }
+    pub(super) fn usb_devices(&self) -> Vec<crate::devices::Device> {
+        if !self.duplicate_usb_serial {
+            return Vec::new();
+        }
+        self.trace.event(
+            "duplicate_usb_discovery",
+            0,
+            None,
+            json!({"serial":"UI_SYNTHETIC_DUPLICATE_USB","candidates":2}),
+        );
+        ["合成候选 A", "合成候选 B"]
+            .into_iter()
+            .map(|description| crate::devices::Device {
+                serial: Some("UI_SYNTHETIC_DUPLICATE_USB".into()),
+                description: description.into(),
+            })
+            .collect()
     }
     pub(super) fn expired(&self) -> bool {
         Instant::now() >= self.trace.deadline
@@ -151,7 +178,7 @@ impl Context {
 }
 
 // 只允许实际会话的观察、明确授权/范围/固定控制、记录与生命周期路径。
-// 不允许 v1、维护、物理连接、档案连接、适配器/ODrive 发现或扫描绕行。
+// 扫描仅用预装纯内存网络；不允许 v1、维护、物理连接、档案连接或适配器/ODrive 发现。
 pub(super) fn allowed_path(path: &str, method: Method) -> bool {
     let Some(rest) = path.strip_prefix("/service/v2/") else {
         return false;
@@ -164,15 +191,44 @@ pub(super) fn allowed_path(path: &str, method: Method) -> bool {
             || rest.starts_with("operations/")
             || rest.starts_with("recordings")
             || rest.starts_with("groups/")
-            || rest.starts_with("jobs/");
+            || rest.starts_with("jobs/")
+            || rest.starts_with("scans/");
     }
     matches!(
         rest,
         "bindings" | "shutdown" | "control-reservations" | "operation-ids" | "groups"
-    ) || rest.starts_with("bindings/") && !rest.ends_with("/maintenance")
+    ) || rest == "scans" && method == Method::Post
+        || rest.starts_with("bindings/") && !rest.ends_with("/maintenance")
         || rest.starts_with("control-reservations/")
         || rest.starts_with("control-scopes/")
         || rest.starts_with("groups/")
+}
+
+// 真实扫描 worker 仍创建只读会话并等待 Identity；此通道只丢弃帧，不接触任何驱动。
+struct SilentScanFactory(Trace);
+struct SilentScanChannel(Trace);
+impl eha_sdk::can::CanChannelFactory for SilentScanFactory {
+    fn open(&self) -> Result<Box<dyn eha_sdk::can::CanChannel>, String> {
+        Ok(Box::new(SilentScanChannel(self.0.clone())))
+    }
+}
+impl eha_sdk::can::CanChannel for SilentScanChannel {
+    fn send(&mut self, frame: &eha_sdk::transport::can::Frame, _: Duration) -> Result<(), String> {
+        self.0.event(
+            "scan_frame_discarded",
+            0,
+            None,
+            json!({"frame_id":frame.id,"data_len":frame.data_len}),
+        );
+        Ok(())
+    }
+    fn receive(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<eha_sdk::transport::can::Frame>, String> {
+        thread::sleep(timeout.min(Duration::from_millis(1)));
+        Ok(None)
+    }
 }
 
 fn workbench(
@@ -195,6 +251,18 @@ fn workbench(
         nodes.insert(node, session);
     }
     let mut workbench = Workbench::with_test_sessions_in(ToolSession::new(), nodes, runs, None);
+    workbench
+        .service_install_network(super::network_jobs::NetworkPrepared {
+            network: eha_sdk::can::CanNetwork::new(
+                Arc::new(SilentScanFactory(trace.clone())),
+                crate::session::parse_can_mode("fd").expect("固定 FD 模式"),
+            )
+            .expect("纯内存扫描网络"),
+            channel: "UI_SYNTHETIC_SCAN_ONLY".into(),
+            mode: "fd".into(),
+            python: None,
+        })
+        .expect("安装一次合成扫描网络");
     workbench.configure_p5_fixture(Context::new(trace.clone(), scenario));
     workbench.mutations =
         Some(mutations::State::new(&credentials.instance_id).expect("fixed limits"));
@@ -440,6 +508,136 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn live_telemetry_events_resume_after_real_cache_retention_gap() {
+        let service = Running::start(Scenario::Healthy, Duration::from_secs(40));
+        let (_, base) = service.attach(1);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let first = loop {
+            let (status, batch) =
+                service.request("GET", "/service/v2/events?after=0&limit=4", None);
+            assert_eq!(status, 200, "{batch}");
+            if batch["events"]
+                .as_array()
+                .expect("events")
+                .iter()
+                .any(|e| e["kind"] == "telemetry" && e["payload"]["target_id"] == "can:1")
+            {
+                break batch;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fresh SDK telemetry events missing: {batch}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        let first_cursor = first["cursor"].as_str().expect("first cursor");
+        // 真实保留期为 30 秒；只暂停消费者，服务和 SDK 队列继续采集。
+        thread::sleep(Duration::from_secs(31));
+        let (status, resumed) = service.request(
+            "GET",
+            &format!("/service/v2/events?after={first_cursor}&limit=4"),
+            None,
+        );
+        assert_eq!(status, 200, "{resumed}");
+        assert_eq!(resumed["gap"], true);
+        assert!(
+            resumed["gap_reasons"]
+                .as_array()
+                .expect("gap reasons")
+                .contains(&json!("cache_loss"))
+        );
+        assert!(
+            !resumed["lost_ranges"]
+                .as_array()
+                .expect("lost ranges")
+                .is_empty()
+        );
+        let matching: Vec<_> = resumed["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|e| e["kind"] == "telemetry" && e["payload"]["target_id"] == "can:1")
+            .collect();
+        assert!(!matching.is_empty(), "real telemetry follows the gap");
+        for event in matching {
+            assert_eq!(event["payload"]["identity"], base["expected_identity"]);
+            assert_eq!(
+                event["payload"]["connection_generation"],
+                base["connection_generation"]
+            );
+            assert_eq!(event["source_timestamp"]["clock"], "device_monotonic_us");
+        }
+        assert!(
+            resumed["cursor"]
+                .as_str()
+                .expect("resumed cursor")
+                .parse::<u64>()
+                .expect("integer")
+                > first_cursor.parse::<u64>().expect("integer")
+        );
+        let next_cursor = resumed["cursor"].as_str().expect("cursor");
+        let (status, next) = service.request(
+            "GET",
+            &format!("/service/v2/events?after={next_cursor}&limit=4"),
+            None,
+        );
+        assert_eq!(status, 200, "{next}");
+        assert!(
+            !next["events"]
+                .as_array()
+                .expect("following events")
+                .is_empty()
+        );
+        assert_eq!(
+            next["gap"], false,
+            "consumer resumes the uninterrupted cached stream"
+        );
+    }
+
+    #[test]
+    fn duplicate_usb_serial_rejects_real_selection_before_any_open() {
+        let service = Running::start(Scenario::DuplicateUsbSerial, Duration::from_secs(10));
+        let (status, targets) = service.request("GET", "/service/v2/targets", None);
+        assert_eq!(status, 200, "{targets}");
+        let usb = targets["targets"]
+            .as_array()
+            .expect("targets")
+            .iter()
+            .find(|t| t["target_id"] == "usb:UI_SYNTHETIC_DUPLICATE_USB")
+            .expect("fixed duplicate USB candidate");
+        assert_eq!(usb["connected"], false);
+        assert_eq!(usb["can_connect"], true);
+        let connect = json!({"api_version":2,"instance_id":service.instance,"target_id":"usb:UI_SYNTHETIC_DUPLICATE_USB","intent":"connect","lease_ms":120000});
+        let (status, rejected) =
+            service.request("POST", "/service/v2/bindings", Some(connect.clone()));
+        assert_eq!(status, 404, "{rejected}");
+        assert_eq!(rejected["code"], "not_found");
+        assert_eq!(rejected["message"], "USB 序列号重复，不能唯一选择设备。");
+        assert!(rejected.get("binding_id").is_none());
+        let (_, connections) = service.request("GET", "/service/v2/connections", None);
+        assert!(
+            connections["connections"]
+                .as_array()
+                .expect("connections")
+                .iter()
+                .all(|c| !c["target_id"]
+                    .as_str()
+                    .expect("target id")
+                    .starts_with("usb:"))
+        );
+        let mut other = connect;
+        other["target_id"] = json!("usb:UI_SYNTHETIC_OTHER_USB");
+        assert_eq!(
+            service
+                .request("POST", "/service/v2/bindings", Some(other))
+                .0,
+            403
+        );
+        assert_eq!(service.request("POST", "/service/v2/connections", Some(json!({"api_version":2,"instance_id":service.instance,"transport":"usb","serial":"UI_SYNTHETIC_DUPLICATE_USB"}))).0, 403);
+        assert_eq!(service.request("GET", "/service/v2/adapters", None).0, 403);
     }
 
     #[test]
@@ -769,6 +967,164 @@ mod tests {
                     && event["facts"]["request_id"] == request_id
                     && event["facts"]["transport_local_id"] == submission_id)
         );
+    }
+
+    #[test]
+    fn scan_is_blocked_during_trial_then_uses_only_silent_memory_network() {
+        let service = Running::start(Scenario::Healthy, Duration::from_secs(15));
+        let (binding, base) = service.attach(1);
+        let mut permission = base.clone();
+        permission["permissions"] = json!({"maintenance":false,"control":true});
+        permission["expected_grant_id"] = Value::Null;
+        let (status, grant) = service.request(
+            "POST",
+            &format!("/service/v2/bindings/{binding}/permissions"),
+            Some(permission.clone()),
+        );
+        assert_eq!(status, 200, "{grant}");
+        let (status, reservation) = service.request("POST", "/service/v2/control-reservations", Some(json!({"api_version":2,"instance_id":service.instance,"claimant_id":"UI_SYNTHETIC_operator","permission":"control","members":[{"binding_id":binding,"expected_identity":base["expected_identity"],"connection_generation":base["connection_generation"]}]})));
+        assert_eq!(status, 200, "{reservation}");
+        let (_, ticket) = service.request("POST", "/service/v2/operation-ids", Some(json!({"api_version":2,"instance_id":service.instance,"claimant_id":"UI_SYNTHETIC_operator","reservation_id":reservation["reservation_id"]})));
+        let mut command = base.clone();
+        command["claimant_id"] = json!("UI_SYNTHETIC_operator");
+        command["reservation_id"] = reservation["reservation_id"].clone();
+        command["request_id"] = ticket["request_id"].clone();
+        command["trial"] = json!({"command":{"action":"position","mm":1},"envelope":{"position_min_mm":-10,"position_max_mm":10,"velocity_abs_max_mm_s":2,"force_abs_max_n":10,"stiffness_max_n_per_mm":10,"damping_max_ns_per_mm":10,"duration_max_s":10},"duration_s":10,"reach":null});
+        let (status, admitted) = service.request(
+            "POST",
+            &format!("/service/v2/bindings/{binding}/trials"),
+            Some(command),
+        );
+        assert_eq!(status, 202, "{admitted}");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !service
+            .events()
+            .iter()
+            .any(|e| e["kind"] == "local_submitted" && e["facts"]["action"] == "position")
+        {
+            assert!(Instant::now() < deadline, "target submission");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let mut scan = base.clone();
+        scan["connection_id"] = json!("can:1");
+        scan["nodes"] = json!([1, 2]);
+        let (status, rejected) = service.request("POST", "/service/v2/scans", Some(scan.clone()));
+        assert_eq!(status, 409, "{rejected}");
+        assert_eq!(rejected["code"], "control_busy");
+        assert!(
+            !service
+                .events()
+                .iter()
+                .any(|e| e["kind"] == "scan_frame_discarded")
+        );
+        let mut stop = base.clone();
+        stop["claimant_id"] = json!("UI_SYNTHETIC_operator");
+        stop["request_id"] = grant["stop_request_id"].clone();
+        let (status, result) = service.request(
+            "POST",
+            &format!("/service/v2/bindings/{binding}/stop"),
+            Some(stop),
+        );
+        assert_eq!(status, 202, "{result}");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !service
+            .events()
+            .iter()
+            .any(|e| e["kind"] == "synthetic_post_stop_observation")
+        {
+            assert!(Instant::now() < deadline, "fresh Stop observation");
+            thread::sleep(Duration::from_millis(5));
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (_, stopped) = service.request(
+                "GET",
+                &format!(
+                    "/service/v2/operations/{}",
+                    grant["stop_request_id"].as_str().expect("Stop ID")
+                ),
+                None,
+            );
+            let (_, snapshot) = service.request(
+                "GET",
+                &format!("/service/v2/bindings/{binding}/snapshot"),
+                None,
+            );
+            if stopped["operation"]["admission"] == "finished"
+                && snapshot["read_permit"]["ready"] == true
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Stop completion and read gate: {stopped} {snapshot}"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        permission["permissions"] = json!({"maintenance":false,"control":false});
+        permission["expected_grant_id"] = grant["grant_id"].clone();
+        let (status, revoked) = service.request(
+            "POST",
+            &format!("/service/v2/bindings/{binding}/permissions"),
+            Some(permission),
+        );
+        assert_eq!(status, 200, "{revoked}");
+        // 每个已连接合成目标都能选择同一纯内存扫描网络，扫描没有虚构 Identity 回复。
+        for node in [1, 2] {
+            let (_, fields) = service.attach(node);
+            scan["connection_id"] = json!(format!("can:{node}"));
+            scan["expected_identity"] = fields["expected_identity"].clone();
+            scan["connection_generation"] = fields["connection_generation"].clone();
+            let (status, queued) = service.request("POST", "/service/v2/scans", Some(scan.clone()));
+            assert_eq!(status, 202, "{queued}");
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let (status, result) = service.request(
+                    "GET",
+                    &format!(
+                        "/service/v2/scans/{}",
+                        queued["scan_id"].as_str().expect("scan id")
+                    ),
+                    None,
+                );
+                assert_eq!(status, 200, "{result}");
+                if result["state"] == "completed" {
+                    assert_eq!(result["nodes"], json!([]));
+                    let errors = result["errors"].as_array().expect("per-node errors");
+                    assert_eq!(errors.len(), 2);
+                    for (error, expected_node) in errors.iter().zip([1, 2]) {
+                        assert_eq!(error["node"], expected_node);
+                        let native: Value = serde_json::from_str(
+                            error["error_json_text"].as_str().expect("native error"),
+                        )
+                        .expect("native JSON");
+                        assert_eq!(native["kind"], "timeout", "{native}");
+                    }
+                    break;
+                }
+                assert!(Instant::now() < deadline, "scan completion: {result}");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        assert!(
+            service
+                .events()
+                .iter()
+                .any(|e| e["kind"] == "scan_frame_discarded")
+        );
+        for fields in [
+            json!({"advanced":{"channel":"physical","mode":"fd","python":null}}),
+            json!({"profile_id":"physical"}),
+        ] {
+            let mut body = fields;
+            body["api_version"] = json!(2);
+            body["instance_id"] = json!(service.instance);
+            body["nodes"] = json!([1]);
+            let (status, result) = service.request("POST", "/service/v2/scans", Some(body));
+            assert!(status >= 400, "physical scan: {result}");
+        }
+        assert_eq!(service.request("GET", "/service/v2/adapters", None).0, 403);
+        assert_eq!(service.request("POST", "/service/v2/connections", Some(json!({"api_version":2,"instance_id":service.instance,"transport":"usb","serial":"physical"}))).0, 403);
     }
 
     #[test]

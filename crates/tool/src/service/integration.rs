@@ -460,7 +460,9 @@ impl IntegrationState {
                 Err(message) => return self.error(request, 400, "bad_request", message),
             };
             #[cfg(test)]
-            if workbench.p5_fixture.is_some() && intent != "attach" {
+            if workbench.p5_fixture.as_ref().is_some_and(|fixture| {
+                intent != "attach" && !fixture.permits_usb_selection(&target_id, &intent)
+            }) {
                 return self.error(
                     request,
                     403,
@@ -542,7 +544,17 @@ impl IntegrationState {
                             "当前 owner 有未决控制或运行状态，拒绝新连接",
                         );
                     }
-                    let devices = match crate::devices::discover() {
+                    #[cfg(test)]
+                    let discovered =
+                        workbench
+                            .p5_fixture
+                            .as_ref()
+                            .map_or_else(crate::devices::discover, |fixture| {
+                                Ok(fixture.usb_devices())
+                            });
+                    #[cfg(not(test))]
+                    let discovered = crate::devices::discover();
+                    let devices = match discovered {
                         Ok(devices) => devices,
                         Err(message) => return self.error(request, 502, "sdk_error", message),
                     };

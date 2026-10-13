@@ -877,6 +877,12 @@ fn session_fixture_configured(
     })
     .expect("group fixture backend starts");
     let mut client = Client::new(backend);
+    if is_live {
+        // 与 Workbench 的正式会话同为 4096；直接挂载 Client 时也须接好趋势队列。
+        client
+            .enable_telemetry_queue(4096)
+            .expect("合成 UI 遥测队列");
+    }
     let identity = client
         .identify(None, &eha_sdk::host::Wait::new(Duration::from_millis(100)))
         .expect("fixture Identity succeeds");
@@ -885,6 +891,9 @@ fn session_fixture_configured(
     } else {
         Duration::from_millis(100)
     });
+    if is_live {
+        session = session.with_telemetry_trend(4096);
+    }
     session.request = Some(ConnectionRequest::Can {
         channel: if is_live {
             format!("UI_SYNTHETIC-{node}")
