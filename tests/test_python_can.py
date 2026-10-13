@@ -4,6 +4,7 @@
 import importlib.util
 import pathlib
 import unittest
+from enum import Enum
 
 
 MODULE = pathlib.Path(__file__).parents[1] / "src" / "can" / "python_can.py"
@@ -30,7 +31,16 @@ class FakeUtil:
 class FakeCan:
     util = FakeUtil
 
+    class BusState(Enum):
+        ACTIVE = 1
+        PASSIVE = 2
+        ERROR = 3
+
     class BitTimingFd:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class BitTiming:
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
@@ -110,6 +120,51 @@ class PythonCanBridgeTests(unittest.TestCase):
         self.assertIsInstance(timing, can.BitTimingFd)
         self.assertEqual(timing.nom_bitrate, 1_000_000)
         self.assertEqual(timing.data_bitrate, 2_000_000)
+
+    def test_frozen_config_preserves_integer_channel_and_classic_timing(self):
+        config = {"interface": "virtual", "channel": 7, "receive_own_messages": True,
+                  "timing": {"_eha_timing_kind": "classic", "f_clock": 8_000_000,
+                             "brp": 1, "tseg1": 13, "tseg2": 2, "sjw": 1}}
+        bus = BRIDGE.explicit_bus(FakeCan, BRIDGE.json.dumps(config))
+        self.assertEqual(bus["channel"], 7)
+        self.assertTrue(bus["receive_own_messages"])
+        self.assertTrue(bus["ignore_config"])
+        self.assertIsInstance(bus["timing"], FakeCan.BitTiming)
+        self.assertNotIn("_eha_timing_kind", bus["timing"].kwargs)
+        config["timing"]["_eha_timing_kind"] = "unsupported"
+        with self.assertRaisesRegex(ValueError, "timing 类型无效"):
+            BRIDGE.explicit_bus(FakeCan, BRIDGE.json.dumps(config))
+
+    def test_explicit_config_rejects_boolean_channel(self):
+        with self.assertRaisesRegex(ValueError, "interface 和 channel"):
+            BRIDGE.explicit_bus(FakeCan, '{"interface":"virtual","channel":true}')
+
+    def test_frozen_official_bus_state_is_reconstructed(self):
+        bus = BRIDGE.explicit_bus(FakeCan, '{"interface":"virtual","channel":7,"state":"PASSIVE"}')
+        self.assertIs(bus["state"], FakeCan.BusState.PASSIVE)
+        with self.assertRaisesRegex(ValueError, "state 无效"):
+            BRIDGE.explicit_bus(FakeCan, '{"interface":"virtual","channel":7,"state":"INVALID"}')
+
+    def test_frozen_classic_timing_reconstructs_real_python_can_object(self):
+        try:
+            import can
+        except ImportError:
+            self.skipTest("真实 python-can 仅在受管运行时测试")
+
+        class RealClassicCan:
+            BitTiming = can.BitTiming
+
+            @staticmethod
+            def Bus(**kwargs):
+                return kwargs
+
+        config = {"interface": "virtual", "channel": 7, "timing": {
+            "_eha_timing_kind": "classic", "f_clock": 8_000_000,
+            "brp": 1, "tseg1": 13, "tseg2": 2, "sjw": 1,
+        }}
+        timing = BRIDGE.explicit_bus(RealClassicCan, BRIDGE.json.dumps(config))["timing"]
+        self.assertIsInstance(timing, can.BitTiming)
+        self.assertEqual(timing.bitrate, 500_000)
 
     def test_fd_byte_length_is_converted_to_wire_dlc(self):
         frame = BRIDGE.frame_to_wire(FakeMessage())

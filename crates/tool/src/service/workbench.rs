@@ -9,15 +9,12 @@ use crate::connections::{ConnectionProfile, ConnectionStore, managed_factory};
 use crate::session::{
     Command, CommandResult, ConnectionRequest, SessionError, ToolSession, TrialRequest,
 };
-use eha_sdk::can::{
-    CanChannelFactory, CanNetwork, CanNetworkStatus, CanNodeConnector, python::PythonCanOptions,
-};
+use eha_sdk::can::{CanNetwork, CanNetworkStatus, CanNodeConnector};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs,
     path::PathBuf,
-    sync::Arc,
 };
 
 const TREND_CAPACITY: usize = 4_096;
@@ -57,6 +54,8 @@ pub(crate) struct Workbench {
     runs_dir: PathBuf,
     profiles: ConnectionStore,
     pub(super) integration: Option<super::integration::IntegrationState>,
+    pub(super) v2: Option<super::integration::IntegrationState>,
+    pub(super) legacy_routes: bool,
 }
 
 impl Workbench {
@@ -70,6 +69,8 @@ impl Workbench {
             runs_dir,
             profiles: ConnectionStore::load_default(),
             integration: None,
+            v2: None,
+            legacy_routes: true,
         }
     }
 
@@ -90,6 +91,8 @@ impl Workbench {
                 std::env::temp_dir().join("eha-tool-webui-tests-connections.json"),
             ),
             integration: None,
+            v2: None,
+            legacy_routes: true,
         }
     }
 
@@ -322,7 +325,7 @@ impl Workbench {
                     .into(),
             );
         }
-        let network = CanNetwork::new(python_factory(channel.clone(), python.clone()), parsed)?;
+        let network = CanNetwork::new(python_factory(channel.clone(), python.clone())?, parsed)?;
         self.can_network = Some(CanNetworkState {
             network,
             channel,
@@ -842,6 +845,12 @@ impl Workbench {
         self.can_nodes.get_mut(&node)
     }
 
+    pub(super) fn has_unresolved_target(&self) -> bool {
+        std::iter::once(&self.usb)
+            .chain(self.can_nodes.values())
+            .any(ToolSession::integration_pending_target)
+    }
+
     pub(crate) fn integration_global_read_blocker(&self) -> Option<&'static str> {
         let sessions = std::iter::once(&self.usb).chain(self.can_nodes.values());
         for session in sessions {
@@ -852,10 +861,10 @@ impl Workbench {
                 return Some("trial_active");
             }
             // A disconnected but otherwise idle owner has no active I/O to contend with.
-            if session.integration_connected() {
-                if let Some(reason) = session.integration_read_blocker() {
-                    return Some(reason);
-                }
+            if session.integration_connected()
+                && let Some(reason) = session.integration_read_blocker()
+            {
+                return Some(reason);
             }
         }
         None
@@ -1059,12 +1068,7 @@ fn group_member_terminal(session: &ToolSession) -> bool {
     )
 }
 
-fn python_factory(channel: String, python: Option<String>) -> Arc<dyn CanChannelFactory> {
-    Arc::new(match python {
-        Some(python) => PythonCanOptions::with_python(channel, python),
-        None => PythonCanOptions::new(channel),
-    })
-}
+use crate::connections::advanced_factory as python_factory;
 
 fn validate_nodes(nodes: &[u8]) -> Result<(), String> {
     if nodes.is_empty() {
@@ -1095,9 +1099,11 @@ fn results_unknown(results: &[Value]) -> bool {
 }
 
 fn session_error(message: impl Into<String>) -> SessionError {
+    let message = message.into();
+    let kind = crate::connections::owner_error_code(&message).unwrap_or("invalid_input");
     SessionError {
-        kind: "invalid_input".into(),
-        message: message.into().into_boxed_str(),
+        kind: kind.into(),
+        message: message.into_boxed_str(),
         local_stage: Some("not_submitted".into()),
         unknown: false,
         failure: None,

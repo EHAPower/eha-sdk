@@ -8,17 +8,13 @@
 use std::{
     collections::VecDeque,
     path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
+use crate::owner_lock::{OwnerGuard, ResourceKey};
 use eha_sdk::{
-    can::{
-        CanChannelFactory, CanConnector, CanNodeConnector, CanOptions, python::PythonCanOptions,
-    },
+    can::{CanConnector, CanNodeConnector, CanOptions},
     host::{Client, ClientState, Error as SdkError, Failure, LocalSubmission, Reply, Wait},
     protocol::{
         Response,
@@ -390,6 +386,18 @@ enum Connector {
 }
 
 impl Connector {
+    fn acquire_usb_owner(
+        &self,
+        request: &ConnectionRequest,
+    ) -> Result<Option<OwnerGuard>, SessionError> {
+        // CAN guard 由物理 channel worker 持有；共享节点没有第二个物理 owner。
+        if let (Self::Usb(_), ConnectionRequest::Usb { serial }) = (self, request) {
+            let key = ResourceKey::usb(serial).map_err(owner_error)?;
+            return OwnerGuard::acquire(&key).map(Some).map_err(owner_error);
+        }
+        Ok(None)
+    }
+
     fn open(&mut self) -> Result<eha_sdk::host::backend::Backend, String> {
         match self {
             Self::Usb(connector) => connector.open(),
@@ -412,6 +420,8 @@ pub struct ToolSession {
     connector: Option<Connector>,
     request: Option<ConnectionRequest>,
     client: Option<Client>,
+    // 字段 drop 顺序保证 Backend 关闭并 join worker 后才释放 USB 通路。
+    usb_owner: Option<OwnerGuard>,
     disconnected: Option<ClientState>,
     timeout: Duration,
     identity: Option<Reply>,
@@ -441,6 +451,7 @@ impl ToolSession {
             connector: None,
             request: None,
             client: None,
+            usb_owner: None,
             disconnected: None,
             timeout: Duration::from_secs(5),
             identity: None,
@@ -488,6 +499,7 @@ impl ToolSession {
         self.connection_generation = next_connection_generation();
         self.clear_observations();
         let mut connector = connector_for(&request)?;
+        let owner = connector.acquire_usb_owner(&request)?;
         let backend = connector.open().map_err(open_error)?;
         let mut client = Client::new(backend);
         if let Some(capacity) = self.telemetry_queue_capacity {
@@ -510,6 +522,7 @@ impl ToolSession {
         self.request = Some(request);
         self.connector = Some(connector);
         self.client = Some(client);
+        self.usb_owner = owner;
         self.disconnected = None;
         self.disconnected_reason = None;
         Ok(self.snapshot())
@@ -582,6 +595,7 @@ impl ToolSession {
         self.capture_telemetry(&client);
         self.disconnected_reason = client.connection_status().disconnected;
         self.disconnected = Some(client.disconnect());
+        self.usb_owner = None;
         Ok(self.snapshot())
     }
 
@@ -605,8 +619,18 @@ impl ToolSession {
             self.capture_telemetry(&client);
             self.disconnected_reason = client.connection_status().disconnected;
             self.disconnected = Some(client.disconnect());
+            self.usb_owner = None;
         }
         let previous = self.identity.as_ref().and_then(identity_facts);
+        let owner = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| invalid("没有连接器"))?
+            .acquire_usb_owner(
+                self.request
+                    .as_ref()
+                    .ok_or_else(|| invalid("没有连接请求"))?,
+            )?;
         let state = self
             .disconnected
             .take()
@@ -658,6 +682,7 @@ impl ToolSession {
         self.identity = Some(identity);
         self.reconcile_interrupted_trial();
         self.client = Some(client);
+        self.usb_owner = owner;
         self.disconnected_reason = None;
         Ok(self.snapshot())
     }
@@ -680,6 +705,7 @@ impl ToolSession {
     }
 
     pub fn snapshot(&mut self) -> Snapshot {
+        self.retire_disconnected_usb();
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
             let (heartbeat, transport, adapter, connection_status) = (
@@ -754,6 +780,7 @@ impl ToolSession {
 
     /// 执行普通 SDK 动作。试验活跃时，控制及阻塞查询必须通过试验入口协调。
     pub fn execute(&mut self, command: Command) -> Result<CommandResult, SessionError> {
+        self.retire_disconnected_usb();
         if self.trial.active.is_some()
             || self
                 .trial
@@ -1192,6 +1219,7 @@ impl ToolSession {
 
     /// 服务后台每约 10 ms 调用。它只消费 SDK 的被动遥测队列和推进已授权试验。
     pub fn tick(&mut self) {
+        self.retire_disconnected_usb();
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
             let disconnected = client.connection_status().disconnected;
@@ -1214,6 +1242,35 @@ impl ToolSession {
         self.observe_trial_stop();
         self.observe_stop_confirmation_deadline();
         self.flush_recording();
+    }
+
+    /// 断连通知可能早于 USB endpoint 清理；必须 drop/join Backend 后才能归还物理锁。
+    /// 保留 ClientState 与原身份/未知试验，不自动 Stop、心跳或续接。
+    fn retire_disconnected_usb(&mut self) {
+        if self.usb_owner.is_none() {
+            return;
+        }
+        let Some(reason) = self
+            .client
+            .as_ref()
+            .and_then(|client| client.connection_status().disconnected)
+        else {
+            return;
+        };
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        self.capture_telemetry(&client);
+        if self.disconnected_reason.is_none() {
+            self.connection_generation = next_connection_generation();
+        }
+        self.disconnected_reason = Some(reason.clone());
+        self.interrupt_trial_unknown(&format!("transport_disconnected:{reason}"));
+        self.mark_interrupted_reconnect_required();
+        self.trial.prepared = None;
+        self.finish_recording_boundary("transport_disconnected");
+        self.disconnected = Some(client.disconnect());
+        self.usb_owner = None;
     }
 
     fn trial_stop_reason(&mut self) -> Option<String> {
@@ -2106,15 +2163,7 @@ pub(crate) fn parse_can_mode(value: &str) -> Result<eha_sdk::transport::can::Mod
     }
 }
 
-fn python_factory(
-    channel: String,
-    python: Option<String>,
-) -> Result<Arc<dyn CanChannelFactory>, String> {
-    Ok(Arc::new(PythonCanOptions::with_python(
-        channel,
-        crate::runtime::python(python.as_deref())?,
-    )))
-}
+use crate::connections::advanced_factory as python_factory;
 
 fn expected_uid_matches(request: &ConnectionRequest, identity: &Reply) -> Result<(), SessionError> {
     let identity = reply_json(identity)?;
@@ -2179,8 +2228,9 @@ fn invalid(message: impl Into<String>) -> SessionError {
     }
 }
 fn open_error(message: String) -> SessionError {
+    let kind = crate::connections::owner_error_code(&message).unwrap_or("connection");
     SessionError {
-        kind: "connection".into(),
+        kind: kind.into(),
         message: message.into_boxed_str(),
         local_stage: None,
         unknown: false,
@@ -2188,6 +2238,10 @@ fn open_error(message: String) -> SessionError {
         observed_transport: None,
         transport_raw_hex: None,
     }
+}
+
+fn owner_error(error: crate::owner_lock::OwnerLockError) -> SessionError {
+    open_error(error.to_string())
 }
 fn sdk_error(error: SdkError) -> SessionError {
     let SdkError {
@@ -2564,6 +2618,181 @@ mod tests {
         protocol::{SampleData, responses::*},
     };
     use serde_json::json;
+
+    #[test]
+    fn usb_owner_busy_is_structured_before_physical_open() {
+        let serial = format!("eha-session-busy-{}", std::process::id());
+        let key = crate::owner_lock::ResourceKey::usb(&serial).expect("key");
+        let _owner = crate::owner_lock::OwnerGuard::acquire(&key).expect("外部 owner");
+        let error = super::ToolSession::new()
+            .connect(super::ConnectionRequest::Usb { serial })
+            .expect_err("不能打开已占用 USB");
+        assert_eq!(&*error.kind, "owner_busy");
+        assert!(!error.unknown);
+    }
+
+    #[test]
+    fn usb_disconnect_drop_and_busy_reconnect_preserve_state() {
+        let serial = format!("eha-session-lifecycle-{}", std::process::id());
+        let key = crate::owner_lock::ResourceKey::usb(&serial).expect("key");
+        let (mut session, _) = super::trial_tests::session_fixture(
+            0,
+            [41; 12],
+            super::trial_tests::FixtureBehavior::Ready,
+        );
+        session.request = Some(super::ConnectionRequest::Usb {
+            serial: serial.clone(),
+        });
+        session.connector = Some(super::Connector::Usb(
+            eha_sdk::usb::UsbConnector::new(serial).expect("连接器"),
+        ));
+        session.usb_owner = Some(crate::owner_lock::OwnerGuard::acquire(&key).expect("会话 owner"));
+        assert_eq!(
+            crate::owner_lock::OwnerGuard::acquire(&key)
+                .expect_err("Backend 持有期间 busy")
+                .code,
+            "owner_busy"
+        );
+        session.disconnect().expect("断开并结束 worker");
+        let other = crate::owner_lock::OwnerGuard::acquire(&key).expect("断连释放 owner");
+        assert_eq!(
+            &*session.reconnect().expect_err("重连竞争失败").kind,
+            "owner_busy"
+        );
+        assert!(session.disconnected.is_some(), "失败保留可恢复会话状态");
+        drop(other);
+        drop(session);
+        let (mut session, _) = super::trial_tests::session_fixture(
+            0,
+            [42; 12],
+            super::trial_tests::FixtureBehavior::Ready,
+        );
+        session.usb_owner =
+            Some(crate::owner_lock::OwnerGuard::acquire(&key).expect("第二会话 owner"));
+        drop(session);
+        drop(crate::owner_lock::OwnerGuard::acquire(&key).expect("会话 drop 后释放 owner"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn passive_usb_failure_joins_before_unlock_and_preserves_unknown_reconnect_state() {
+        use eha_sdk::host::backend::{Backend, Command as BackendCommand};
+        use std::sync::{
+            Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+        use std::time::{Duration, Instant};
+        for use_tick in [false, true] {
+            let serial = format!("eha-passive-usb-{}-{use_tick}", std::process::id());
+            let key = crate::owner_lock::ResourceKey::usb(&serial).expect("key");
+            let (mut session, _) = super::trial_tests::session_fixture(
+                0,
+                [43; 12],
+                super::trial_tests::FixtureBehavior::Ready,
+            );
+            let identity = session.integration_identity();
+            session.client.take().expect("旧合成client").close();
+            session.request = Some(super::ConnectionRequest::Usb {
+                serial: serial.clone(),
+            });
+            session.connector = Some(super::Connector::Usb(
+                eha_sdk::usb::UsbConnector::new(serial.clone()).expect("连接器"),
+            ));
+            let physical_done = Arc::new(AtomicBool::new(false));
+            let worker_done = Arc::clone(&physical_done);
+            let cleanup = Arc::new(Barrier::new(2));
+            let worker_cleanup = Arc::clone(&cleanup);
+            let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+            let (close_tx, close_rx) = mpsc::sync_channel(1);
+            let backend = Backend::spawn("eha-passive-usb-failure", move |commands, sink| {
+                sink.disconnected("合成断连，物理清理尚未结束");
+                ready_tx.send(()).expect("断连可见");
+                assert!(matches!(
+                    commands.recv().expect("只等待归还Backend"),
+                    BackendCommand::Close
+                ));
+                close_tx.send(()).expect("join已开始");
+                worker_cleanup.wait();
+                worker_done.store(true, Ordering::SeqCst);
+            })
+            .expect("合成worker");
+            session.client = Some(eha_sdk::host::Client::new(backend));
+            session.usb_owner =
+                Some(crate::owner_lock::OwnerGuard::acquire(&key).expect("USB owner"));
+            session.pending_target = true;
+            session.trial.active = Some(super::ActiveTrial {
+                request: super::TrialRequest {
+                    command: super::Command::Velocity { mm_s: 0.5 },
+                    envelope: super::TrialEnvelope {
+                        position_min_mm: -10.0,
+                        position_max_mm: 10.0,
+                        velocity_abs_max_mm_s: 2.0,
+                        force_abs_max_n: 10.0,
+                        stiffness_max_n_per_mm: 10.0,
+                        damping_max_ns_per_mm: 10.0,
+                        duration_max_s: 5.0,
+                    },
+                    duration_s: Some(5.0),
+                    reach: None,
+                },
+                started_at: Instant::now(),
+                duration: Duration::from_secs(5),
+                pending_position_mm: None,
+                last_position_submit: None,
+                settled_since: None,
+                stop_submission: None,
+                stop_reason: None,
+                stop_observed: false,
+                started_sample_time_us: 0,
+                stop_after_sample_time_us: None,
+                stop_attempt_finished_at: None,
+                stop_confirmation_timeout: Duration::from_secs(1),
+                stop_confirmation_overdue: false,
+                stop_recovery_after_received_at: None,
+                settled_sample_time_us: None,
+            });
+            ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("已发布断连");
+            let observer = std::thread::spawn(move || {
+                close_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("snapshot/tick开始回收Backend");
+                let key = crate::owner_lock::ResourceKey::usb(&serial).expect("key");
+                let busy = crate::owner_lock::OwnerGuard::acquire(&key)
+                    .err()
+                    .is_some_and(|error| error.code == "owner_busy");
+                cleanup.wait();
+                busy
+            });
+            if use_tick {
+                session.tick();
+            } else {
+                assert!(!session.snapshot().connected);
+            }
+            assert!(observer.join().expect("观察线程"), "物理清理完成前仍排他");
+            assert!(
+                physical_done.load(Ordering::SeqCst),
+                "释放owner前已完成worker join"
+            );
+            assert!(session.client.is_none());
+            assert!(session.disconnected.is_some());
+            assert_eq!(session.integration_identity(), identity);
+            assert_eq!(session.trial_snapshot()["state"], "interrupted_unknown");
+            assert_eq!(session.trial_snapshot()["stop_available"], false);
+            assert!(session.pending_target, "未知目标事实不能因归还句柄而清除");
+            let competitor =
+                crate::owner_lock::OwnerGuard::acquire(&key).expect("旧会话仍存活但已释放物理锁");
+            assert_eq!(
+                &*session.reconnect().expect_err("竞争中的显式重连").kind,
+                "owner_busy"
+            );
+            assert!(session.disconnected.is_some());
+            assert_eq!(session.trial_snapshot()["state"], "interrupted_unknown");
+            drop(competitor);
+        }
+    }
 
     fn sample() -> SampleData {
         SampleData {

@@ -50,7 +50,7 @@ flowchart LR
     F --> E["分别判断采用、输出许可<br/>设备影响与机构效果"]
 ```
 
-枚举不会打开设备或扫描总线，不能说明连接或 Identity 已核对。`device` 的每个动作新建本地
+枚举不会打开设备或扫描总线，不能说明连接或 Identity 已核对。默认直连 `device` 的每个动作新建本地
 会话、核对 Identity、执行一个动作后关闭本地句柄；单次调用返回后不保留会话、心跳或 USB 传输编号及其保护状态。因此两个独立 USB `device` 进程不构成同一串行会话；连续查询、维护核对或脚本自动化使用已有的 `shell --batch`，在同一 SDK 会话内完成，不把独立调用的超时自动重发。USB 目标使用完整
 序列号；CAN 目标可选已保存的 `--connection ID`，或给出高级 `--can-channel` 与 `--node`，可选
 `--can-mode classic|fd`（默认 `fd`）和 `--can-python` 指定带 `python-can` 的解释器。受管档案仅支持
@@ -95,6 +95,33 @@ eha-tool device --can-channel "$EHA_CAN_CHANNEL" --node "$EHA_CAN_NODE" --can-mo
 只完成连接和所请求的业务；不启动心跳、不恢复控制或重放旧操作。`--can-python PATH` 仅覆盖本次操作，不保存到档案。物理断开后先恢复实际连接，再由用户显式执行连接。
 `inspect --json` 只输出身份、运行实例和更新路由；`--version` 不访问设备。无参数仅在标准输入和输出
 都是终端时进入 Shell；管道或重定向中无参数只显示帮助。
+
+#### 显式共享服务只读 CLI
+
+默认 `device` 保持上述单次直连。只有显式给出 `--via-service` 的私有实例描述符绝对路径，
+才使用 `/service/v2` 认证现有服务；还须明确给出该实例内的 `--target-id`，不能与 USB、
+连接档案或任何 CAN 直连参数混用。描述符、token 文件和父目录复用服务的 Unix 私有权限、
+UID、无符号链接与无硬链接检查。凭据不输出。
+
+```sh
+eha-tool device --via-service /absolute/private/instance.json --target-id can:7 status
+eha-tool device --via-service /absolute/private/instance.json --target-id usb:完整序列号 measurements
+eha-tool device --via-service /absolute/private/instance.json --target-id can:7 config-read --view startup
+```
+
+此入口只 attach 已连接的 owner 会话；不隐式连接、选择第一候选或另开设备。P1 支持
+`status`、`measurements`、`diagnostics` 和 `config-read --view startup|user`，总是直接输出服务的
+`native_json_text` 原文；`--json` 可保留在调用中，输出也保持该原文。Factory 配置、`--output`
+导出及其它控制、维护、观察或试验动作均明确 `unsupported`。精确服务合同见
+[service-api.md](service-api.md)。
+
+`--timeout-secs` 默认 5，共享服务允许 1 至 60 秒，每个 HTTP 请求有独立截止时间；
+连接、凭据、版本、实例、UID/run_nonce 或代次错误立即结束，不回落直连、不自动重放。
+CLI为观察申请 `2 × timeout-secs × 1000 + 1000` 毫秒租约；取得绑定ID后，即使读取超时或
+实例变化也只对已验证的原实例观察ID做一次有界 best-effort DELETE。attach 回复丢失而ID未知时，
+由服务单调时钟租约到期回收名额。清理和到期只解除观察 binding，不 Stop、不断开 owner、
+不改变心跳或目标；不以重启服务恢复观察容量。长观察客户端可申请最多121000毫秒租约，
+通过合同定义的 `renew` 后台续约；未申请租约的现有观察和v1兼容入口保持原生命周期。
 
 #### 控制与停止
 

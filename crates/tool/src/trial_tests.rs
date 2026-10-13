@@ -14,10 +14,12 @@ use eha_sdk::{
         self, Direction, Message, SampleData,
         responses::{
             CanProfile, ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView,
-            ContactState, DesiredAxis, DriverState, EvidenceState, FallbackReason, IdentityFields,
-            IdentityText, ReferenceKind, RunIdentity, SourceQuality, StartupSource, TargetIngress,
-            TargetMode, TelemetryFacts, TelemetryFields, ValueFields, ValueResult, ValueState,
-            encode_identity, encode_status, encode_telemetry,
+            ContactState, DesiredAxis, DiagnosticsFields, DriverState, EvidenceState,
+            FallbackReason, IdentityFields, IdentityText, MeasurementFields, MeasurementValues,
+            ModelState, PositiveForceChannel, ReferenceKind, RunIdentity, SourceQuality,
+            StartupSource, TargetIngress, TargetMode, TelemetryFacts, TelemetryFields, ValueFields,
+            ValueResult, ValueState, encode_diagnostics, encode_identity, encode_measurements,
+            encode_status, encode_telemetry,
         },
     },
 };
@@ -293,6 +295,10 @@ fn active(request: TrialRequest, started_at: Instant, started_sample_time_us: u6
 }
 
 fn startup_config_bytes(query_id: u32) -> Vec<u8> {
+    config_read_bytes(query_id, ConfigView::Startup)
+}
+
+fn config_read_bytes(query_id: u32, view: ConfigView) -> Vec<u8> {
     let record = br#"{"config":{"protection":{"hard_position_min_mm":-10.0,"hard_position_max_mm":10.0,"hard_velocity_max_mm_s":2.0,"hard_force_max_n":10.0}}}"#;
     let fields = ConfigDataFields {
         sample: SampleData {
@@ -301,7 +307,7 @@ fn startup_config_bytes(query_id: u32) -> Vec<u8> {
             snapshot_sequence: 5,
             snapshot_time_us: 5_000,
         },
-        view: ConfigView::Startup,
+        view,
         record_state: ConfigRecordState::Complete,
         startup_source: StartupSource::User,
         fallback_reason: FallbackReason::None,
@@ -313,6 +319,56 @@ fn startup_config_bytes(query_id: u32) -> Vec<u8> {
     writer.data_mut().copy_from_slice(record);
     let length = writer.finish().expect("config encodes");
     bytes.truncate(length);
+    bytes
+}
+
+fn readonly_observation_bytes(query_id: u32, category: u8) -> Vec<u8> {
+    let sample = SampleData {
+        query_id,
+        run_nonce: [9; 16],
+        snapshot_sequence: 12,
+        snapshot_time_us: 12_000,
+    };
+    if category == 3 {
+        let fields = DiagnosticsFields {
+            sample,
+            decision_age_us: 0,
+            device_evidence_age_us: 0,
+            overflow: false,
+            entries: &[],
+        };
+        let mut bytes = vec![0; fields.encoded_len().expect("diagnostic length")];
+        encode_diagnostics(&fields, &mut bytes).expect("diagnostics encode");
+        return bytes;
+    }
+    let value = ValueFields::new(
+        0.0,
+        ValueState::new(ValueResult::Available, SourceQuality::Qualified, true),
+    );
+    let fields = MeasurementFields {
+        sample,
+        values: MeasurementValues {
+            position_mm: value,
+            velocity_mm_s: value,
+            raw_pressure_a_mpa: value,
+            raw_pressure_b_mpa: value,
+            filtered_pressure_a_mpa: value,
+            filtered_pressure_b_mpa: value,
+            main_force_n: value,
+            protection_force_n: value,
+        },
+        position_age_us: 0,
+        velocity_age_us: 0,
+        pressure_pair_age_us: 0,
+        position_reference_count: 0,
+        effective_area_mm2: 1.0,
+        positive_force_channel: PositiveForceChannel::ElectricalB,
+        reference_state: true,
+        model_state: ModelState::Available,
+        pressure_batch_sequence: 1,
+    };
+    let mut bytes = vec![0; MeasurementFields::encoded_len()];
+    encode_measurements(&fields, &mut bytes).expect("measurements encode");
     bytes
 }
 
@@ -435,6 +491,19 @@ pub(crate) fn session_fixture(
                         Message::ReadConfig { query_id, view: 2 } => {
                             pump.sink.submitted(request.id);
                             pump.sink.received(startup_config_bytes(query_id));
+                        }
+                        Message::ReadConfig { query_id, view: 1 } => {
+                            pump.sink.submitted(request.id);
+                            pump.sink
+                                .received(config_read_bytes(query_id, ConfigView::UserRecord));
+                        }
+                        Message::Query {
+                            query_id,
+                            category: category @ (2 | 3),
+                        } => {
+                            pump.sink.submitted(request.id);
+                            pump.sink
+                                .received(readonly_observation_bytes(query_id, category));
                         }
                         Message::Query {
                             query_id,
