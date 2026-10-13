@@ -115,10 +115,7 @@ impl State {
         workbench: &mut Workbench,
     ) {
         for group in self.groups.values_mut() {
-            if common.book.reservation(&group.reservation_id).is_none() {
-                group.released = true;
-                common.invalidate_reservation_tickets(&group.reservation_id);
-            }
+            group.sync_reservation_retirement(common);
             let Some(ids) = group.barrier.as_ref() else {
                 continue;
             };
@@ -198,7 +195,9 @@ impl State {
             .ok_or_else(|| "未知群组路径".to_owned())?;
         let (id, action) = rest.split_once('/').unwrap_or((rest, ""));
         if method == Method::Get && action.is_empty() {
-            return Ok((200, self.group_mut(id, None)?.projection(common)));
+            let group = self.group_mut(id, None)?;
+            group.sync_reservation_retirement(common);
+            return Ok((200, group.projection(common)));
         }
         let claimant = fields.string("claimant_id")?;
         let group = self.group_mut(
@@ -211,6 +210,7 @@ impl State {
         )?;
         if action.is_empty() && method == Method::Delete {
             fields.reject_unknown(&["instance_id", "claimant_id"])?;
+            group.sync_reservation_retirement(common);
             if !group.released {
                 common
                     .book
@@ -412,6 +412,15 @@ impl Member {
     }
 }
 impl Group {
+    fn sync_reservation_retirement(&mut self, common: &mut mutations::State) {
+        // Group 只在本 Book 成功 reserve 后创建，原 ID 不复用且仅 release 会移除。
+        // 因此这是已持有原范围的退役事实，不将未知 Group 或任意 NotFound 视为成功。
+        if common.book.reservation(&self.reservation_id).is_none() {
+            self.released = true;
+            common.invalidate_reservation_tickets(&self.reservation_id);
+        }
+    }
+
     fn keys(&self) -> Vec<MemberKey> {
         self.members
             .iter()
@@ -1098,7 +1107,41 @@ mod tests {
             status, 200,
             "unknown replay reads receipt without resubmitting"
         );
-        call(
+        let original = f.groups.groups[&f.id].projection(&f.common);
+        let member = f.groups.groups[&f.id].members[0].key.clone();
+        f.common
+            .book
+            .set_permissions(member, Permissions::default())
+            .expect("explicit revocation retires original reservation");
+        assert!(
+            f.common
+                .book
+                .reservation(&f.groups.groups[&f.id].reservation_id)
+                .is_none()
+        );
+        assert!(
+            !f.groups.groups[&f.id].released,
+            "owner poll has not run after revocation"
+        );
+        let mut foreign = body();
+        foreign["claimant_id"] = json!("other");
+        assert_eq!(
+            call(
+                &mut f.groups,
+                &f.id,
+                "",
+                Method::Delete,
+                foreign,
+                &mut f.common,
+                &mut f.control,
+                &mut f.workbench
+            )
+            .expect_err("foreign claimant stays denied")
+            .code,
+            "claimant_mismatch"
+        );
+        // 刻意不 tick：权限路径已明确退役，紧接着的释放应同步原 Group 投影。
+        let (status, released) = call(
             &mut f.groups,
             &f.id,
             "",
@@ -1109,6 +1152,45 @@ mod tests {
             &mut f.workbench,
         )
         .expect("release unknown original group scope");
+        assert_eq!(status, 200);
+        assert_eq!(released["released"], true);
+        assert_eq!(released["members"], original["members"]);
+        assert_eq!(released["stop_request_id"], original["stop_request_id"]);
+        assert_eq!(
+            f.groups.groups[&f.id].results(&f.common),
+            results,
+            "original ledger facts remain unchanged"
+        );
+        assert!(!f.control.busy(), "release queues no Stop or other control");
+        assert!(f.common.tickets.is_empty());
+        let (status, replay) = call(
+            &mut f.groups,
+            &f.id,
+            "",
+            Method::Delete,
+            body(),
+            &mut f.common,
+            &mut f.control,
+            &mut f.workbench,
+        )
+        .expect("repeat release only returns original scope");
+        assert_eq!(status, 200);
+        assert_eq!(replay, released);
+        assert_eq!(
+            call(
+                &mut f.groups,
+                "missing-group",
+                "",
+                Method::Delete,
+                body(),
+                &mut f.common,
+                &mut f.control,
+                &mut f.workbench
+            )
+            .expect_err("unknown group never becomes a successful release")
+            .code,
+            "group_not_found"
+        );
         let unknown_member = f.groups.groups[&f.id].members[1].key.clone();
         assert!(
             f.common
@@ -1149,6 +1231,19 @@ mod tests {
             .book
             .set_permissions(original[1].clone(), Permissions::default())
             .expect("revoke second original member control grant");
+        let (status, snapshot) = call(
+            &mut f.groups,
+            &f.id,
+            "",
+            Method::Get,
+            json!({}),
+            &mut f.common,
+            &mut f.control,
+            &mut f.workbench,
+        )
+        .expect("GET immediately reflects the retired reservation");
+        assert_eq!(status, 200);
+        assert_eq!(snapshot["released"], true);
         f.groups
             .poll(&mut f.control, &mut f.common, &mut f.workbench);
         assert_eq!(f.groups.groups[&f.id].keys(), original);
