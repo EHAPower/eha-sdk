@@ -94,6 +94,7 @@ mod tests {
                         &mut odrive,
                         &mut scan,
                         &reader,
+                        &crate::service::stop_body::StopBodyReader::new(),
                     )
                     .expect("dispatch");
                 }

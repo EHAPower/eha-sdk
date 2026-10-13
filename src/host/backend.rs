@@ -4,7 +4,7 @@ use std::{
     collections::VecDeque,
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         mpsc::{self, Receiver, SyncSender},
     },
     thread::JoinHandle,
@@ -75,6 +75,27 @@ pub(crate) struct TelemetryQueue {
     received: VecDeque<Received>,
     dropped: u64,
 }
+impl TelemetryQueue {
+    pub(super) fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            received: VecDeque::with_capacity(capacity),
+            dropped: 0,
+        }
+    }
+
+    pub(super) fn drain_limited(&mut self, limit: usize) -> (Vec<Received>, u64) {
+        if limit == 0 {
+            return (Vec::new(), 0);
+        }
+        let count = self.received.len().min(limit);
+        (
+            self.received.drain(..count).collect(),
+            std::mem::take(&mut self.dropped),
+        )
+    }
+}
+
 #[derive(Clone)]
 pub struct EventSink(pub(crate) Arc<(Mutex<Inbox>, Condvar)>);
 impl EventSink {
@@ -210,8 +231,54 @@ impl SendRequest {
         }
     }
 }
+/// Cancellation of a control item before its last handoff to the I/O worker.
+/// A taken item is never aborted. A protected item returned to Pump becomes queued again.
+#[derive(Clone)]
+pub struct QueueCancellation {
+    state: Arc<AtomicU8>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Default for QueueCancellation {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(0)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+impl QueueCancellation {
+    /// Cancels only queued work. A handoff that won the race remains conservatively unknown.
+    pub fn cancel(&self) -> super::LocalStage {
+        let previous = self.state.fetch_or(2, Ordering::AcqRel);
+        if previous & 1 == 0 {
+            self.cancelled.store(true, Ordering::Release);
+            super::LocalStage::NotSubmitted
+        } else {
+            super::LocalStage::MayHaveBeenSubmitted
+        }
+    }
+    fn take(&self) -> bool {
+        self.state
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+    fn put_back(&self) {
+        let previous = self.state.fetch_and(!1, Ordering::AcqRel);
+        if previous & 2 != 0 {
+            self.cancelled.store(true, Ordering::Release);
+        }
+    }
+    fn cancelled_while_queued(&self) -> bool {
+        self.state.load(Ordering::Acquire) == 2
+    }
+    pub(super) fn flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+}
+
 pub enum Command {
     Send(SendRequest),
+    CancellableSend(SendRequest, QueueCancellation),
     Heartbeat(Option<Duration>),
     Close,
 }
@@ -221,6 +288,8 @@ pub struct Pump {
     pub sink: EventSink,
     pending: [Option<SendRequest>; 3],
     returned_query_cancellation: [Option<(u64, Arc<AtomicBool>)>; 3],
+    queued_control: [Option<QueueCancellation>; 3],
+    returned_control: [Option<(u64, QueueCancellation)>; 3],
     period: Option<Duration>,
     next: Instant,
     epoch: Instant,
@@ -233,6 +302,8 @@ impl Pump {
             sink,
             pending: [None, None, None],
             returned_query_cancellation: [None, None, None],
+            queued_control: [None, None, None],
+            returned_control: [None, None, None],
             period: None,
             next: Instant::now(),
             epoch: Instant::now(),
@@ -253,26 +324,16 @@ impl Pump {
     pub fn poll(&mut self) -> bool {
         loop {
             match self.rx.try_recv() {
-                Ok(Command::Send(req)) => {
-                    let lane = req.lane();
-                    if self.pending[lane]
-                        .as_ref()
-                        .is_some_and(SendRequest::expired)
-                        && let Some(expired) = self.pending[lane].take()
-                    {
-                        self.sink.failed(expired.id, "发送前已取消或到期", false);
-                    }
-                    if self.pending[lane].is_some() {
-                        self.sink.failed(req.id, "本地发送槽占用", false);
-                    } else {
-                        self.pending[lane] = Some(req);
-                    }
+                Ok(Command::Send(req)) => self.enqueue(req, None),
+                Ok(Command::CancellableSend(req, cancellation)) => {
+                    self.enqueue(req, Some(cancellation))
                 }
                 Ok(Command::Heartbeat(period)) => {
                     self.period = period;
                     self.next = Instant::now();
                     if period.is_none() {
                         self.pending[0] = None;
+                        self.queued_control[0] = None;
                     }
                     if let Ok(mut i) = self.sink.0.0.lock() {
                         i.heartbeat.enabled = period.is_some();
@@ -313,17 +374,42 @@ impl Pump {
         }
         !self.closed
     }
+    fn enqueue(&mut self, req: SendRequest, cancellation: Option<QueueCancellation>) {
+        let lane = req.lane();
+        if (self.pending[lane]
+            .as_ref()
+            .is_some_and(SendRequest::expired)
+            || self.queued_control[lane]
+                .as_ref()
+                .is_some_and(QueueCancellation::cancelled_while_queued))
+            && let Some(expired) = self.pending[lane].take()
+        {
+            self.queued_control[lane] = None;
+            self.sink.failed(expired.id, "发送前已取消或到期", false);
+        }
+        if self.pending[lane].is_some() {
+            self.sink.failed(req.id, "本地发送槽占用", false);
+        } else {
+            self.pending[lane] = Some(req);
+            self.queued_control[lane] = cancellation;
+        }
+    }
     /// 每 lane 的 worker 完成或退回上一请求后再取下一请求；最多保留三份退回关联。
     pub fn take(&mut self, lane: usize) -> Option<SendRequest> {
         let mut req = self.pending[lane].take()?;
         self.returned_query_cancellation[lane] = None;
-        if req.expired() {
+        self.returned_control[lane] = None;
+        let control = self.queued_control[lane].take();
+        if req.expired() || control.as_ref().is_some_and(|token| !token.take()) {
             self.sink.failed(req.id, "发送前已取消或到期", false);
             None
         } else {
             // 取出后隔离等待取消，避免中止已开始的 USB/CAN 发送；未能开始而退回
             // 的请求在 put_back 恢复排队取消。真实 I/O 期限始终保留。
-            if matches!(
+            if let Some(token) = control {
+                self.returned_control[lane] = Some((req.id, token));
+                req.cancelled = Arc::new(AtomicBool::new(false));
+            } else if matches!(
                 req.bytes
                     .get(1)
                     .copied()
@@ -339,6 +425,15 @@ impl Pump {
     /// 仅退回尚未开始发送的请求；只读查询重新关联等待取消，允许随后 Stop 回收槽位。
     pub fn put_back(&mut self, mut req: SendRequest) {
         let lane = req.lane();
+        if self.returned_control[lane]
+            .as_ref()
+            .is_some_and(|(id, _)| *id == req.id)
+            && let Some((_, token)) = self.returned_control[lane].take()
+        {
+            token.put_back();
+            req.cancelled = token.flag();
+            self.queued_control[lane] = Some(token);
+        }
         if self.returned_query_cancellation[lane]
             .as_ref()
             .is_some_and(|(id, _)| *id == req.id)
@@ -428,6 +523,85 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(5),
             cancelled: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn control_cancel_races_with_handoff_and_return_without_aborting_active_io() {
+        for phase in 0..4 {
+            let (backend, commands, sink) = Backend::endpoint();
+            let mut pump = Pump::new(commands, sink.clone());
+            let token = QueueCancellation::default();
+            let mut req = request(1);
+            req.cancelled = token.flag();
+            backend
+                .tx
+                .try_send(Command::CancellableSend(req, token.clone()))
+                .expect("enqueue cancellable control");
+            pump.poll();
+            let mut taken = (phase != 0).then(|| pump.take(1).expect("queued control available"));
+            if phase == 3 {
+                pump.put_back(taken.take().expect("control was handed off"));
+            }
+            assert_eq!(
+                token.cancel(),
+                if phase == 0 || phase == 3 {
+                    super::super::LocalStage::NotSubmitted
+                } else {
+                    super::super::LocalStage::MayHaveBeenSubmitted
+                }
+            );
+            if let Some(active) = taken.as_ref() {
+                assert!(!active.expired());
+            }
+            if phase == 2 {
+                pump.put_back(taken.take().expect("control was handed off"));
+            }
+            backend
+                .tx
+                .try_send(Command::Send(request(2)))
+                .expect("enqueue following control");
+            pump.poll();
+            assert_eq!(pump.take(1).expect("queued control available").id, 2);
+            if phase != 1 {
+                assert!(
+                    matches!(sink.0.0.lock().expect("inspect backend events").events.front(), Some(Event::Failed(1, failure)) if !failure.may_have_sent)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn returned_control_association_never_cancels_a_later_id() {
+        let (backend, commands, sink) = Backend::endpoint();
+        let mut pump = Pump::new(commands, sink);
+        let first = QueueCancellation::default();
+        backend
+            .tx
+            .try_send(Command::CancellableSend(request(1), first.clone()))
+            .expect("enqueue first cancellable control");
+        pump.poll();
+        let active = pump.take(1).expect("queued control available");
+        first.cancel();
+        assert!(!active.expired());
+        let second = QueueCancellation::default();
+        backend
+            .tx
+            .try_send(Command::CancellableSend(request(2), second.clone()))
+            .expect("enqueue second cancellable control");
+        pump.poll();
+        let pending = pump.take(1).expect("queued control available");
+        assert_eq!(Arc::strong_count(&first.state), 1);
+        pump.put_back(pending);
+        assert!(
+            !pump.pending[1]
+                .as_ref()
+                .expect("returned control occupies lane")
+                .expired()
+        );
+        assert_eq!(second.cancel(), super::super::LocalStage::NotSubmitted);
+        assert!(pump.take(1).is_none());
+        assert!(pump.returned_control[1].is_none());
+        assert_eq!(Arc::strong_count(&second.state), 1);
     }
 
     #[test]

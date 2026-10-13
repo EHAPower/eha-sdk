@@ -1035,10 +1035,20 @@ mod tests {
 
     #[test]
     fn cancelling_taken_query_wait_does_not_expire_usb_active_or_block_stop() {
+        cancelling_taken_wait(false);
+    }
+
+    #[test]
+    fn cancelling_taken_control_wait_does_not_expire_usb_active_or_block_stop() {
+        cancelling_taken_wait(true);
+    }
+
+    fn cancelling_taken_wait(control: bool) {
         use crate::host::backend::{Command, SendRequest};
         let (backend, commands, sink) = Backend::endpoint();
         let mut pump = Pump::new(commands, sink);
         let wait_cancelled = Arc::new(AtomicBool::new(false));
+        let token = crate::host::backend::QueueCancellation::default();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut heartbeat = [0; 8];
         let mut short = [0; 256];
@@ -1052,28 +1062,35 @@ mod tests {
         for (id, message) in [
             (
                 1,
-                protocol::Message::Query {
-                    query_id: 1,
-                    category: 1,
+                if control {
+                    protocol::Message::Position(1.0)
+                } else {
+                    protocol::Message::Query {
+                        query_id: 1,
+                        category: 1,
+                    }
                 },
             ),
             (2, protocol::Message::Stop),
         ] {
             let mut bytes = vec![0; message.encoded_len().expect("length")];
             protocol::encode(message, &mut bytes).expect("encode");
-            backend
-                .tx
-                .try_send(Command::Send(SendRequest {
-                    id,
-                    bytes,
-                    deadline,
-                    cancelled: if id == 1 {
-                        wait_cancelled.clone()
-                    } else {
-                        Arc::new(AtomicBool::new(false))
-                    },
-                }))
-                .expect("enqueue");
+            let request = SendRequest {
+                id,
+                bytes,
+                deadline,
+                cancelled: if id == 1 {
+                    wait_cancelled.clone()
+                } else {
+                    Arc::new(AtomicBool::new(false))
+                },
+            };
+            let command = if control && id == 1 {
+                Command::CancellableSend(request, token.clone())
+            } else {
+                Command::Send(request)
+            };
+            backend.tx.try_send(command).expect("enqueue");
             assert!(pump.poll());
             let request = pump.take(1).expect("worker takes request");
             let mut active = [
@@ -1102,7 +1119,14 @@ mod tests {
                 transport::usb::SendEvent::PacketAccepted
             );
             // 真实 worker 的窗口：Bulk OUT 已接受，本地 completion 尚未返回。
-            wait_cancelled.store(true, Ordering::Release);
+            if control {
+                assert_eq!(
+                    token.cancel(),
+                    crate::host::LocalStage::MayHaveBeenSubmitted
+                );
+            } else {
+                wait_cancelled.store(true, Ordering::Release);
+            }
             assert!(!active_request_expired(&active), "取消查询等待不得关闭 USB");
             assert!(matches!(
                 sender.completed(prepared.token, 0),

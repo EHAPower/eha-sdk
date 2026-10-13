@@ -8,7 +8,7 @@
 use super::connection_profiles::{UsbProfile, UsbProfileStore};
 use crate::connections::{ConnectionProfile, ConnectionStore};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, VecDeque},
     fs,
@@ -376,7 +376,7 @@ fn read_recording(
 
 #[cfg(unix)]
 fn open_recording_file(root: &Path, run_id: &str, file: &str) -> Result<fs::File, String> {
-    use rustix::fs::{fstat, open, openat, FileType, Mode, OFlags};
+    use rustix::fs::{FileType, Mode, OFlags, fstat, open, openat};
 
     let root = open(
         root,
@@ -659,17 +659,17 @@ fn usb_profile_response(profile: UsbProfile) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_read_operation, JobState, Operation, ProfileJobs, ProfileOperation, ReadJobs,
+        JobState, Operation, ProfileJobs, ProfileOperation, ReadJobs, execute_read_operation,
     };
     use crate::connections::{ConnectionProfile, ConnectionStore, ManagedAdapter};
     use crate::service::connection_profiles::{UsbProfile, UsbProfileStore, UsbTransport};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use std::{
         collections::BTreeSet,
         fs,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc, Barrier,
+            atomic::{AtomicBool, Ordering},
         },
         thread,
         time::{SystemTime, UNIX_EPOCH},
@@ -755,16 +755,18 @@ mod tests {
         fs::write(run.join("telemetry.csv"), vec![b'x'; 65_537]).expect("telemetry");
 
         let mut listed = BTreeSet::new();
-        assert!(execute_read_operation(
-            Operation::Recording {
-                run_id: "run_1".into(),
-                file: "events.jsonl".into(),
-                offset: 0,
-            },
-            &root,
-            &mut listed,
-        )
-        .is_err());
+        assert!(
+            execute_read_operation(
+                Operation::Recording {
+                    run_id: "run_1".into(),
+                    file: "events.jsonl".into(),
+                    offset: 0,
+                },
+                &root,
+                &mut listed,
+            )
+            .is_err()
+        );
         let listing =
             execute_read_operation(Operation::Recordings, &root, &mut listed).expect("listing");
         assert_eq!(
@@ -802,16 +804,18 @@ mod tests {
         .expect("bounded chunk");
         assert_eq!(chunk["next_offset"], "65536");
         assert!(!chunk["eof"].as_bool().expect("boolean eof"));
-        assert!(execute_read_operation(
-            Operation::Recording {
-                run_id: "../run_1".into(),
-                file: "events.jsonl".into(),
-                offset: 0,
-            },
-            &root,
-            &mut listed,
-        )
-        .is_err());
+        assert!(
+            execute_read_operation(
+                Operation::Recording {
+                    run_id: "../run_1".into(),
+                    file: "events.jsonl".into(),
+                    offset: 0,
+                },
+                &root,
+                &mut listed,
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -833,23 +837,25 @@ mod tests {
 
         fs::create_dir_all(&run).expect("recreate directory");
         fs::write(run.join("events.jsonl"), b"second").expect("recreated events");
-        assert!(execute_read_operation(
-            Operation::Recording {
-                run_id: "run_1".into(),
-                file: "events.jsonl".into(),
-                offset: 0,
-            },
-            &root,
-            &mut listed,
-        )
-        .is_err());
+        assert!(
+            execute_read_operation(
+                Operation::Recording {
+                    run_id: "run_1".into(),
+                    file: "events.jsonl".into(),
+                    offset: 0,
+                },
+                &root,
+                &mut listed,
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
     #[cfg(unix)]
     #[test]
     fn recordings_reject_run_and_fixed_file_symlinks() {
-        use rustix::fs::{mkfifoat, Mode};
+        use rustix::fs::{Mode, mkfifoat};
         use std::os::unix::fs::symlink;
 
         let root = temporary_root("symlinks");
@@ -870,26 +876,30 @@ mod tests {
         assert_eq!(listing["runs"][0]["metadata_json_text"], Value::Null);
         assert_eq!(listing["runs"][0]["files"], json!([]));
         assert!(!listed.contains("run_link"));
-        assert!(execute_read_operation(
-            Operation::Recording {
-                run_id: "run_1".into(),
-                file: "events.jsonl".into(),
-                offset: 0,
-            },
-            &root,
-            &mut listed,
-        )
-        .is_err());
-        assert!(execute_read_operation(
-            Operation::Recording {
-                run_id: "run_1".into(),
-                file: "telemetry.csv".into(),
-                offset: 0,
-            },
-            &root,
-            &mut listed,
-        )
-        .is_err());
+        assert!(
+            execute_read_operation(
+                Operation::Recording {
+                    run_id: "run_1".into(),
+                    file: "events.jsonl".into(),
+                    offset: 0,
+                },
+                &root,
+                &mut listed,
+            )
+            .is_err()
+        );
+        assert!(
+            execute_read_operation(
+                Operation::Recording {
+                    run_id: "run_1".into(),
+                    file: "telemetry.csv".into(),
+                    offset: 0,
+                },
+                &root,
+                &mut listed,
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).expect("remove fixture");
     }
 
@@ -978,9 +988,11 @@ mod tests {
         };
         assert_eq!(second_id, "profile-2");
         let (_, can_store, usb_store, result) = take_profile_completion(&mut jobs);
-        assert!(result
-            .expect_err("different UID rejected")
-            .contains("另一 EHA UID"));
+        assert!(
+            result
+                .expect_err("different UID rejected")
+                .contains("另一 EHA UID")
+        );
 
         let third = jobs.start(
             can_store,
@@ -1016,9 +1028,11 @@ mod tests {
         };
         assert_eq!(fourth_id, "profile-4");
         let (_, _can_store, _usb_store, result) = take_profile_completion(&mut jobs);
-        assert!(result
-            .expect_err("cross-transport id rejected")
-            .contains("id 冲突"));
+        assert!(
+            result
+                .expect_err("cross-transport id rejected")
+                .contains("id 冲突")
+        );
         drop(jobs);
         fs::remove_dir_all(root).expect("remove fixture");
     }

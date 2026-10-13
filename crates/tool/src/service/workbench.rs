@@ -58,6 +58,10 @@ pub(crate) struct Workbench {
     pub(super) p2: Option<super::p2::State>,
     pub(super) integration: Option<super::integration::IntegrationState>,
     pub(super) v2: Option<super::integration::IntegrationState>,
+    pub(super) mutations: Option<super::mutations::State>,
+    pub(super) control: Option<super::control::State>,
+    pub(super) control_groups: Option<super::control_groups::State>,
+    pub(super) control_reads: Option<super::control_reads::State>,
     pub(super) legacy_routes: bool,
 }
 
@@ -76,6 +80,10 @@ impl Workbench {
             profiles: Some(ConnectionStore::load_default()),
             integration: None,
             v2: None,
+            mutations: None,
+            control: Some(super::control::State::new()),
+            control_groups: Some(super::control_groups::State::new()),
+            control_reads: Some(super::control_reads::State::new()),
             legacy_routes: true,
         }
     }
@@ -103,8 +111,52 @@ impl Workbench {
             )),
             integration: None,
             v2: None,
+            mutations: None,
+            control: Some(super::control::State::new()),
+            control_groups: Some(super::control_groups::State::new()),
+            control_reads: Some(super::control_reads::State::new()),
             legacy_routes: true,
         }
+    }
+
+    pub(super) fn service_fence_control(&mut self, uid: &str, run_nonce: &str, reason: &str) {
+        for session in std::iter::once(&mut self.usb).chain(self.can_nodes.values_mut()) {
+            if session
+                .integration_identity()
+                .is_some_and(|(actual_uid, actual_run)| {
+                    actual_uid == uid && actual_run == run_nonce
+                })
+            {
+                session.fence_control(reason);
+            }
+        }
+    }
+
+    pub(super) fn control_blocks_sync(&self) -> bool {
+        if self.mutations.as_ref().is_some_and(|state| {
+            state.book.grant_members().iter().any(|member| {
+                state
+                    .book
+                    .grant(member)
+                    .is_some_and(|grant| grant.permissions.control)
+            })
+        }) {
+            return true;
+        }
+        self.control
+            .as_ref()
+            .is_some_and(super::control::State::busy)
+            || self.has_unresolved_target()
+            || self.has_unresolved_trial()
+            || self.usb.integration_read_blocker() == Some("heartbeat_active")
+            || self
+                .can_nodes
+                .values()
+                .any(|session| session.integration_read_blocker() == Some("heartbeat_active"))
+    }
+
+    pub(super) fn service_runs_dir(&self) -> PathBuf {
+        self.runs_dir.clone()
     }
 
     pub(crate) fn default_runs_dir() -> PathBuf {
@@ -133,6 +185,22 @@ impl Workbench {
     }
 
     pub(crate) fn tick(&mut self) {
+        if let Some(mut state) = self.mutations.take() {
+            if let Some(mut control) = self.control.take() {
+                control.poll(&mut state, self);
+                if let Some(mut groups) = self.control_groups.take() {
+                    groups.poll(&mut control, &mut state, self);
+                    self.control_groups = Some(groups);
+                }
+                self.control = Some(control);
+            }
+            state.poll(self);
+            self.mutations = Some(state);
+        }
+        if let Some(mut reads) = self.control_reads.take() {
+            reads.poll(self);
+            self.control_reads = Some(reads);
+        }
         if let Some(mut p2) = self.p2.take() {
             p2.reap(self);
             p2.advance_batch(self);
@@ -1170,7 +1238,11 @@ impl Workbench {
         &mut self,
     ) -> Result<(Vec<Value>, Option<&'static str>), String> {
         let mut targets = BTreeMap::<String, Value>::new();
-        let discovery_reason = self.integration_global_read_blocker();
+        let discovery_reason = if self.control_blocks_sync() {
+            Some("control_authorized_or_pending")
+        } else {
+            self.integration_global_read_blocker()
+        };
         if discovery_reason.is_none() {
             for device in crate::devices::discover()? {
                 let Some(serial) = device.serial else {

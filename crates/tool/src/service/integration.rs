@@ -44,6 +44,22 @@ struct Binding {
     expires_at: Option<Instant>,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct CheckedBinding {
+    pub(super) binding_id: String,
+    pub(super) target_id: String,
+    pub(super) uid: String,
+    pub(super) run_nonce: String,
+    pub(super) connection_generation: String,
+    pub(super) lease_ms: Option<u64>,
+}
+
+pub(super) struct BindingError {
+    pub(super) status: u16,
+    pub(super) code: &'static str,
+    pub(super) message: String,
+}
+
 pub(super) struct IntegrationState {
     token: String,
     pub(super) instance_id: String,
@@ -207,6 +223,112 @@ impl IntegrationState {
         let now = self.observation_now();
         self.bindings
             .retain(|_, binding| binding.expires_at.is_none_or(|deadline| deadline > now));
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_binding(&mut self, workbench: &mut Workbench, target_id: &str) -> String {
+        let session = workbench
+            .integration_session_mut(target_id)
+            .expect("synthetic owner");
+        let (uid, run_nonce) = session
+            .integration_identity()
+            .expect("verified synthetic identity");
+        let id = format!("{}-v2-b-{}", self.instance_id, self.next_binding);
+        self.next_binding += 1;
+        self.bindings.insert(
+            id.clone(),
+            Binding {
+                target_id: target_id.into(),
+                generation: session.connection_generation().to_string(),
+                identity: Identity { uid, run_nonce },
+                lease_ms: None,
+                expires_at: None,
+            },
+        );
+        id
+    }
+
+    pub(super) fn checked_current_binding(
+        &mut self,
+        binding_id: &str,
+        workbench: &mut Workbench,
+    ) -> Result<CheckedBinding, BindingError> {
+        self.reclaim_expired_observations();
+        let binding = self.bindings.get(binding_id).ok_or_else(|| BindingError {
+            status: 404,
+            code: "not_found",
+            message: "绑定不存在".into(),
+        })?;
+        let fields=crate::RawFields::parse(&json!({"instance_id":self.instance_id,"expected_identity":binding.identity.json(),"connection_generation":binding.generation}).to_string()).map_err(|error|BindingError {status:500,code:"bad_request",message:error.to_string()})?;
+        self.checked_binding(binding_id, &fields, workbench)
+    }
+
+    pub(super) fn checked_binding(
+        &mut self,
+        binding_id: &str,
+        fields: &crate::RawFields,
+        workbench: &mut Workbench,
+    ) -> Result<CheckedBinding, BindingError> {
+        self.reclaim_expired_observations();
+        let bad = |message| BindingError {
+            status: 400,
+            code: "bad_request",
+            message,
+        };
+        if fields.string("instance_id").map_err(bad)? != self.instance_id {
+            return Err(BindingError {
+                status: 409,
+                code: "instance_mismatch",
+                message: "工具实例已改变".into(),
+            });
+        }
+        let binding = self.bindings.get(binding_id).ok_or_else(|| BindingError {
+            status: 404,
+            code: "not_found",
+            message: "绑定不存在".into(),
+        })?;
+        let identity: Identity = fields.decode_field("expected_identity").map_err(bad)?;
+        let generation = fields.string("connection_generation").map_err(bad)?;
+        if identity != binding.identity || generation != binding.generation {
+            return Err(BindingError {
+                status: 409,
+                code: "binding_stale",
+                message: "绑定预期身份或代次不一致".into(),
+            });
+        }
+        let session = workbench
+            .integration_session_mut(&binding.target_id)
+            .ok_or_else(|| BindingError {
+                status: 409,
+                code: "binding_stale",
+                message: "owner 会话已改变".into(),
+            })?;
+        if !session.integration_connected()
+            || session.connection_generation().to_string() != generation
+        {
+            return Err(BindingError {
+                status: 409,
+                code: "binding_stale",
+                message: "连接代次已改变".into(),
+            });
+        }
+        if session.integration_identity().as_ref()
+            != Some(&(identity.uid.clone(), identity.run_nonce.clone()))
+        {
+            return Err(BindingError {
+                status: 409,
+                code: "identity_changed",
+                message: "运行身份已改变".into(),
+            });
+        }
+        Ok(CheckedBinding {
+            binding_id: binding_id.into(),
+            target_id: binding.target_id.clone(),
+            uid: identity.uid,
+            run_nonce: identity.run_nonce,
+            connection_generation: generation,
+            lease_ms: binding.lease_ms,
+        })
     }
 
     pub(super) fn shutdown_ready(&self) -> bool {
@@ -395,6 +517,14 @@ impl IntegrationState {
                     let Some(serial) = target_id.strip_prefix("usb:") else {
                         return self.error(request, 400, "bad_request", "只允许显式连接 USB 候选");
                     };
+                    if workbench.control_blocks_sync() {
+                        return self.error(
+                            request,
+                            409,
+                            "control_busy",
+                            "控制授权或工作尚未退出，拒绝新连接",
+                        );
+                    }
                     if workbench.integration_global_read_blocker().is_some() {
                         return self.error(
                             request,
@@ -601,6 +731,9 @@ impl IntegrationState {
                 "config_startup" => Command::ConfigRead {
                     view: "startup".into(),
                 },
+                "config_factory" if self.version == 2 => Command::ConfigRead {
+                    view: "factory".into(),
+                },
                 "config_user" => Command::ConfigRead {
                     view: "user".into(),
                 },
@@ -644,6 +777,26 @@ impl IntegrationState {
             );
             value["native_json_text"] =
                 json!(serde_json::to_string(&result.data).map_err(|error| error.to_string())?);
+            if self.version == 2
+                && matches!(action.as_str(), "config_user" | "config_startup")
+                && let Some(state) = workbench.mutations.as_mut()
+                && let Ok(member) = super::reservations::MemberKey::new(
+                    &self.instance_id,
+                    &binding.target_id,
+                    &binding.identity.uid,
+                    &binding.identity.run_nonce,
+                    &binding.generation,
+                )
+            {
+                state.note_config_read(
+                    &member,
+                    if action == "config_user" {
+                        "user"
+                    } else {
+                        "startup"
+                    },
+                );
+            }
             if action.starts_with("config_") {
                 value["data_utf8"] = result.data["data_utf8"].clone();
                 value["data_hex"] = result.data["data_hex"].clone();
@@ -900,6 +1053,14 @@ pub(super) mod tests {
             )?;
         } else {
             dispatch(server.recv()?, port, workbench, None)?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !client.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                return Err("HTTP fixture owner deadline exceeded".into());
+            }
+            workbench.tick();
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
         let response = client.join().map_err(|_| "client panic")??;
         let (head, body) = response.split_once("\r\n\r\n").ok_or("missing HTTP body")?;

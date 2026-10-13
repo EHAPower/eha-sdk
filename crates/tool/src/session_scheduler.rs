@@ -195,12 +195,26 @@ impl ToolSession {
     }
 
     pub(super) fn require_read_slot_idle(&self) -> Result<(), SessionError> {
-        if self.pending_read.is_some()
+        self.require_maintenance_idle()?;
+        if self.pending_control.is_some()
+            || self.pending_trial_target.is_some()
+            || self.pending_read.is_some()
             || self.pending_preflight.is_some()
             || self.pending_recording_start.is_some()
             || self.pending_trial_start.is_some()
         {
             let mut error = invalid("读取槽已占用；请先领取原读取的完成或取消结果");
+            error.kind = "busy".into();
+            error.local_stage = Some("not_submitted".into());
+            Err(error)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(super) fn require_maintenance_idle(&self) -> Result<(), SessionError> {
+        if self.maintenance_pending() {
+            let mut error = invalid("维护等待尚未结束");
             error.kind = "busy".into();
             error.local_stage = Some("not_submitted".into());
             Err(error)
@@ -294,7 +308,9 @@ mod tests {
                                     heartbeat_notified = true;
                                 }
                             }
-                            Message::Query { .. } | Message::ReadConfig { .. } => {
+                            Message::Query { .. }
+                            | Message::ReadConfig { .. }
+                            | Message::Position(_) => {
                                 sent.send(request).expect("pending request");
                             }
                             other => panic!("unexpected request: {other:?}"),
@@ -532,6 +548,7 @@ mod tests {
             settled_sample_time_us: None,
         });
         f.session.tick_at(started + Duration::from_millis(20));
+        super::super::trial_tests::settle_control(&mut f.session);
         assert_eq!(f.stops.load(Ordering::SeqCst), 1);
         let active = f
             .session
@@ -596,6 +613,7 @@ mod tests {
             let requested = flush_probe.load(Ordering::SeqCst) != 0;
             started + Duration::from_millis(if requested { 21 } else { 19 })
         });
+        super::super::trial_tests::settle_control(&mut f.session);
         assert_eq!(f.stops.load(Ordering::SeqCst), 1);
         let active = f
             .session
@@ -787,5 +805,132 @@ mod tests {
             matches!(f.session.poll_read(), Poll::Ready(Err(error)) if &*error.kind == "cancelled")
         );
         assert_eq!(f.stops.load(Ordering::SeqCst), 0);
+    }
+    #[test]
+    fn never_submitted_control_yields_then_fence_preserves_unknown_before_stop() {
+        let mut f = fixture();
+        f.session
+            .begin_control(Command::Position { mm: 1.0 })
+            .expect("begin target");
+        let taken = request(&f);
+        assert!(f.session.poll_control().is_pending());
+        assert!(
+            f.session.begin_control(Command::Stop).is_err(),
+            "terminal ownership must be drained by owner"
+        );
+        f.session.fence_control("explicit_stop");
+        assert!(
+            matches!(f.session.poll_control(),Poll::Ready(Err(error)) if &*error.kind=="result_unknown" && error.unknown && error.local_stage.as_deref()==Some("may_have_been_submitted"))
+        );
+        f.sink.submitted(taken.id); // late target completion cannot complete the new Stop.
+        f.session
+            .begin_control(Command::Stop)
+            .expect("Stop admitted");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match f.session.poll_control() {
+                Poll::Ready(result) => {
+                    assert_eq!(result.expect("Stop local").action, "stop");
+                    break;
+                }
+                Poll::Pending => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(f.stops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn group_audit_is_admission_only_and_fence_invalidates_its_release_token() {
+        use super::super::trial_tests::{FixtureBehavior, session_fixture};
+        let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+        let request = trial();
+        session.prepare_trial(&request).expect("preflight");
+        session
+            .begin_trial_audit(request.clone())
+            .expect("audit begin");
+        assert!(matches!(session.poll_trial_audit(), Poll::Ready(Ok(()))));
+        assert_eq!(probe.observed.lock().expect("observed").targets, 0);
+        assert!(session.poll_trial_start().is_ready());
+        assert_eq!(
+            probe.observed.lock().expect("observed").targets,
+            0,
+            "wrong poll cannot release target"
+        );
+        session.fence_control("alias_stop");
+        assert!(session.begin_trial_start(request).is_err());
+        assert!(
+            matches!(session.poll_trial_audit(),Poll::Ready(Err(error)) if error.local_stage.as_deref()==Some("not_submitted"))
+        );
+        assert_eq!(probe.observed.lock().expect("observed").targets, 0);
+    }
+
+    #[test]
+    fn audited_trial_and_target_report_only_the_actual_local_submission() {
+        use super::super::trial_tests::{FixtureBehavior, session_fixture};
+        let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+        let request = trial();
+        session.prepare_trial(&request).expect("preflight");
+        session.begin_trial_audit(request.clone()).expect("audit");
+        assert!(matches!(session.poll_trial_audit(), Poll::Ready(Ok(()))));
+        session
+            .begin_trial_start(request)
+            .expect("release audited request");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match session.poll_trial_start() {
+                Poll::Ready(result) => {
+                    result.expect("initial submitted");
+                    break;
+                }
+                Poll::Pending => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(probe.observed.lock().expect("observed").targets, 1);
+        session
+            .trial
+            .active
+            .as_mut()
+            .expect("active trial")
+            .last_position_submit = None;
+        session.begin_trial_target(2.0).expect("position accepted");
+        assert!(
+            session.poll_trial_target().is_pending(),
+            "first step only queues local submission"
+        );
+        loop {
+            match session.poll_trial_target() {
+                Poll::Ready(result) => {
+                    assert!(result.expect("target submitted").local_submission.is_some());
+                    break;
+                }
+                Poll::Pending => {
+                    assert!(Instant::now() < deadline);
+                    std::thread::yield_now();
+                }
+            }
+        }
+        assert_eq!(
+            probe.observed.lock().expect("observed").positions,
+            vec![1.0, 2.0]
+        );
+        assert!(
+            !session.pending_target,
+            "trial lifetime owns its target; generic unknown flag is unchanged"
+        );
+        session.begin_trial_target(3.0).expect("next accepted");
+        session.fence_control("alias_stop");
+        assert!(
+            matches!(session.poll_trial_target(),Poll::Ready(Err(error)) if error.local_stage.as_deref()==Some("not_submitted"))
+        );
+        assert_eq!(
+            probe.observed.lock().expect("observed").positions,
+            vec![1.0, 2.0]
+        );
     }
 }

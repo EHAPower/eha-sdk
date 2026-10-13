@@ -206,6 +206,9 @@ fn controlled_client() -> (
                 }
                 Command::Close => break,
                 Command::Heartbeat(_) => {}
+                Command::CancellableSend(_, _) => {
+                    panic!("read-only fixture does not drive async control")
+                }
             }
         }
     })

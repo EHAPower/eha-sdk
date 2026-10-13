@@ -304,6 +304,34 @@ impl Recording {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_stalled_finish(
+        root: &Path,
+    ) -> (Self, mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let mut count = 0;
+        let writer = Writer::spawn(16, move || {
+            count += 1;
+            if count == 2 {
+                entered.send(()).expect("entered finish");
+                release_rx.recv().expect("release finish");
+            }
+        })
+        .expect("test writer");
+        let mut recording = Self::begin_with_writer(root, json!({}), writer).expect("recording");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if let Poll::Ready(result) = recording.poll_started() {
+                result.expect("started");
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        (recording, entered_rx, release)
+    }
+
+    #[cfg(test)]
     pub(crate) fn poll_started(&mut self) -> Poll<Result<Value, String>> {
         match self.progress() {
             Poll::Pending => Poll::Pending,

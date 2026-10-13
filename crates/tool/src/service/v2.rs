@@ -44,6 +44,15 @@ pub(super) fn describe(instance_id: &str, response_bytes: usize, max_bindings: u
         "read_diagnostics",
         "read_config_startup",
         "read_config_user",
+        "read_config_factory",
+        "config_schema",
+        "config_validate",
+        "maintenance",
+        "maintenance_permissions",
+        "maintenance_reservations",
+        "operation_ids",
+        "operation_read",
+        "async_reads",
         "managed_profiles",
         "usb_profiles",
         "advanced_can",
@@ -57,20 +66,35 @@ pub(super) fn describe(instance_id: &str, response_bytes: usize, max_bindings: u
         "read_jobs"
     ]);
     value["limits"] = json!({"request_bytes":65536,"response_bytes":response_bytes,
-        "sdk_read_timeout_ms":5000,"max_bindings":max_bindings,"shutdown_response_grace_ms":500,
+        "sdk_read_timeout_ms":5000,"max_maintenance_reservations":16,"max_mutation_members":1,"max_operation_tickets":32,"max_normal_operations":32,"max_stop_scopes":16,"operation_receipt_retention_ms":30000,"max_maintenance_readbacks":16,"operation_ticket_ttl_ms":30000,"control_max_group_members":16,"max_bindings":max_bindings,"shutdown_response_grace_ms":500,
         "event_max_events":4096,"event_max_bytes":4194304,"event_max_batch":100,"event_retention_ms":30000,
         "event_max_payload_bytes":8192,"max_connections":16,"scan_max_nodes":16,"job_history":16,
         "recording_metadata_total_bytes":262144,"recording_max_runs":128,"recording_max_entries":1024,"recording_chunk_bytes":65536,
         "http_max_connections":64,"http_body_wire_bytes":8388608,"http_header_bytes":16384,"http_response_workers":16,"http_pending_requests":64,"http_io_deadline_ms":super::http_io::IO_DEADLINE_MS,"binding_lease_min_ms":integration::MIN_LEASE_MS,"binding_lease_max_ms":integration::MAX_LEASE_MS});
+    if super::control::RELEASED {
+        value["capabilities"]
+            .as_array_mut()
+            .expect("capability array")
+            .extend(
+                [
+                    "control",
+                    "control_groups",
+                    "trials",
+                    "recording_write",
+                    "control_scopes",
+                ]
+                .map(|name| json!(name)),
+            );
+    }
     value["limitations"] = json!({
-        "mutations_supported":false,"control_supported":false,
-        "can_connect_supported":true,"can_attach_existing_session_only":false,"recording_write_supported":false,
+        "device_execution_confirmation":false,"mutations_supported":true,"maintenance_supported":true,"control_supported":super::control::RELEASED,
+        "can_connect_supported":true,"can_attach_existing_session_only":false,"recording_write_supported":super::control::RELEASED,
         "read_gate":"existing_global_readonly_gate",
         "control_effect_evidence":"unresolved_target_latch_only",
-        "sdk_read_execution":"synchronous_owner_loop",
+        "sdk_read_execution":"unique_client_begin_poll",
         "shutdown_stops_devices":false,"shutdown_response_delivery":"bounded_best_effort",
         "instance_liveness":"authenticated_describe_instance_match",
-        "mutation_ledger_supported":false
+        "mutation_ledger_supported":true
     });
     value
 }
@@ -100,7 +124,7 @@ pub(super) fn validate_version(fields: &mut crate::RawFields) -> Result<(), Stri
 
 pub(super) fn snapshot_permits(value: &mut Value, blocker: Option<&str>, unresolved_target: bool) {
     value["read_permit"] = json!({"ready":blocker.is_none(),"reason_code":blocker});
-    // 读取成功和遥测 Idle 都不能证明历史控制效果；此阶段没有 mutation ledger。
+    // 读取成功和遥测 Idle 都不能证明历史控制效果；原操作账本独立保留，不因本次观察改写。
     value["control_effect"] = json!({
         "state":if unresolved_target { "unknown" } else { "not_observed" },
         "reason_code":if unresolved_target { Some("unresolved_target") } else { None }
@@ -141,6 +165,53 @@ pub(super) fn dispatch(
             .and_then(|value| integration::respond(request, 200, value))
     } else if path == "/service/v2/shutdown" && method == Method::Post {
         shutdown(request, &mut state, workbench, parsed_body)
+    } else if method == Method::Post
+        && !super::stop_body::is_stop_path(&path)
+        && scan.busy
+        && (super::control::handles(&path)
+            || super::control_groups::handles(&path)
+            || path.ends_with("/permissions"))
+    {
+        integration::respond_error(
+            request,
+            Some(&state),
+            409,
+            "scan_busy",
+            "等待扫描结束后再明确控制",
+        )
+    } else if method == Method::Post
+        && workbench.control_blocks_sync()
+        && (path == "/service/v2/connections"
+            || path.starts_with("/service/v2/connections/")
+            || path == "/service/v2/scans")
+    {
+        integration::respond_error(
+            request,
+            Some(&state),
+            409,
+            "control_busy",
+            "控制或未决效果期间不执行同步连接；先处理原控制范围",
+        )
+    } else if super::control::handles(&path) || super::control_groups::handles(&path) {
+        super::control::dispatch(request, &mut state, workbench, parsed_body)
+    } else if super::control_reads::handles(&path)
+        && (scan.busy
+            || workbench
+                .p2
+                .as_ref()
+                .is_some_and(super::p2::State::connection_busy))
+    {
+        integration::respond_error(
+            request,
+            Some(&state),
+            409,
+            "busy",
+            "CAN 扫描或连接期间拒绝新主动读取",
+        )
+    } else if super::control_reads::handles(&path) {
+        super::control_reads::dispatch(request, &mut state, workbench, parsed_body)
+    } else if super::maintenance::handles(&path) {
+        super::maintenance::dispatch(request, &mut state, workbench, parsed_body)
     } else if super::p2::handles(&path) {
         super::p2::dispatch(request, &state, workbench, odrive, scan, parsed_body)
     } else if (scan.busy
@@ -202,7 +273,7 @@ fn instance_status(
     value["activity"] = json!({"trial_active":workbench.has_active_trial(),
         "trial_unresolved":workbench.has_pending_interrupted_trial(),"read_blocker":read_blocker});
     value["control_effect"] = json!({"state":if pending_target { "unknown" } else { "not_observed" },
-        "reason_code":if pending_target { Some("unresolved_target") } else { None },"mutation_ledger_supported":false});
+        "reason_code":if pending_target { Some("unresolved_target") } else { None },"mutation_ledger_supported":true});
     value["device_stop_requested"] = json!(false);
     value["message"] = json!(
         "退出只结束服务会话，不请求设备 Stop；活动心跳、试验、记录和未决效果须由人工判断，不能据此认定设备已停止。"
@@ -456,13 +527,21 @@ mod tests {
             assert_eq!(value["api_version"], 2);
             assert_eq!(value["instance_id"], "i-test");
             if status == 200 {
-                assert_eq!(value["limitations"]["control_supported"], false);
-                assert!(
-                    !value["capabilities"]
-                        .as_array()
-                        .expect("capabilities")
-                        .contains(&json!("stop"))
-                );
+                assert_eq!(value["limitations"]["control_supported"], true);
+                for capability in [
+                    "control",
+                    "control_groups",
+                    "trials",
+                    "recording_write",
+                    "control_scopes",
+                ] {
+                    assert!(
+                        value["capabilities"]
+                            .as_array()
+                            .expect("capabilities")
+                            .contains(&json!(capability))
+                    );
+                }
             }
         }
         let attach = attach_fields(&mut workbench);
@@ -574,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn reads_preserve_native_json_and_only_allow_five_actions() {
+    fn reads_preserve_native_json_and_only_allow_six_read_actions() {
         let (mut workbench, probe) = fixture();
         probe.inject_idle(31);
         for _ in 0..20 {
@@ -610,7 +689,7 @@ mod tests {
                 "expected_identity":fields["expected_identity"],"connection_generation":fields["connection_generation"]});
             let (status, value) =
                 call(&mut workbench, "POST", &path, Some(read), true, false).expect("read");
-            if matches!(action, "stop" | "config_factory") {
+            if action == "stop" {
                 assert_eq!(status, 400);
                 continue;
             }

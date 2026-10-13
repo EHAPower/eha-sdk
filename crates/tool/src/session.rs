@@ -25,6 +25,16 @@ use eha_sdk::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[path = "session_retirement.rs"]
+mod retirement;
+
+#[path = "session_control.rs"]
+mod control;
+
+#[path = "session_maintenance.rs"]
+mod maintenance;
+pub(crate) use maintenance::{MaintenanceCompletion, MaintenancePhase};
+
 #[path = "recording.rs"]
 mod recording;
 #[path = "session_recording.rs"]
@@ -428,10 +438,13 @@ pub struct ToolSession {
     client: Option<Client>,
     // 字段 drop 顺序保证 Backend 关闭并 join worker 后才释放 USB 通路。
     usb_owner: Option<OwnerGuard>,
+    retirement_slot: Option<retirement::RetirementSlot>,
+    retiring: Option<retirement::Retirement>,
     disconnected: Option<ClientState>,
     timeout: Duration,
     identity: Option<Reply>,
     last_telemetry: Option<Reply>,
+    observed: Option<eha_sdk::host::ClientObservation>,
     last_status: Option<Reply>,
     last_measurements: Option<Reply>,
     last_diagnostics: Option<Reply>,
@@ -449,6 +462,24 @@ pub struct ToolSession {
     pending_recording_finish: Option<recording_tasks::RecordingFinish>,
     pending_trial_start: Option<recording_tasks::TrialStart>,
     position_audit: Option<(f32, u64)>,
+    position_submission_mm: Option<f32>,
+    maintenance_pending: Option<maintenance::Pending>,
+    pending_control: Option<control::PendingControl>,
+    pending_trial_target: Option<control::TrialTarget>,
+}
+
+impl Drop for ToolSession {
+    fn drop(&mut self) {
+        if let Some(slot) = self.retirement_slot.take()
+            && let Some(client) = self.client.take()
+        {
+            drop(retirement::Retirement::begin(
+                client,
+                self.usb_owner.take(),
+                slot,
+            ));
+        }
+    }
 }
 
 impl Default for ToolSession {
@@ -472,10 +503,13 @@ impl ToolSession {
             request: None,
             client: None,
             usb_owner: None,
+            retirement_slot: None,
+            retiring: None,
             disconnected: None,
             timeout: Duration::from_secs(5),
             identity: None,
             last_telemetry: None,
+            observed: None,
             last_status: None,
             last_measurements: None,
             last_diagnostics: None,
@@ -493,6 +527,10 @@ impl ToolSession {
             pending_recording_finish: None,
             pending_trial_start: None,
             position_audit: None,
+            position_submission_mm: None,
+            maintenance_pending: None,
+            pending_control: None,
+            pending_trial_target: None,
         }
     }
 
@@ -513,6 +551,8 @@ impl ToolSession {
 
     /// 打开、核对 Identity 并保留同一 Client，期间不启动心跳或发送控制。
     pub fn connect(&mut self, mut request: ConnectionRequest) -> Result<Snapshot, SessionError> {
+        self.require_maintenance_idle()?;
+        self.require_retirement_idle()?;
         if self.trial.active.is_some() {
             return Err(invalid("试验进行中；拒绝切换连接"));
         }
@@ -526,6 +566,7 @@ impl ToolSession {
         self.clear_observations();
         let mut connector = connector_for(&request)?;
         let owner = connector.acquire_usb_owner(&request)?;
+        let retirement_slot = retirement::RetirementSlot::reserve().map_err(invalid)?;
         let backend = connector.open().map_err(open_error)?;
         let mut client = Client::new(backend);
         if let Some(capacity) = self.telemetry_queue_capacity {
@@ -548,6 +589,7 @@ impl ToolSession {
         self.request = Some(request);
         self.connector = Some(connector);
         self.client = Some(client);
+        self.retirement_slot = Some(retirement_slot);
         self.usb_owner = owner;
         self.disconnected = None;
         self.disconnected_reason = None;
@@ -560,6 +602,8 @@ impl ToolSession {
         mut request: ConnectionRequest,
         connector: CanNodeConnector,
     ) -> Result<Snapshot, SessionError> {
+        self.require_maintenance_idle()?;
+        self.require_retirement_idle()?;
         if self.trial.active.is_some() {
             return Err(invalid("试验进行中；拒绝切换连接"));
         }
@@ -575,6 +619,7 @@ impl ToolSession {
         self.connection_generation = next_connection_generation();
         self.clear_observations();
         let mut shared = Connector::SharedCan(connector);
+        let retirement_slot = retirement::RetirementSlot::reserve().map_err(invalid)?;
         let backend = shared.open().map_err(open_error)?;
         let mut client = Client::new(backend);
         if let Some(capacity) = self.telemetry_queue_capacity {
@@ -597,6 +642,7 @@ impl ToolSession {
         self.request = Some(request);
         self.connector = Some(shared);
         self.client = Some(client);
+        self.retirement_slot = Some(retirement_slot);
         self.disconnected = None;
         self.disconnected_reason = None;
         Ok(self.snapshot())
@@ -604,6 +650,8 @@ impl ToolSession {
 
     /// 只关闭本地 I/O 并保存 ClientState；不发送 Stop、Reset 或重放目标。
     pub fn disconnect(&mut self) -> Result<Snapshot, SessionError> {
+        self.require_maintenance_idle()?;
+        self.require_retirement_idle()?;
         if self.trial.active.is_some() {
             return Err(invalid("试验进行中；普通 disconnect 不停止也不切换设备"));
         }
@@ -622,12 +670,15 @@ impl ToolSession {
         self.capture_telemetry(&client);
         self.disconnected_reason = client.connection_status().disconnected;
         self.disconnected = Some(client.disconnect());
+        self.retirement_slot = None;
         self.usb_owner = None;
         Ok(self.snapshot())
     }
 
     /// 在同一个 Connector 上恢复传输编号和业务关联，随后重新核对 Identity。
     pub fn reconnect(&mut self) -> Result<Snapshot, SessionError> {
+        self.require_maintenance_idle()?;
+        self.require_retirement_idle()?;
         if self
             .client
             .as_ref()
@@ -647,6 +698,7 @@ impl ToolSession {
             self.capture_telemetry(&client);
             self.disconnected_reason = client.connection_status().disconnected;
             self.disconnected = Some(client.disconnect());
+            self.retirement_slot = None;
             self.usb_owner = None;
         }
         let previous = self.identity.as_ref().and_then(identity_facts);
@@ -659,6 +711,7 @@ impl ToolSession {
                     .as_ref()
                     .ok_or_else(|| invalid("没有连接请求"))?,
             )?;
+        let retirement_slot = retirement::RetirementSlot::reserve().map_err(invalid)?;
         let state = self
             .disconnected
             .take()
@@ -710,6 +763,7 @@ impl ToolSession {
         self.identity = Some(identity);
         self.reconcile_interrupted_trial();
         self.client = Some(client);
+        self.retirement_slot = Some(retirement_slot);
         self.usb_owner = owner;
         self.disconnected_reason = None;
         Ok(self.snapshot())
@@ -736,57 +790,31 @@ impl ToolSession {
         self.retire_disconnected_usb();
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
-            let (heartbeat, transport, adapter, connection_status) = (
-                client.heartbeat_status(),
-                client.transport_status(),
-                client.adapter_status(),
-                client.connection_status(),
-            );
-            let snapshot = Snapshot {
-                connected: true,
-                connection: self.request.clone(),
-                identity: self
-                    .identity
-                    .as_ref()
-                    .and_then(|reply| reply_json(reply).ok()),
-                heartbeat: json!({
-                    "enabled": heartbeat.enabled,
-                    "submitted": heartbeat.submitted,
-                    "missed": heartbeat.missed,
-                    "error": heartbeat.error,
-                }),
-                transport: transport_json(&transport, connection_status.disconnected),
-                adapter: json!({"notices": adapter.notices, "last_notice": adapter.last_notice.as_ref().map(|(detail, raw, _)| json!({"detail": detail, "raw_hex": hex(raw)}))}),
-                telemetry: self
-                    .last_telemetry
-                    .as_ref()
-                    .and_then(|reply| reply_json(reply).ok()),
-                last_status: self
-                    .last_status
-                    .as_ref()
-                    .and_then(|reply| reply_json(reply).ok()),
-                last_measurements: self
-                    .last_measurements
-                    .as_ref()
-                    .and_then(|reply| reply_json(reply).ok()),
-                last_diagnostics: self
-                    .last_diagnostics
-                    .as_ref()
-                    .and_then(|reply| reply_json(reply).ok()),
-            };
             self.client = Some(client);
-            return snapshot;
         }
+        self.snapshot_cached()
+    }
+
+    fn snapshot_cached(&self) -> Snapshot {
+        let observation = self.observed.clone().unwrap_or_default();
+        let heartbeat = observation.heartbeat;
+        let adapter = observation.adapter;
         Snapshot {
-            connected: false,
+            connected: self.client.is_some(),
             connection: self.request.clone(),
             identity: self
                 .identity
                 .as_ref()
                 .and_then(|reply| reply_json(reply).ok()),
-            heartbeat: json!({"enabled": false, "submitted": 0, "missed": 0, "error": Value::Null}),
-            transport: json!({"disconnected": self.disconnected_reason}),
-            adapter: json!({}),
+            heartbeat: json!({"enabled":heartbeat.enabled,"submitted":heartbeat.submitted,"missed":heartbeat.missed,"error":heartbeat.error}),
+            transport: transport_json(
+                &observation.transport,
+                observation
+                    .connection
+                    .disconnected
+                    .or_else(|| self.disconnected_reason.clone()),
+            ),
+            adapter: json!({"notices":adapter.notices,"last_notice":adapter.last_notice.as_ref().map(|(detail,raw,_)|json!({"detail":detail,"raw_hex":hex(raw)}))}),
             telemetry: self
                 .last_telemetry
                 .as_ref()
@@ -1066,7 +1094,10 @@ impl ToolSession {
         let fresh = self
             .client
             .as_ref()
-            .and_then(Client::telemetry)
+            .and_then(|client| match client.try_observe(0) {
+                std::task::Poll::Ready(Ok(observed)) => observed.telemetry,
+                _ => None,
+            })
             .ok_or_else(|| invalid("开始试验前需要同一运行实例的新鲜被动遥测"))?;
         let fresh_value = reply_json(&fresh)?;
         validate_trial_facts(
@@ -1081,7 +1112,7 @@ impl ToolSession {
     fn start_prepared_trial_after_audit(
         &mut self,
         request: TrialRequest,
-    ) -> Result<Value, SessionError> {
+    ) -> Result<(), SessionError> {
         self.last_telemetry = Some(self.validate_prepared_trial_start(&request)?);
         let prepared = self
             .trial
@@ -1110,10 +1141,21 @@ impl ToolSession {
             stop_recovery_after_received_at: None,
             settled_sample_time_us: None,
         });
-        let result = match self.execute_trial_command(request.command.clone()) {
+        if let Err(error) = self.begin_initial_submission(request.command) {
+            self.trial.active = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn finish_initial_submission(
+        &mut self,
+        result: Result<CommandResult, SessionError>,
+    ) -> Result<Value, SessionError> {
+        let result = match result {
             Ok(result) => result,
             Err(error) => {
-                self.record_event("trial_command_error", json!({"error": &error}));
+                self.record_event("trial_command_error", json!({"error":&error}));
                 if error.local_stage.as_deref() == Some("not_submitted") {
                     self.trial.active = None;
                 } else {
@@ -1122,14 +1164,16 @@ impl ToolSession {
                 return Err(error);
             }
         };
+        if let Some(active) = self.trial.active.as_mut()
+            && matches!(active.request.command, Command::Position { .. })
+        {
+            active.last_position_submit = Some(Instant::now());
+        }
         self.record_event(
             "trial_command_submitted",
-            json!({
-                "local_submission": result.local_submission,
-                "data": result.data,
-            }),
+            json!({"local_submission":result.local_submission,"data":result.data}),
         );
-        Ok(json!({"submitted": result, "trial": self.trial_snapshot()}))
+        Ok(json!({"submitted":result,"trial":self.trial_snapshot()}))
     }
 
     pub fn start_trial(&mut self, request: TrialRequest) -> Result<Value, SessionError> {
@@ -1166,6 +1210,19 @@ impl ToolSession {
     pub fn stop_trial(&mut self) -> Result<Value, SessionError> {
         self.resume_interrupted_trial_for_stop()?;
         self.submit_trial_stop("explicit")?;
+        while self
+            .pending_control
+            .as_ref()
+            .is_some_and(|pending| pending.autonomous_stop)
+        {
+            match self.poll_control() {
+                std::task::Poll::Ready(result) => {
+                    result?;
+                    break;
+                }
+                std::task::Poll::Pending => std::thread::sleep(Duration::from_millis(1)),
+            }
+        }
         Ok(self.trial_snapshot())
     }
 
@@ -1187,10 +1244,14 @@ impl ToolSession {
         self.retire_disconnected_usb();
         if let Some(client) = self.client.take() {
             self.capture_telemetry(&client);
-            let disconnected = client.connection_status().disconnected;
+            let disconnected = self
+                .observed
+                .as_ref()
+                .and_then(|value| value.connection.disconnected.clone());
             self.client = Some(client);
             if let Some(reason) = disconnected {
                 self.end_read(Failure::Disconnected(reason.clone()));
+                self.fence_control("transport_disconnected");
                 if self.disconnected_reason.is_none() {
                     self.connection_generation = next_connection_generation();
                     self.disconnected_reason = Some(reason.clone());
@@ -1205,6 +1266,13 @@ impl ToolSession {
         if let Some(reason) = stop_reason {
             let _ = self.submit_trial_stop(&reason);
         }
+        if self
+            .pending_control
+            .as_ref()
+            .is_some_and(|pending| pending.autonomous_stop)
+        {
+            let _ = self.poll_control();
+        }
         self.flush_trial_position(now());
         self.observe_trial_stop();
         self.observe_stop_confirmation_deadline_at(now());
@@ -1213,22 +1281,48 @@ impl ToolSession {
 
     /// 断连通知可能早于 USB endpoint 清理；必须 drop/join Backend 后才能归还物理锁。
     /// 保留 ClientState 与原身份/未知试验，不自动 Stop、心跳或续接。
+    fn poll_retirement(&mut self) {
+        let Some(retiring) = self.retiring.as_mut() else {
+            return;
+        };
+        match retiring.poll() {
+            std::task::Poll::Ready(Ok(state)) => {
+                self.disconnected = Some(state);
+                self.retiring = None;
+            }
+            // Error is not physical completion. Keep the handle and its lease.
+            std::task::Poll::Ready(Err(_)) | std::task::Poll::Pending => {}
+        }
+    }
+
+    fn require_retirement_idle(&mut self) -> Result<(), SessionError> {
+        self.poll_retirement();
+        if self.retiring.is_some() {
+            Err(invalid("原 I/O owner 尚未完成关闭；不可开启新 Client"))
+        } else {
+            Ok(())
+        }
+    }
+
     fn retire_disconnected_usb(&mut self) {
+        self.poll_retirement();
         if self.usb_owner.is_none() {
             return;
         }
-        let Some(reason) = self
-            .client
-            .as_ref()
-            .and_then(|client| client.connection_status().disconnected)
-        else {
-            return;
-        };
-        self.end_read(Failure::Disconnected(reason.clone()));
         let Some(client) = self.client.take() else {
             return;
         };
         self.capture_telemetry(&client);
+        self.client = Some(client);
+        let Some(reason) = self
+            .observed
+            .as_ref()
+            .and_then(|o| o.connection.disconnected.clone())
+        else {
+            return;
+        };
+        self.end_read(Failure::Disconnected(reason.clone()));
+        self.fence_control("transport_disconnected");
         if self.disconnected_reason.is_none() {
             self.connection_generation = next_connection_generation();
         }
@@ -1237,8 +1331,21 @@ impl ToolSession {
         self.mark_interrupted_reconnect_required();
         self.trial.prepared = None;
         self.finish_recording_boundary("transport_disconnected");
-        self.disconnected = Some(client.disconnect());
-        self.usb_owner = None;
+        // Official connection paths reserve before open. Synthetic/legacy sessions
+        // may acquire here; on exhaustion keep their Client and physical owner.
+        if self.retirement_slot.is_none() {
+            self.retirement_slot = retirement::RetirementSlot::reserve().ok();
+        }
+        let Some(slot) = self.retirement_slot.take() else {
+            return;
+        };
+        let client = self.client.take().expect("live client checked");
+        self.retiring = Some(retirement::Retirement::begin(
+            client,
+            self.usb_owner.take(),
+            slot,
+        ));
+        self.poll_retirement();
     }
 
     fn trial_stop_reason(&mut self, now: Instant) -> Option<String> {
@@ -1324,6 +1431,22 @@ impl ToolSession {
     }
 
     fn flush_trial_position(&mut self, now: Instant) {
+        if self
+            .pending_control
+            .as_ref()
+            .is_some_and(|pending| pending.trial_position)
+        {
+            if let std::task::Poll::Ready(result) = self.poll_control() {
+                self.finish_position_submission(&result);
+                if let Some(target) = self.pending_trial_target.as_mut() {
+                    target.result = Some(result);
+                }
+            }
+            return;
+        }
+        if self.pending_control.is_some() {
+            return;
+        }
         let position = {
             let Some(active) = self.trial.active.as_ref() else {
                 return;
@@ -1375,11 +1498,29 @@ impl ToolSession {
             }
         }
         self.position_audit = None;
-        let result = self.execute_trial_command(Command::Position { mm });
+        if let Err(error) = self.begin_position_submission(mm) {
+            let result = Err(error);
+            self.finish_position_submission(&result);
+            if let Some(target) = self.pending_trial_target.as_mut() {
+                target.result = Some(result);
+            }
+        }
+    }
+
+    fn finish_position_submission(&mut self, result: &Result<CommandResult, SessionError>) {
+        let mm = self.position_submission_mm.take();
+        let Some(mm) = mm else {
+            return;
+        };
         match result {
             Ok(result) => {
                 if let Some(active) = self.trial.active.as_mut() {
-                    active.pending_position_mm = None;
+                    if active
+                        .pending_position_mm
+                        .is_some_and(|pending| pending.to_bits() == mm.to_bits())
+                    {
+                        active.pending_position_mm = None;
+                    }
                     active.last_position_submit = Some(Instant::now());
                     active.request.command = Command::Position { mm };
                     active.settled_since = None;
@@ -1402,51 +1543,23 @@ impl ToolSession {
     }
 
     fn submit_trial_stop(&mut self, reason: &str) -> Result<(), SessionError> {
-        self.position_audit = None;
-        let baseline = self
-            .last_telemetry
+        let active = self
+            .trial
+            .active
             .as_ref()
-            .and_then(|reply| reply_json(reply).ok())
-            .and_then(|value| value["sample"]["snapshot_time_us"].as_u64())
-            .unwrap_or(0);
-        {
-            let active = self
-                .trial
-                .active
-                .as_mut()
-                .ok_or_else(|| invalid("当前没有进行中的试验"))?;
-            if active.stop_submission.is_some() {
-                return Ok(());
-            }
-            active.pending_position_mm = None;
+            .ok_or_else(|| invalid("当前没有进行中的试验"))?;
+        if active.stop_submission.is_some() {
+            return Ok(());
+        }
+        self.fence_control(reason);
+        let result = self.begin_control(Command::Stop);
+        if let Some(active) = self.trial.active.as_mut() {
             active.stop_reason = Some(reason.into());
-            active.stop_after_sample_time_us = Some(baseline);
         }
-        self.record_event("trial_stop_input", json!({"reason": reason}));
-        match self.execute_trial_command(Command::Stop) {
-            Ok(result) => {
-                let submission = json!({
-                    "local_submission": result.local_submission,
-                    "data": result.data,
-                    "device_execution": "awaiting_new_telemetry",
-                });
-                if let Some(active) = self.trial.active.as_mut() {
-                    active.stop_submission = Some(submission.clone());
-                    active.stop_attempt_finished_at = Some(Instant::now());
-                }
-                self.record_event("trial_stop_submitted", submission);
-                Ok(())
-            }
-            Err(error) => {
-                let failure = json!({"error": &error, "device_execution": "unknown_no_retry"});
-                if let Some(active) = self.trial.active.as_mut() {
-                    active.stop_submission = Some(failure.clone());
-                    active.stop_attempt_finished_at = Some(Instant::now());
-                }
-                self.record_event("trial_stop_error", failure);
-                Err(error)
-            }
+        if let Some(pending) = self.pending_control.as_mut() {
+            pending.autonomous_stop = true;
         }
+        result
     }
 
     fn observe_stop_confirmation_deadline(&mut self) {
@@ -1550,14 +1663,6 @@ impl ToolSession {
         }
     }
 
-    fn execute_trial_command(&mut self, command: Command) -> Result<CommandResult, SessionError> {
-        let original = self.timeout;
-        self.timeout = original.min(Duration::from_millis(100));
-        let result = self.execute_inner(command);
-        self.timeout = original;
-        result
-    }
-
     fn wait(&self) -> Wait {
         Wait::new(self.timeout)
     }
@@ -1565,6 +1670,7 @@ impl ToolSession {
     fn clear_observations(&mut self) {
         self.identity = None;
         self.last_telemetry = None;
+        self.observed = None;
         self.last_status = None;
         self.last_measurements = None;
         self.last_diagnostics = None;
@@ -1575,15 +1681,21 @@ impl ToolSession {
     }
 
     fn capture_telemetry(&mut self, client: &Client) {
-        let trend_source = self.trend_source();
-        let drained = self
-            .telemetry_queue_capacity
-            .map(|_| client.drain_telemetry());
-        if let (Some(trend), Some(drained)) = (self.telemetry_trend.as_mut(), drained.as_ref()) {
-            trend.set_source(trend_source);
-            trend.record(drained.replies.clone(), drained.dropped);
-        }
-        if let Some(drained) = drained {
+        let budget = if self.telemetry_queue_capacity.is_some() {
+            64
+        } else {
+            0
+        };
+        let std::task::Poll::Ready(Ok(mut observation)) = client.try_observe(budget) else {
+            return;
+        };
+        let drained = std::mem::take(&mut observation.drained);
+        if self.telemetry_queue_capacity.is_some() {
+            let trend_source = self.trend_source();
+            if let Some(trend) = self.telemetry_trend.as_mut() {
+                trend.set_source(trend_source);
+                trend.record(drained.replies.clone(), drained.dropped);
+            }
             if drained.dropped != 0 {
                 self.record_telemetry_dropped(drained.dropped);
             }
@@ -1592,16 +1704,15 @@ impl ToolSession {
                 match reply_json(&reply) {
                     Ok(value) => self.record_telemetry(&value, std::mem::take(&mut gap)),
                     Err(error) => {
-                        self.record_event("telemetry_decode_error", json!({"error": error}))
+                        self.record_event("telemetry_decode_error", json!({"error":error}))
                     }
                 }
             }
         }
-        if let Some(reply) = client.telemetry()
-            && reply_json(&reply).is_ok()
-        {
+        if let Some(reply) = observation.telemetry.clone() {
             self.last_telemetry = Some(reply);
         }
+        self.observed = Some(observation);
     }
 
     pub(crate) fn connection_generation(&self) -> u64 {
@@ -1618,9 +1729,28 @@ impl ToolSession {
     }
 
     pub(crate) fn integration_connected(&self) -> bool {
-        self.client
-            .as_ref()
-            .is_some_and(|client| client.connection_status().disconnected.is_none())
+        let Some(client) = self.client.as_ref() else {
+            return false;
+        };
+        self.connection_observation_connected(client.try_observe(0))
+    }
+
+    fn connection_observation_connected(
+        &self,
+        observation: std::task::Poll<Result<eha_sdk::host::ClientObservation, SdkError>>,
+    ) -> bool {
+        match observation {
+            std::task::Poll::Ready(Ok(observed)) => observed.connection.disconnected.is_none(),
+            std::task::Poll::Pending => {
+                self.client.is_some()
+                    && self.disconnected_reason.is_none()
+                    && self
+                        .observed
+                        .as_ref()
+                        .is_none_or(|observed| observed.connection.disconnected.is_none())
+            }
+            std::task::Poll::Ready(Err(_)) => false,
+        }
     }
 
     pub(crate) fn integration_pending_target(&self) -> bool {
@@ -1656,10 +1786,13 @@ impl ToolSession {
         let Some(client) = self.client.as_ref() else {
             return Some("transport_unknown");
         };
-        if client.connection_status().disconnected.is_some() {
+        let std::task::Poll::Ready(Ok(observed)) = client.try_observe(0) else {
+            return Some("observation_busy");
+        };
+        if observed.connection.disconnected.is_some() {
             return Some("transport_unknown");
         }
-        if client.heartbeat_status().enabled {
+        if observed.heartbeat.enabled {
             return Some("heartbeat_active");
         }
         let Some(reply) = self.last_telemetry.as_ref() else {
@@ -1814,10 +1947,7 @@ impl ToolSession {
         let Some(mut interrupted) = self.trial.interrupted.take() else {
             return Ok(());
         };
-        let same_instance = self
-            .client
-            .as_ref()
-            .is_some_and(|client| client.connection_status().disconnected.is_none())
+        let same_instance = self.integration_connected()
             && self
                 .identity
                 .as_ref()
@@ -2766,6 +2896,15 @@ mod tests {
                 assert!(!session.snapshot().connected);
             }
             assert!(observer.join().expect("观察线程"), "物理清理完成前仍排他");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while session.retiring.is_some() {
+                session.poll_retirement();
+                assert!(
+                    Instant::now() < deadline,
+                    "retirement completion not observed"
+                );
+                std::thread::yield_now();
+            }
             assert!(
                 physical_done.load(Ordering::SeqCst),
                 "释放owner前已完成worker join"

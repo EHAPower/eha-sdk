@@ -321,14 +321,14 @@ message:string,unknown:boolean,error_json_text:string|null}]}`。部分失败仍
 
 | 请求 | 冻结语义 |
 | --- | --- |
-| `POST /service/v2/control-reservations`、`DELETE /service/v2/control-reservations/{id}` | 明确申请或释放单台/群组控制占用。多个观察 binding 可以共存，每台设备至多一个写入者；释放不等于 Stop。|
-| `POST /service/v2/bindings/{id}/heartbeat` | 固定 `start`、`stop`、`once`。停止心跳与停止控制是不同动作。|
-| `POST /service/v2/bindings/{id}/target` | 固定 position、velocity、force、impedance 持续目标；到位、UI 超时、解绑、窗口关闭均不结束目标。|
+| `POST /service/v2/control-reservations`、`DELETE /service/v2/control-reservations/{id}` | 明确申请或释放单台控制占用，群组通过 groups 创建。多个观察 binding 可以共存，每台设备至多一个写入者；释放不等于 Stop。|
+| `POST /service/v2/bindings/{id}/controls` | 固定 `heartbeat_start`、`heartbeat_stop`、`heartbeat_once`。停止心跳与停止控制是不同动作。|
+| `POST /service/v2/bindings/{id}/controls` | 固定 position、velocity、force、impedance 持续目标；到位、UI 超时、解绑、窗口关闭均不结束目标。|
 | `POST /service/v2/bindings/{id}/stop` | 显式普通 Stop，走独立高优先级受理路径；其本地提交和后续停止观测分开报告。|
 | `POST /service/v2/bindings/{id}/trials`、`POST /service/v2/bindings/{id}/trials/{trial_id}/stop`、`POST /service/v2/bindings/{id}/trials/{trial_id}/target` | 复用已有有界试验、位置更新和 Stop 确认语义。|
 | `POST /service/v2/groups`、`DELETE /service/v2/groups/{id}` | 创建或释放固定成员引用；释放不 Stop、不断连。|
-| `POST /service/v2/groups/{id}/trials`、`POST /service/v2/groups/{id}/stop`、`POST /service/v2/groups/{id}/heartbeat` | 显式成员集合，逐设备报告准备、提交、停止与未知状态；不承诺设备侧原子性。|
-| `POST /service/v2/bindings/{id}/recording` | 显式开始/结束服务侧记录；不从绘图状态推断。|
+| `POST /service/v2/groups/{id}/trials`、`POST /service/v2/groups/{id}/stop`、`POST /service/v2/groups/{id}/controls` | 显式成员集合，逐设备报告准备、提交、停止与未知状态；不承诺设备侧原子性。|
+| `POST /service/v2/bindings/{id}/recording/start`、`/recording/stop` | 显式开始/结束服务侧记录；不从绘图状态推断。|
 
 权限在服务后端检查，默认只读。用户只在明确对指定目标启用维护或控制能力后，固定表单和对话
 才可调用对应接口；对话的可信归属来自 Fieldkit `exec.agent.id`，不能由模型参数替换。binding、
@@ -382,3 +382,83 @@ HTTP 限定 literal loopback IP、固定路径、无代理/Origin/redirect、16 
 
 `/integration/v1` 在其公布的兼容期内保持原协议。它不自动升级为 v2，也不因删除 HTML
 而提前破坏。P6 删除旧页面前，所有仍受支持的客户端都必须已迁移或有明确发布处置。
+
+### P4 控制 owner 接入合同
+
+以下路由使用唯一 Workbench owner 的有界 continuation，发布前 `control_enabled=false`，不得凭本段启用真实设备控制。v1 的主动读取门禁不改变。所有变更请求继承 `api_version:2` 与 `instance_id`；以下 `R` 表示 `{expected_identity:{uid,run_nonce},connection_generation}`，所有身份和代次为字符串。默认权限为只读；控制授权后预分配 canonical Stop 编号，Stop 不需要调用者持有 writer reservation。
+
+* 单成员 `POST /bindings/{id}/controls`：`R,reservation_id,claimant_id,request_id,command`。`command` 只允许 `heartbeat_start/heartbeat_stop/heartbeat_once`、`position{mm}`、`velocity{mm_s}`、`force{n}`、`impedance{equilibrium_mm,stiffness_n_per_mm,damping_ns_per_mm}`，每项带 `action`。未知字段拒绝。
+* `POST /bindings/{id}/trials`：同上公共字段加 `trial`。trial 精确复用 SDK `TrialRequest`：`command`、`envelope`、`duration_s:number|null`、`reach:null|{tolerance_mm:number,settle_ms:u64}`。envelope 必含 `position_min_mm,position_max_mm,velocity_abs_max_mm_s,force_abs_max_n,stiffness_max_n_per_mm,damping_max_ns_per_mm,duration_max_s`。试验 ID 是开始操作的 request_id。开始先异步 Startup/Status 预检，再等待记录审计屏障，最后提交目标。
+* `POST /bindings/{id}/trials/{trial_id}/target`：公共字段加 `mm`，原试验编号、成员和代次不可替换；回执须等待 SDK 20 Hz 合并、审计和实际本地提交结果，不能把仅合并目标称作提交。
+* `POST /bindings/{id}/recording/start`、`/recording/stop`：仅公共字段；路径由服务选择，不接受用户文件路径。停止记录不请求设备 Stop。
+* `POST /bindings/{id}/stop` 与 `/bindings/{id}/trials/{trial_id}/stop`：`R,claimant_id,request_id`，不带 reservation_id。两条路由使用同一 canonical Stop action/编号；trial 路径额外验证原试验。Stop 先在同 UID/run 的所有 alias 上 fence 旧生产者，再于当前有界步骤之后的下一调度步尝试唯一 SDK 提交；不等待普通读取完整超时。重复请求只返回原回执。未认证请求不能占用专用 Stop reader；大于 1024 字节的 Stop JSON 进入独立的容量 8 reader/completion 队列。
+
+控制端点首次接纳返回 202 `{operation,new_submission:true}`；相同原始参数重放返回 200 `new_submission:false`。`GET /operations/{id}` 复用 P3 的唯一账本，动作包括 `heartbeat_start/heartbeat_stop/heartbeat_once/position/velocity/force/impedance/trial_start/trial_target/recording_start/recording_stop/stop`。submission 为 `not_attempted/not_submitted/locally_submitted/unknown`，control_effect 为 `not_attempted/not_applicable/known/unresolved`；known 仅表示该操作本地结果已知，不表示停止或机械安全。未知原操作不可被成功读取、Idle 遥测或新操作覆盖。额外白名单事实为 `phase`、`stop_attempt_delay_ms:string|null`、`trial_id:string|null`、`recording_id:string|null`。
+
+业务数字在 JSON 中是原始 number token；消费者编辑器可保留十进制文本，但发送时必须经严格 JSON 数字词法验证后直接拼接原 token，不经 JS Number 或 binary64。SDK 对 f32 仅一次量化，参数全文参与同 request_id 的一致性判断。
+
+`GET /bindings/{id}/trials/{trial_id}` 返回 `{trial_id,operation,trial:{native_json_text,state,stop_observed,stop_confirmation_overdue,elapsed_ms}}`，elapsed_ms 为字符串或 null；其他白名单字段只投影 SDK 原事实。`GET /bindings/{id}/recording` 返回 `{native_json_text,active,failed,recording_id}`。UI 不重建试验或配置计算。
+
+群组创建 `POST /groups {claimant_id,members:[{binding_id,...R}]}` 必须包含 1..16 个不同物理 UID。一次原子 Book reserve 全部成员；设备提交仍逐台，非原子。响应 `{group_id,reservation_id,claimant_id,stop_request_id,members:[{binding_id,target_id,...R,control_epoch,stop_request_id}]}`，每成员有独立 epoch/canonical Stop；群组 Stop ID 只聚合这些预留范围。
+
+`POST /groups/{id}/operation-ids {claimant_id}` 返回 `{group_id,expires_in_ms:30000,requests:[{binding_id,request_id,control_epoch}]}`。`POST /groups/{id}/controls|trials|recording/start|recording/stop` 请求含 `claimant_id,requests:[{binding_id,request_id,command|trial}]`，记录动作不带 command/trial。`POST /groups/{id}/trials/target` 的每项为 `{binding_id,request_id,trial_id,mm}`。每次必须精确覆盖原始所有成员一次；部分准入或失败逐台记录。群组 trial 全部原成员预检及记录审计屏障成功之前不提交任何目标；实际首目标前再次核对原 writer 状态。
+
+`POST /groups/{id}/stop {claimant_id,request_id}` 使用 group.stop_request_id，始终覆盖原始全部成员，包括当前断连者；响应 202 `{group_id,members:[{binding_id,operation:null|OPERATION,error:null|{code,message}}]}`，无新子提交时 200。普通群组动作采用同一逐台响应。`GET /groups/{id}` 返回完整固定范围、released 与每台最新 operation/error。DELETE 仅释放占用、废止未用票据，不 Stop、不 disconnect，不删除未知原回执或固定 Stop 范围。
+
+存在控制授权、控制等待或未知 target 效果期间，尚未转为有界 continuation 的连接、扫描与旧 /api 入口（含慢 GET）返回明确 busy，targets 只投影已持有目标，不同步枚举；不会把同步 Identity 等待插入 Stop 调度。v2 固定主动 reads 使用同一 Client 的 begin/poll，HTTP 结果仍保持原 DTO；read_permit 与 control_effect 分开。`async_reads` 已随异步读取实现公布；`control,control_groups,trials,recording_write` 仅在控制发布门开放时公布。
+
+原固定范围 Stop 不依赖观察 binding：`GET /control-scopes` 返回 `{scopes:[{stop_request_id,scope:{target_id,expected_identity:{uid,run_nonce},connection_generation,control_epoch},current,control_granted}]}`。`POST /control-scopes/{stop_request_id}/stop` 请求 `{instance_id,claimant_id,expected_scope}`，expected_scope 必须完整匹配上述原对象（另带 api_version）。它使用原明确 target 的唯一 Client；不会从同 UID 的其他观察 alias 选路，不会取列表第一项。跨观察页显示原范围，由人明确选择；当前 scope 不可用则明确拒绝并保留回执，不能换通路重试。capability `control_scopes` 随 control 发布门。
+
+
+##### P3 维护 owner 精确 DTO（P4 复用共同账本）
+
+本段定义维护与共享权限的 SDK route 和插件线格式。维护只允许固定四项；控制是否开放以 describe 的 control_supported 及对应 capabilities 为准，发布门关闭时 trial/HB/target 写入不开放。所有在线请求均携带 api_version:2、instance_id；绑定路由还须 expected_identity:{uid,run_nonce}、connection_generation（均字符串，与 v2 binding 同形）。普通 v2 envelope/error 复用现合同；未知字段拒绝，不接受任意 method/action。鉴权仍为实例私密凭据；claimant_id 是插件从可信 exec.agent.id 或本地人工会话签发的身份，不接受模型自报身份。
+
+#### Capabilities and limits
+
+新增 capabilities: config_schema, config_validate, maintenance_permissions, maintenance_reservations, operation_ids, maintenance, operation_read, read_config_factory。limitations: mutations_supported=true, maintenance_supported=true, mutation_ledger_supported=true；control_supported 由控制发布门决定，device_execution_confirmation=false。limits: max_maintenance_reservations=16, max_mutation_members=1, max_operation_tickets=32, operation_ticket_ttl_ms=30000, max_normal_operations=32, max_stop_scopes=16, operation_receipt_retention_ms=30000, max_maintenance_readbacks=16。未知记录永久保留并计容量，满时诚实拒绝普通准入。
+
+#### Routes
+
+- GET /service/v2/config/schema：envelope + native_json_text:string（官方 SDK SCHEMA_JSON 原文）、config_format_version:number。离线，不需要 binding。
+- POST /service/v2/config/validate：{api_version,instance_id,config_text:string}。原字符串完整 UTF-8 送 SDK validate_json；不 parse/reserialize。成功 envelope + valid:true；失败普通 error code invalid_config + message（SDK 原错）。不写设备。
+- POST /service/v2/bindings/{binding_id}/permissions：{api_version,instance_id,expected_identity,connection_generation,expected_grant_id:string|null,permissions:{maintenance:boolean,control:boolean}}。只允许显式人工授权/撤销，模型工具不能调用。返回 envelope + binding_id + target_id + expected_identity + connection_generation + grant_id:string|null + control_epoch:string|null + stop_request_id:string|null + permissions:{maintenance:boolean,control:boolean}。授权是固定 MemberKey。grant_id 是服务签发 instance-grant-N；同权限重复授权保持编号；撤销/权限变更后重新授权必须新编号。reservation 捕获所有 grant_id，票据捕获该 reservation 生命周期；旧 reservation/ticket 不得因重新启用复活。撤销取消尚未提交工作，retire旧reservation/未消费ticket；在途/unknown仍保留原归属，不 Stop、不清未知占用；control_supported=false 时不能授予 control:true。
+- POST /service/v2/control-reservations：{api_version,instance_id,claimant_id:string,permission:"maintenance",members:[{binding_id,expected_identity,connection_generation}]}。P3 恰好一台；owner 一次核对所有成员/权限/身份/当前门禁/容量，按 UID 互斥。返回 envelope + reservation_id + claimant_id + permission + control_epoch:string + members:[{binding_id,target_id,expected_identity,connection_generation,grant_id}]。control_epoch 服务签发，不接受 caller 指定。
+- DELETE /service/v2/control-reservations/{reservation_id}：{api_version,instance_id,claimant_id}。返回 envelope + reservation_id + released:[target_id] + blocked:[target_id]。release 不 Stop；pending/unknown claim 保持阻挡，不能自动移交。
+- POST /service/v2/operation-ids：{api_version,instance_id,reservation_id,claimant_id}。返回 envelope + request_id + reservation_id + control_epoch + expires_in_ms:30000。票据固定 reservation 成员/epoch；计数单调、实例内永不复用；未消费过期号永拒绝，不再执行；签发不提交设备动作。
+- POST /service/v2/bindings/{binding_id}/maintenance：{api_version,instance_id,expected_identity,connection_generation,reservation_id,claimant_id,request_id,action,config_text?}。action 仅 save_and_restart、restore_factory_and_restart、reset_application、enter_update；config_text 仅 save 必需，其余禁止。save 原文只经 SDK validate_json，原始全文进入去重同一性。既有 request_id 全参数相同返回原 operation，不重发；异参 conflict；旧/过期号 expired。成功 HTTP202 envelope + operation（以下 projection）+ new_submission:boolean（仅新本地工作，非实际 TX 证明）。重复 HTTP200 且 new_submission:false。开始前禁止 HB/trial/target pending/unknown；factory 读取与 mutation submission 均同唯一 Client begin/poll，不 blocking owner。
+- GET /service/v2/operations/{request_id}：envelope + operation。只读取原记录，不重发。unknown/pending 永不被普通 retention 淘汰；已知本地终态 receipt 可在 retention 后返回 expired，旧号仍永不执行。
+
+#### Operation projection
+
+operation:{request_id,reservation_id,claimant_id,action,control_epoch,members:[{target_id,expected_identity,connection_generation}],admission:"queued"|"attempting"|"finished",submission:"not_attempted"|"not_submitted"|"locally_submitted"|"unknown",control_effect:"not_attempted"|"not_applicable"|"unresolved",observation:"unconfirmed",phase:"factory_read"|"submission"|null,native_json_text:string|null,follow_up:{reconnect_required:boolean,readback_views:["user","startup"]},error:{code,message}|null}。
+
+native_json_text 保留 SDK ToolSession CommandResult 或 SessionError 的完整 JSON 原文（含 local_stage、raw SDK failure 与 transport），不得把 bigint 转 JS number；插件只投影白名单字段。queued 无 native。Factory query 的 MayHaveBeenSubmitted 只是读请求：FactoryRead 失败映射维护 submission:not_submitted/control_effect:not_attempted，原错误保留。真正 mutation 的 MayHaveBeenSubmitted/ResultUnknown => submission:unknown/control_effect:unresolved，原 operation+blockedclaim 永久 pin；取消本地等待不撤回 bytes、不重发。身份变化撤销旧 grant/未消费票据，但不删未知审计。后续 Idle/readback 不自动清未知。
+
+成功 local submission => control_effect:not_applicable，仅表示无持续控制需求；observation:unconfirmed，绝不宣称设备保存/复位完成。四维护已知提交都要求操作者明确重连，并读取同一明确选定设备的 User/Startup 作为后续证据；旧 nonce/generation 的授权、reservation、未消费票据不能迁入新连接。EnterUpdate 后不可读时诚实说明不可用，不自动找新设备。有限 retention 只回收已结束且非真实 SDK unknown 的 receipt；未决记录不改名淘汰。
+
+#### Errors
+
+延续 v2 {protocol,api_version,instance_id,code,message}。精确新增 codes: invalid_config、unsupported_permission、permission_denied、permission_conflict、claimant_mismatch、reservation_busy、reservation_unknown、operation_capacity、request_id_expired、request_id_conflict、operation_not_found、maintenance_busy；原 not_connected/binding_stale/identity_changed/invalid_request/instance_mismatch 复用。提交后错误成为 operation 投影，不把已准入 operation 改成无记录 HTTP 错误。HTTP202/200 仅说明服务受理/回执读取，未知不自动重试。
+
+固定 Factory 读取通过现 v2 bindings/{id}/reads action:config_factory；User/Startup保持现有固定actions。v1能力不扩大，读取原门禁不放松。
+
+维护已知提交的后续读回是 SDK 准入门槛：固定原 target_id、同 UID 的新 connection_generation 与重新核对的 run_nonce，成功 User 和 Startup 两固定读取必须属于同一完整新 MemberKey，才解除后续维护授权/占用阻挡。跨 alias 或旧代次读不解除；读取不修改原 operation observation/unresolved，不判断配置等于保存原文，差异完整保留供操作员核对。义务按 UID 有界（max_stop_scopes），不增加无限审计。未发送队列工作被显式释放/撤销后，精确 operation_id 的 NotSubmitted 完成可安全回收 released claim；真正 submitted/unknown 与 prior unresolved 保持原保留规则。
+
+P4共享权限响应：control开启且门槛完成时由服务提前预留canonical Stopslot，permissions响应control_epoch/stop_request_id可在无reservation情况下供显式人工Stop；P3control=false时两者null。双权限属于同一个服务grant，任何权限变更更换编号并使旧占用/票据失效，不能合并成两个独立授权。
+
+权限读取与CAS：GET /service/v2/bindings/{id}/permissions 返回当前完整权限、grant_id、control_epoch、stop_request_id及固定binding身份，无device动作。POST 必需 expected_grant_id:string|null 与当前grant一致；第一次null、已存在则真实编号。CAS冲突HTTP409 permission_conflict且不改权限；相同flags幂等保留grantID。插件先GET核对固定绑定，仅修改人类明确请求的位，再POST完整flags+CAS；冲突不自动覆盖，不把另一位重置为false。P3cap maintenance_permissions涵盖GET/POST。
+
+Readback quota在维护动作admission前预留：已保留义务+pending维护预留总数不超过16，旧scope退休不删除义务；满则普通拒绝、不提交SDK、旧票据作废不会在容量恢复后执行。已知完成转为原UID义务；NotSubmitted/真实Unknown仅释放尚未成为义务的预留容量，未知operation/claim另保留永久pin，绝不丢未知审计。
+
+
+### 原范围本地收尾（P4，随 control_scopes 发布门）
+
+Stop fence 后仍可由操作者明确停止原会话的本地心跳或记录，保持原 MemberKey、原控制授权和服务签发请求 ID。此操作不提交设备 Stop，不重连、不切换 Client、不取得或转移 writer claim，不修改任何旧 unknown 回执或 claim。失联或身份/代次变化返回 `binding_stale`。
+
+- `POST /service/v2/control-scopes/{stop_request_id}/cleanup-ids`：请求 `{api_version:2,instance_id,claimant_id,expected_scope}`，其中 expected_scope 与原范围 Stop 相同。HTTP 200 data 为 `{request_id:string,expires_in_ms:30000,grant_id:string}`。票据绑定原 MemberKey、claimant、grant ID，使用共享 normal 32 容量，30 秒后过期；授权撤销或轮换不可复活旧票据。
+- `POST /service/v2/control-scopes/{stop_request_id}/cleanup`：以上请求另加 `request_id:string,action:"heartbeat_stop"|"recording_stop"`。只能停止本地心跳或记录；其他动作及把此票据用于普通控制入口均拒绝。无 reservation_id。首次 HTTP 202、同一会话精确重放 HTTP 200，data 均为 `{operation,new_submission}`。本地成功回执 `submission:"not_submitted",control_effect:"not_applicable"` 表示未提交设备命令，原文保留本地 SDK 结果。
+
+所有 normal 票据均由共同准入层捕获用途、原完整 MemberKey/control_epoch、claimant、服务 grant ID 与期限。`operation-ids` 及群组子票据还固定原 reservation ID 和 permission；只能用于该 permission 对应的动作，不能改占用或请求会话。cleanup 票据仅用于上述两个无 reservation 的本地收尾动作，不可进入维护、普通控制或群组设备动作。共同票据校验对当前票据跨用途或归属不一致返回 `request_id_conflict`；授权撤销/轮换、原占用释放或期限到期后返回 `request_id_expired`，旧 ID 永不重新执行；入口更早的身份、授权或占用门禁仍保留其固定拒绝码。所有维护、控制、群组及本地收尾入口执行同一校验，再消费编号并建立回执；已有回执的精确重放只读取原记录，不重新验证为一次新提交。票据拒绝不改变任何在途或 unknown operation/claim，不 Stop、不提交设备字节。
+
+排队与执行每一步核对原 grant ID，撤权取消未开始的收尾；release 本身不执行收尾。当前同 UID 有控制/维护等待动作时返回 `control_busy`，操作者可等该原动作明确结束后重新签票操作。Stop 保持独立优先准入。群组可使用各原成员明确显示的原范围执行同样收尾，不缩减群组 Stop 范围。

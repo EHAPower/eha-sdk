@@ -2,7 +2,9 @@
 //! 桌面客户 API。`Client` 串行提交业务，独立 I/O 线程维持收发和显式心跳。
 //! 所有数据副本拥有自己的字节；本地提交绝不表示目标采用或设备执行。
 pub mod backend;
+mod observations;
 mod submissions;
+pub use observations::ClientObservation;
 
 use crate::session::{MutationKind, QueryKind, QueryMatch, Session};
 pub use backend::{AdapterStatus, Backend, HeartbeatStatus, TransportStatus};
@@ -61,7 +63,7 @@ mod tests {
             ValueState::new(ValueResult::Never, SourceQuality::Unknown, false),
         )
     }
-    fn telemetry(run_nonce: [u8; 16], sequence: u32) -> Vec<u8> {
+    pub(super) fn telemetry(run_nonce: [u8; 16], sequence: u32) -> Vec<u8> {
         let fields = TelemetryFields {
             sample: SampleData {
                 query_id: 0,
@@ -571,6 +573,25 @@ impl Client {
         message: &Message<'_>,
         wait: &Wait,
     ) -> Result<(u64, Instant, Arc<AtomicBool>), Error> {
+        self.send_inner(message, wait, None)
+    }
+
+    fn send_control(
+        &mut self,
+        message: &Message<'_>,
+        wait: &Wait,
+    ) -> Result<(u64, Instant, backend::QueueCancellation), Error> {
+        let cancellation = backend::QueueCancellation::default();
+        let (id, deadline, _) = self.send_inner(message, wait, Some(cancellation.clone()))?;
+        Ok((id, deadline, cancellation))
+    }
+
+    fn send_inner(
+        &mut self,
+        message: &Message<'_>,
+        wait: &Wait,
+        queued: Option<backend::QueueCancellation>,
+    ) -> Result<(u64, Instant, Arc<AtomicBool>), Error> {
         let deadline = Instant::now()
             .checked_add(wait.timeout)
             .ok_or_else(|| invalid("等待期限无法表示"))?;
@@ -582,21 +603,26 @@ impl Client {
             .sequence
             .checked_add(1)
             .ok_or_else(|| invalid("本地调用编号耗尽"))?;
-        let cancelled = Arc::new(AtomicBool::new(false));
-        self.backend
-            .tx
-            .try_send(Command::Send(SendRequest {
-                id: self.sequence,
-                bytes,
-                deadline,
-                cancelled: cancelled.clone(),
-            }))
-            .map_err(|error| {
-                self.query_error(
-                    Failure::Disconnected(error.to_string()),
-                    LocalStage::NotSubmitted,
-                )
-            })?;
+        let cancelled = queued
+            .as_ref()
+            .map(backend::QueueCancellation::flag)
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let request = SendRequest {
+            id: self.sequence,
+            bytes,
+            deadline,
+            cancelled: cancelled.clone(),
+        };
+        let command = match queued {
+            Some(token) => Command::CancellableSend(request, token),
+            None => Command::Send(request),
+        };
+        self.backend.tx.try_send(command).map_err(|error| {
+            self.query_error(
+                Failure::Disconnected(error.to_string()),
+                LocalStage::NotSubmitted,
+            )
+        })?;
         Ok((self.sequence, deadline, cancelled))
     }
 

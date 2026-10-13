@@ -25,14 +25,22 @@ use std::{
 use tiny_http::{Header, Method as HttpMethod, Response, StatusCode};
 
 mod connection_profiles;
+mod control;
+mod control_groups;
+mod control_reads;
 mod events;
 mod http_body;
 mod http_io;
 pub(crate) mod instance;
 mod integration;
+mod maintenance;
+mod mutations;
 mod network_jobs;
+mod operations;
 mod p2;
 mod read_jobs;
+mod reservations;
+mod stop_body;
 mod v2;
 mod workbench;
 
@@ -450,6 +458,8 @@ fn prepare_workbench(
     let mut workbench = Workbench::new(runs_dir.unwrap_or_else(Workbench::default_runs_dir));
     workbench.legacy_routes = legacy_routes;
     if let Some(credentials) = credentials {
+        workbench.mutations =
+            Some(mutations::State::new(&credentials.instance_id).expect("fixed mutation limits"));
         workbench.v2 = Some(credentials.for_v2());
         workbench.integration = Some(credentials);
     }
@@ -502,6 +512,7 @@ fn run(
     let mut scan = CanScanView::new();
     let mut io_deadlines = http_io::Deadlines::default();
     let body_reader = BodyReader::new();
+    let stop_reader = stop_body::StopBodyReader::new();
     let published = if legacy_routes {
         None
     } else {
@@ -548,6 +559,19 @@ fn run(
         {
             thread::sleep(Duration::from_millis(10));
             continue;
+        }
+        while let Ok(ReadyRequest { request, body, .. }) = stop_reader.try_recv() {
+            if let Err(error) = handle_request_with_scan_body(
+                request,
+                port,
+                &mut workbench,
+                &mut odrive,
+                &mut scan,
+                Some(body),
+            ) {
+                eprintln!("warning: Stop response failed: {error}");
+            }
+            workbench.tick();
         }
         workbench.tick();
         odrive.reap();
@@ -596,6 +620,7 @@ fn run(
             &mut odrive,
             &mut scan,
             &body_reader,
+            &stop_reader,
         ) {
             eprintln!("warning: WebUI response failed: {error}");
         }
@@ -609,6 +634,7 @@ fn handle_received_request(
     odrive: &mut OdriveView,
     scan: &mut CanScanView,
     body_reader: &BodyReader,
+    stop_reader: &stop_body::StopBodyReader,
 ) -> Result<(), String> {
     let path = request_path(&request);
     let service_v2 = path.starts_with("/service/v2/");
@@ -632,6 +658,19 @@ fn handle_received_request(
             status,
             code,
             message,
+        );
+    }
+    if !service_v2
+        && workbench.control_blocks_sync()
+        && (path.starts_with("/api/")
+            || matches!(request_method(&request), Method::Post | Method::Delete))
+    {
+        return integration::respond_error(
+            request,
+            workbench.integration.as_ref(),
+            409,
+            "control_busy",
+            "v2 控制期间兼容写入口暂停；使用原固定 v2 Stop 范围",
         );
     }
     let is_json_write = matches!(request_method(&request), Method::Post | Method::Delete)
@@ -665,7 +704,12 @@ fn handle_received_request(
     } else {
         None
     };
-    match body_reader.submit_with_envelope(request, error_envelope.clone()) {
+    let submitted = if service_v2 && stop_body::is_stop_path(request_path(&request)) {
+        stop_reader.submit_with_envelope(request, error_envelope.clone())
+    } else {
+        body_reader.submit_with_envelope(request, error_envelope.clone())
+    };
+    match submitted {
         Ok(()) => Ok(()),
         Err(request) => respond_json(request, 503, http_body::queue_error(error_envelope)),
     }
@@ -1828,6 +1872,7 @@ mod tests {
                 &mut odrive,
                 &mut scan,
                 &reader,
+                &super::stop_body::StopBodyReader::new(),
             )?;
             let response = client.join().map_err(|_| "client panic")??;
             assert!(response.starts_with("HTTP/1.1 404"), "{path}");

@@ -229,7 +229,7 @@ fn telemetry_bytes_with_facts(
     bytes
 }
 
-fn trial_request(command: Command) -> TrialRequest {
+pub(super) fn trial_request(command: Command) -> TrialRequest {
     TrialRequest {
         command,
         envelope: TrialEnvelope {
@@ -506,6 +506,11 @@ pub(crate) fn session_fixture(
                             pump.sink
                                 .received(config_read_bytes(query_id, ConfigView::UserRecord));
                         }
+                        Message::ReadConfig { query_id, view: 0 } => {
+                            pump.sink.submitted(request.id);
+                            pump.sink
+                                .received(config_read_bytes(query_id, ConfigView::Factory));
+                        }
                         Message::Query {
                             query_id,
                             category: category @ (2 | 3),
@@ -701,6 +706,27 @@ fn reconnect_connector(
     }))
 }
 
+pub(super) fn settle_control(session: &mut ToolSession) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let Some(pending) = session.pending_control.as_ref() else {
+            return;
+        };
+        if pending.autonomous_stop {
+            let _ = session.poll_control();
+        } else if pending.trial_position {
+            session.flush_trial_position(Instant::now());
+        } else {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "local control submission did not complete"
+        );
+        thread::yield_now();
+    }
+}
+
 fn tick_after_telemetry(
     session: &mut ToolSession,
     harness: &TrialHarness,
@@ -715,6 +741,7 @@ fn tick_after_telemetry(
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
         session.tick();
+        settle_control(session);
         if expected_sequence.is_some_and(|sequence| {
             session
                 .last_telemetry
@@ -747,7 +774,9 @@ fn deadline_from_initial_unknown_telemetry_submits_one_stop() {
 
     // 起始时没有任何 Telemetry；deadline 仍只构成一次明确 Stop 意图。
     session.tick();
+    settle_control(&mut session);
     session.tick();
+    settle_control(&mut session);
 
     assert_eq!(harness.observed.lock().expect("observed lock").stops, 1);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
@@ -886,6 +915,7 @@ fn interrupted_trial_reconnects_then_explicit_stop_needs_a_fresh_idle() {
     let deadline = Instant::now() + Duration::from_millis(100);
     while session.trial_snapshot()["state"] != "completed" {
         session.tick();
+        settle_control(&mut session);
         assert!(Instant::now() < deadline, "fresh Idle did not confirm Stop");
         thread::sleep(Duration::from_millis(1));
     }
@@ -968,6 +998,7 @@ fn position_slider_coalesces_to_latest_and_is_limited_to_twenty_hz() {
         .update_trial_position(2.0)
         .expect("latest target replaces it");
     session.tick();
+    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![2.0]
@@ -977,6 +1008,7 @@ fn position_slider_coalesces_to_latest_and_is_limited_to_twenty_hz() {
         .update_trial_position(3.0)
         .expect("next target merges");
     session.tick();
+    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![2.0],
@@ -984,6 +1016,7 @@ fn position_slider_coalesces_to_latest_and_is_limited_to_twenty_hz() {
     );
     thread::sleep(Duration::from_millis(55));
     session.tick();
+    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![2.0, 3.0]
@@ -999,8 +1032,17 @@ fn target_adoption_transition_does_not_turn_initial_submit_into_stop() {
     // This is the actual first local target submission, followed by the normal firmware
     // adoption window where it still reports Idle / output disallowed / pending.
     session
-        .execute_trial_command(Command::Position { mm: 5.0 })
-        .expect("initial position submits locally");
+        .begin_initial_submission(Command::Position { mm: 5.0 })
+        .expect("initial begins");
+    loop {
+        match session.poll_control() {
+            std::task::Poll::Ready(result) => {
+                result.expect("initial position submits locally");
+                break;
+            }
+            std::task::Poll::Pending => std::thread::yield_now(),
+        }
+    }
     tick_after_telemetry(
         &mut session,
         &harness,
@@ -1053,6 +1095,7 @@ fn unknown_position_submission_stops_once_and_never_replays_a_target() {
 
     session.update_trial_position(4.0).expect("target merges");
     session.tick();
+    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![4.0]
@@ -1061,6 +1104,7 @@ fn unknown_position_submission_stops_once_and_never_replays_a_target() {
     assert!(session.update_trial_position(5.0).is_err());
     thread::sleep(Duration::from_millis(55));
     session.tick();
+    settle_control(&mut session);
 
     let observed = harness.observed.lock().expect("observed lock");
     assert_eq!(observed.positions, vec![4.0]);
@@ -1127,15 +1171,18 @@ fn stop_confirmation_requires_a_receipt_after_stop_submission() {
     // physically received before Stop and therefore cannot acknowledge that Stop.
     probe.inject_idle(100);
     session.tick();
+    settle_control(&mut session);
     probe.inject_idle(101);
     session.stop_trial().expect("Stop submits locally");
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
 
     // A fresh receipt after the local Stop submission is needed in addition to its
     // newer device timestamp and strict idle/driver/fact fields.
     probe.inject_idle(102);
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "completed");
 }
 
@@ -1149,6 +1196,7 @@ fn unknown_stop_is_not_retried_and_can_only_finish_from_later_telemetry() {
     ));
     probe.inject_idle(100);
     session.tick();
+    settle_control(&mut session);
 
     let error = session
         .stop_trial()
@@ -1165,6 +1213,7 @@ fn unknown_stop_is_not_retried_and_can_only_finish_from_later_telemetry() {
 
     probe.inject_idle(101);
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "completed");
 }
 
@@ -1180,6 +1229,7 @@ fn stale_telemetry_stops_even_when_its_device_sample_is_not_new() {
     ));
     probe.inject_idle_at(100, Instant::now() - Duration::from_millis(300));
     session.tick();
+    settle_control(&mut session);
 
     assert_eq!(probe.observed.lock().expect("observed lock").stops, 1);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
@@ -1214,6 +1264,7 @@ fn reach_requires_a_new_matching_current_run_sample() {
     thread::sleep(Duration::from_millis(4));
     // Reusing the same sample does not accumulate settling time into a false arrival.
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "active");
 
     tick_after_telemetry(
@@ -1267,6 +1318,7 @@ fn stop_confirmation_overdue_keeps_owner_and_preserves_late_confirmation() {
         .stop_attempt_finished_at = Some(Instant::now() - Duration::from_secs(1));
 
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert_eq!(session.trial_snapshot()["stop_confirmation_overdue"], true);
     assert!(session.execute(Command::Status).is_err());
@@ -1278,10 +1330,12 @@ fn stop_confirmation_overdue_keeps_owner_and_preserves_late_confirmation() {
     );
     session.stop_trial().expect("重复停止不重发");
     session.tick();
+    settle_control(&mut session);
     assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
 
     probe.inject_idle(100);
     session.tick();
+    settle_control(&mut session);
     let completed = session.trial_snapshot();
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["stop_observed"], true);
@@ -1355,7 +1409,9 @@ fn recording_failure_stops_once_without_flushing_queued_position_or_completing_r
         .last_position_submit = None;
 
     session.tick();
+    settle_control(&mut session);
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert_eq!(session.recording_snapshot()["failed"], true);
@@ -1366,6 +1422,7 @@ fn recording_failure_stops_once_without_flushing_queued_position_or_completing_r
     }
     probe.inject_idle(100);
     session.tick();
+    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "completed");
     assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
     session.finish_recording_boundary("disconnect");
@@ -1399,6 +1456,7 @@ fn recording_finish_failure_cannot_bypass_trial_stop() {
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert!(session.recording_error.is_some());
     session.tick();
+    settle_control(&mut session);
     assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
     std::fs::remove_dir_all(root).expect("清理测试记录");
 }
@@ -1421,11 +1479,244 @@ fn stop_confirmation_deadline_uses_receipt_time_instead_of_tick_time() {
         probe.inject_idle_at(100, finished + receipt_delay);
 
         session.tick();
+        settle_control(&mut session);
         assert_eq!(session.trial_snapshot()["state"], "completed");
         assert_eq!(
             session.trial_snapshot()["stop_confirmation_overdue"],
             overdue
         );
         assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
+    }
+}
+
+pub(crate) fn begin_autonomous_stop_fixture(session: &mut ToolSession) {
+    session.trial.active = Some(active(
+        trial_request(Command::Position { mm: 1.0 }),
+        Instant::now(),
+        10,
+    ));
+    session
+        .submit_trial_stop("duration_elapsed")
+        .expect("autonomous Stop queued");
+}
+
+fn initial_waiting_for_receipt(session: &mut ToolSession, probe: &FixtureProbe) {
+    let request = trial_request(Command::Position { mm: 1.0 });
+    session.prepare_trial(&request).expect("preflight");
+    session.begin_trial_start(request).expect("begin start");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while session.pending_control.is_none() {
+        assert!(session.poll_trial_start().is_pending());
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    while probe.observed.lock().expect("observed").targets == 0 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+}
+
+fn disconnect_fixture(probe: &FixtureProbe) {
+    let sink = probe
+        .sink
+        .lock()
+        .expect("sink")
+        .as_ref()
+        .expect("live sink")
+        .clone();
+    sink.event(eha_sdk::host::backend::Event::Disconnected(
+        "test disconnect".into(),
+    ));
+}
+
+#[test]
+fn recording_stop_cancels_inflight_initial_with_unknown_receipt_and_releases_stop_slot() {
+    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+    let root =
+        std::env::temp_dir().join(format!("eha-recording-start-cancel-{}", std::process::id()));
+    session.start_recording(&root).expect("recording");
+    initial_waiting_for_receipt(&mut session, &probe);
+    session.begin_recording_stop().expect("finish admitted");
+    assert!(
+        matches!(session.poll_trial_start(),std::task::Poll::Ready(Err(error)) if error.unknown && error.local_stage.as_deref()==Some("may_have_been_submitted"))
+    );
+    settle_control(&mut session);
+    assert_eq!(probe.observed.lock().expect("observed").stops, 1);
+    assert!(session.pending_control.is_none());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match session.poll_recording_stop() {
+            std::task::Poll::Ready(result) => {
+                result.expect("finished");
+                break;
+            }
+            std::task::Poll::Pending => {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+        }
+    }
+    std::fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn disconnect_preserves_initial_unknown_receipt_and_clears_its_pending_control() {
+    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+    initial_waiting_for_receipt(&mut session, &probe);
+    disconnect_fixture(&probe);
+    session.tick();
+    assert!(
+        matches!(session.poll_trial_start(),std::task::Poll::Ready(Err(error)) if error.unknown && error.local_stage.as_deref()==Some("may_have_been_submitted"))
+    );
+    assert!(session.pending_control.is_none());
+    assert!(session.trial.interrupted.is_some());
+}
+
+#[test]
+fn disconnect_keeps_stop_terminal_on_the_interrupted_trial() {
+    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+    session
+        .start_trial(trial_request(Command::Position { mm: 1.0 }))
+        .expect("start");
+    session.begin_control(Command::Stop).expect("Stop begins");
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while probe.observed.lock().expect("observed").stops == 0 {
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    }
+    disconnect_fixture(&probe);
+    session.tick();
+    assert!(matches!(session.poll_control(),std::task::Poll::Ready(Err(error)) if error.unknown));
+    let interrupted = session.trial.interrupted.as_ref().expect("interrupted");
+    assert!(interrupted.active.stop_attempt_finished_at.is_some());
+    assert_eq!(
+        interrupted
+            .active
+            .stop_submission
+            .as_ref()
+            .expect("receipt")["error"]["unknown"],
+        true
+    );
+}
+
+#[test]
+fn first_position_completion_starts_the_twenty_hz_cadence() {
+    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+    initial_waiting_for_receipt(&mut session, &probe);
+    session
+        .trial
+        .active
+        .as_mut()
+        .expect("active")
+        .last_position_submit = Some(Instant::now() - Duration::from_secs(1));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match session.poll_trial_start() {
+            std::task::Poll::Ready(result) => {
+                result.expect("initial submitted");
+                break;
+            }
+            std::task::Poll::Pending => {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+        }
+    }
+    session
+        .begin_trial_target(2.0)
+        .expect("next target admitted");
+    assert!(session.poll_trial_target().is_pending());
+    assert!(
+        session.pending_control.is_none(),
+        "initial actual completion starts the 50ms wait"
+    );
+    assert_eq!(
+        probe.observed.lock().expect("observed").positions,
+        vec![1.0]
+    );
+}
+
+#[test]
+fn pending_observation_preserves_connection_scope_without_hiding_known_disconnect() {
+    let (mut session, _) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+    assert!(session.connection_observation_connected(std::task::Poll::Pending));
+    session.disconnected_reason = Some("known disconnect".into());
+    assert!(!session.connection_observation_connected(std::task::Poll::Pending));
+}
+
+#[test]
+fn invalid_recording_stop_does_not_cancel_an_initial_submission() {
+    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+    initial_waiting_for_receipt(&mut session, &probe);
+    assert!(session.begin_recording_stop().is_err());
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match session.poll_trial_start() {
+            std::task::Poll::Ready(result) => {
+                result.expect("initial submitted");
+                break;
+            }
+            std::task::Poll::Pending => {
+                assert!(Instant::now() < deadline);
+                thread::yield_now();
+            }
+        }
+    }
+    assert_eq!(probe.observed.lock().expect("observed").stops, 0);
+}
+
+#[test]
+fn audited_trial_rechecks_recording_failure_before_initial_submission() {
+    for (projected, released) in [(false, false), (true, false), (false, true), (true, true)] {
+        let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
+        let root = std::env::temp_dir().join(format!(
+            "eha-audit-recheck-{}-{projected}-{released}",
+            std::process::id()
+        ));
+        session.start_recording(&root).expect("recording");
+        let request = trial_request(Command::Position { mm: 1.0 });
+        session.prepare_trial(&request).expect("preflight");
+        session.begin_trial_audit(request.clone()).expect("audit");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match session.poll_trial_audit() {
+                std::task::Poll::Ready(result) => {
+                    result.expect("audited");
+                    break;
+                }
+                std::task::Poll::Pending => {
+                    assert!(Instant::now() < deadline);
+                    thread::yield_now();
+                }
+            }
+        }
+        if released {
+            session
+                .begin_trial_start(request.clone())
+                .expect("release before failure");
+        }
+        let error = session
+            .recording
+            .as_mut()
+            .expect("recording")
+            .event("oversized", json!({"payload":"x".repeat(65_537)}))
+            .expect_err("writer marks evidence partial");
+        if projected {
+            session.recording_error = Some(error);
+        }
+        if !released {
+            session
+                .begin_trial_start(request)
+                .expect("release before submission check");
+        }
+        let rejected = matches!(session.poll_trial_start(),std::task::Poll::Ready(Err(error)) if error.local_stage.as_deref()==Some("not_submitted") && !error.unknown);
+        let targets = probe.observed.lock().expect("observed").targets;
+        drop(session);
+        std::fs::remove_dir_all(root).expect("cleanup");
+        assert!(
+            rejected,
+            "failed recording must invalidate earlier audit (projected={projected}, released={released})"
+        );
+        assert_eq!(targets, 0);
     }
 }

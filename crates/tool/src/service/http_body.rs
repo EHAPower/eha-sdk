@@ -145,6 +145,7 @@ mod tests {
             &mut odrive,
             &mut scan,
             &reader,
+            &crate::service::stop_body::StopBodyReader::new(),
         )?;
         let client = thread::spawn(move || -> std::io::Result<String> {
             let mut stream = TcpStream::connect(address)?;
@@ -165,6 +166,7 @@ mod tests {
             &mut odrive,
             &mut scan,
             &reader,
+            &crate::service::stop_body::StopBodyReader::new(),
         )?;
         let response = client.join().map_err(|_| "client panic")??;
         assert!(response.starts_with("HTTP/1.1 200"));
@@ -236,6 +238,7 @@ mod tests {
             &mut odrive,
             &mut scan,
             &reader,
+            &crate::service::stop_body::StopBodyReader::new(),
         )?;
         let stop = stop.join().map_err(|_| "Stop client panicked")??;
         assert!(stop.starts_with("HTTP/1.1 409"));
@@ -263,6 +266,7 @@ mod tests {
             &mut odrive,
             &mut scan,
             &reader,
+            &crate::service::stop_body::StopBodyReader::new(),
         )?;
         let response = get.join().map_err(|_| "GET client panicked")??;
         assert!(response.starts_with("HTTP/1.1 200"));

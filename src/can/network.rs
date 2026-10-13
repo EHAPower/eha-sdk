@@ -894,6 +894,15 @@ mod tests {
 
     #[test]
     fn transfer_protected_query_returns_cancellable_slot_before_stop() {
+        transfer_protected_cancellation(false);
+    }
+
+    #[test]
+    fn transfer_protected_target_returns_cancellable_slot_before_stop() {
+        transfer_protected_cancellation(true);
+    }
+
+    fn transfer_protected_cancellation(control: bool) {
         let (backend, commands, sink) = Backend::endpoint();
         // 测试时钟保持在 0；随后显式推进到 40ms，避免等待真实 guard 窗口。
         let mut pump =
@@ -931,23 +940,31 @@ mod tests {
             transmitter.copy_and_start(&stop_bytes, 0),
             Err(transport::can::Error::TransferProtected)
         );
-        let query = protocol::Message::Query {
-            query_id: 1,
-            category: 1,
+        let query = if control {
+            protocol::Message::Position(1.0)
+        } else {
+            protocol::Message::Query {
+                query_id: 1,
+                category: 1,
+            }
         };
         let mut bytes = vec![0; query.encoded_len().expect("length")];
         protocol::encode(query, &mut bytes).expect("query encodes");
         let cancelled = Arc::new(AtomicBool::new(false));
         let deadline = Instant::now() + Duration::from_secs(5);
-        backend
-            .tx
-            .try_send(Command::Send(SendRequest {
-                id: 1,
-                bytes,
-                deadline,
-                cancelled: cancelled.clone(),
-            }))
-            .expect("enqueue query");
+        let token = crate::host::backend::QueueCancellation::default();
+        let request = SendRequest {
+            id: 1,
+            bytes,
+            deadline,
+            cancelled: cancelled.clone(),
+        };
+        let command = if control {
+            Command::CancellableSend(request, token.clone())
+        } else {
+            Command::Send(request)
+        };
+        backend.tx.try_send(command).expect("enqueue query");
         assert!(pump.poll());
         let mut active = [None, None, None];
         start_node_request(1, &mut pump, &mut transmitter, &mut active);
@@ -955,7 +972,11 @@ mod tests {
             active[1].is_none(),
             "TransferProtected query returns to Pump"
         );
-        cancelled.store(true, Ordering::Release);
+        if control {
+            assert_eq!(token.cancel(), crate::host::LocalStage::NotSubmitted);
+        } else {
+            cancelled.store(true, Ordering::Release);
+        }
         backend
             .tx
             .try_send(Command::Send(SendRequest {
@@ -1000,23 +1021,37 @@ mod tests {
     #[test]
     #[allow(clippy::panic)]
     fn cancelling_taken_query_wait_does_not_abort_can_node_or_block_stop() {
+        cancelling_taken_wait(false);
+    }
+
+    #[test]
+    fn cancelling_taken_control_wait_does_not_abort_can_node_or_block_stop() {
+        cancelling_taken_wait(true);
+    }
+
+    #[allow(clippy::panic)]
+    fn cancelling_taken_wait(control: bool) {
         let (bus, events) = mpsc::channel();
         let (retired, _retirements) = mpsc::channel();
         let (backend, node) = spawn_node(1, 1, Mode::Fd, Instant::now(), None, bus, retired)
             .expect("real node worker starts");
         let cancelled = Arc::new(AtomicBool::new(false));
+        let token = crate::host::backend::QueueCancellation::default();
         let enqueue = |id, message: protocol::Message<'_>, cancellation| {
             let mut bytes = vec![0; message.encoded_len().expect("length")];
             protocol::encode(message, &mut bytes).expect("encode");
-            backend
-                .tx
-                .try_send(Command::Send(SendRequest {
-                    id,
-                    bytes,
-                    deadline: Instant::now() + Duration::from_secs(5),
-                    cancelled: cancellation,
-                }))
-                .expect("enqueue");
+            let request = SendRequest {
+                id,
+                bytes,
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancelled: cancellation,
+            };
+            let command = if control && id == 1 {
+                Command::CancellableSend(request, token.clone())
+            } else {
+                Command::Send(request)
+            };
+            backend.tx.try_send(command).expect("enqueue");
         };
         let next_frame = || match events
             .recv_timeout(Duration::from_secs(1))
@@ -1038,16 +1073,27 @@ mod tests {
         };
         enqueue(
             1,
-            protocol::Message::Query {
-                query_id: 1,
-                category: 1,
+            if control {
+                protocol::Message::Position(1.0)
+            } else {
+                protocol::Message::Query {
+                    query_id: 1,
+                    category: 1,
+                }
             },
             cancelled.clone(),
         );
         let query_frame = next_frame();
         assert_eq!(query_frame.lane, 1);
         // 真实 run_node 已取出查询并在等待驱动完成；此时结束查询等待并排 Stop。
-        cancelled.store(true, Ordering::Release);
+        if control {
+            assert_eq!(
+                token.cancel(),
+                crate::host::LocalStage::MayHaveBeenSubmitted
+            );
+        } else {
+            cancelled.store(true, Ordering::Release);
+        }
         enqueue(2, protocol::Message::Stop, Arc::new(AtomicBool::new(false)));
         // 两条心跳帧构成确定性的 worker 步进：第二条之前已经过查询 awaiting 检查。
         for id in 3..=4 {
