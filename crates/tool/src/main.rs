@@ -68,6 +68,9 @@ enum Command {
         /// 记录试验原始数据的目录；省略时使用系统本地数据目录。
         #[arg(long)]
         runs_dir: Option<PathBuf>,
+        /// 启用仅本机只读集成；首次创建 token，重启读取同一受限文件。
+        #[arg(long)]
+        integration_token_file: Option<PathBuf>,
     },
 }
 
@@ -102,7 +105,8 @@ fn main() -> ExitCode {
             port,
             odrive_python,
             runs_dir,
-        }) => webui::serve(port.get(), odrive_python, runs_dir),
+            integration_token_file,
+        }) => webui::serve(port.get(), odrive_python, runs_dir, integration_token_file),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -170,6 +174,13 @@ impl RawFields {
 
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.0.contains_key(name)
+    }
+
+    pub(crate) fn reject_unknown(&self, allowed: &[&str]) -> Result<(), String> {
+        if let Some(name) = self.0.keys().find(|name| !allowed.contains(&name.as_str())) {
+            return Err(format!("未知字段：{name}"));
+        }
+        Ok(())
     }
 }
 

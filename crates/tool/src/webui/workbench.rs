@@ -56,6 +56,7 @@ pub(crate) struct Workbench {
     group_nodes: BTreeSet<u8>,
     runs_dir: PathBuf,
     profiles: ConnectionStore,
+    pub(super) integration: Option<super::integration::IntegrationState>,
 }
 
 impl Workbench {
@@ -68,6 +69,7 @@ impl Workbench {
             group_nodes: BTreeSet::new(),
             runs_dir,
             profiles: ConnectionStore::load_default(),
+            integration: None,
         }
     }
 
@@ -87,6 +89,7 @@ impl Workbench {
             profiles: ConnectionStore::load(
                 std::env::temp_dir().join("eha-tool-webui-tests-connections.json"),
             ),
+            integration: None,
         }
     }
 
@@ -825,6 +828,90 @@ impl Workbench {
             "can_nodes":can_nodes,
             "group_nodes":self.group_nodes.iter().copied().collect::<Vec<_>>(),
         }))
+    }
+
+    pub(crate) fn integration_session_mut(&mut self, target_id: &str) -> Option<&mut ToolSession> {
+        if let Some(serial) = target_id.strip_prefix("usb:") {
+            let snapshot = self.usb.snapshot();
+            if matches!(snapshot.connection, Some(ConnectionRequest::Usb { serial: current }) if current == serial)
+            {
+                return Some(&mut self.usb);
+            }
+        }
+        let node = target_id.strip_prefix("can:")?.parse::<u8>().ok()?;
+        self.can_nodes.get_mut(&node)
+    }
+
+    pub(crate) fn integration_global_read_blocker(&self) -> Option<&'static str> {
+        let sessions = std::iter::once(&self.usb).chain(self.can_nodes.values());
+        for session in sessions {
+            if session.integration_pending_target() {
+                return Some("unresolved_target");
+            }
+            if session.integration_unresolved_trial() {
+                return Some("trial_active");
+            }
+            // A disconnected but otherwise idle owner has no active I/O to contend with.
+            if session.integration_connected() {
+                if let Some(reason) = session.integration_read_blocker() {
+                    return Some(reason);
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) fn integration_targets(
+        &mut self,
+    ) -> Result<(Vec<Value>, Option<&'static str>), String> {
+        let mut targets = BTreeMap::<String, Value>::new();
+        let discovery_reason = self.integration_global_read_blocker();
+        if discovery_reason.is_none() {
+            for device in crate::devices::discover()? {
+                let Some(serial) = device.serial else {
+                    continue;
+                };
+                let target_id = format!("usb:{serial}");
+                targets.insert(
+                    target_id.clone(),
+                    json!({
+                        "target_id":target_id, "transport":"usb", "connected":false,
+                        "identity":null, "connection_generation":null,
+                        "can_attach":false, "can_connect":true
+                    }),
+                );
+            }
+        }
+        let snapshot = self.usb.snapshot();
+        if let Some(ConnectionRequest::Usb { serial }) = snapshot.connection {
+            let target_id = format!("usb:{serial}");
+            let connected = snapshot.connected && snapshot.transport["disconnected"].is_null();
+            let identity = connected
+                .then(|| self.usb.integration_identity())
+                .flatten()
+                .map(|(uid, run_nonce)| json!({"uid":uid,"run_nonce":run_nonce}));
+            let enumerated = targets.contains_key(&target_id);
+            targets.insert(target_id.clone(), json!({
+                "target_id":target_id, "transport":"usb", "connected":connected,
+                "identity":identity, "connection_generation":connected.then(|| self.usb.connection_generation().to_string()),
+                "can_attach":connected, "can_connect":!connected && enumerated
+            }));
+        }
+        for (&node, session) in &mut self.can_nodes {
+            let snapshot = session.snapshot();
+            let connected = snapshot.connected && snapshot.transport["disconnected"].is_null();
+            let identity = connected
+                .then(|| session.integration_identity())
+                .flatten()
+                .map(|(uid, run_nonce)| json!({"uid":uid,"run_nonce":run_nonce}));
+            let target_id = format!("can:{node}");
+            targets.insert(target_id.clone(), json!({
+                "target_id":target_id, "transport":"can", "connected":connected,
+                "identity":identity, "connection_generation":connected.then(|| session.connection_generation().to_string()),
+                "can_attach":connected, "can_connect":false
+            }));
+        }
+        Ok((targets.into_values().collect(), discovery_reason))
     }
 
     pub(crate) fn list_runs(&self) -> Result<Value, String> {

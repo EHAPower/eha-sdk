@@ -8,7 +8,10 @@
 use std::{
     collections::VecDeque,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -19,7 +22,7 @@ use eha_sdk::{
     host::{Client, ClientState, Error as SdkError, Failure, LocalSubmission, Reply, Wait},
     protocol::{
         Response,
-        responses::{ConfigView, ValueFields},
+        responses::{ConfigView, DesiredAxis, TargetMode, ValueFields},
     },
     usb::UsbConnector,
 };
@@ -399,6 +402,12 @@ impl Connector {
 }
 
 /// 一个独占、串行的 SDK 客户端会话。调用方以 `&mut self` 执行操作，因此不会并发发送。
+static NEXT_CONNECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+fn next_connection_generation() -> u64 {
+    NEXT_CONNECTION_GENERATION.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct ToolSession {
     connector: Option<Connector>,
     request: Option<ConnectionRequest>,
@@ -416,6 +425,8 @@ pub struct ToolSession {
     recording: Option<Recording>,
     recording_error: Option<String>,
     trial: TrialState,
+    connection_generation: u64,
+    pending_target: bool,
 }
 
 impl Default for ToolSession {
@@ -443,6 +454,8 @@ impl ToolSession {
             recording: None,
             recording_error: None,
             trial: TrialState::default(),
+            connection_generation: next_connection_generation(),
+            pending_target: false,
         }
     }
 
@@ -472,6 +485,7 @@ impl ToolSession {
         if self.disconnected.is_some() && self.request.as_ref() == Some(&request) {
             return self.reconnect();
         }
+        self.connection_generation = next_connection_generation();
         self.clear_observations();
         let mut connector = connector_for(&request)?;
         let backend = connector.open().map_err(open_error)?;
@@ -519,6 +533,7 @@ impl ToolSession {
         if self.client.is_some() {
             return Err(invalid("已有活跃会话；先显式 disconnect"));
         }
+        self.connection_generation = next_connection_generation();
         self.clear_observations();
         let mut shared = Connector::SharedCan(connector);
         let backend = shared.open().map_err(open_error)?;
@@ -553,6 +568,10 @@ impl ToolSession {
         if self.trial.active.is_some() {
             return Err(invalid("试验进行中；普通 disconnect 不停止也不切换设备"));
         }
+        if self.client.is_none() {
+            return Err(invalid("当前没有活跃会话"));
+        }
+        self.connection_generation = next_connection_generation();
         self.finish_recording_boundary("disconnect");
         self.mark_interrupted_reconnect_required();
         self.trial.prepared = None;
@@ -575,6 +594,10 @@ impl ToolSession {
         {
             return Err(invalid("会话仍处于连接状态；无需 reconnect"));
         }
+        if self.client.is_none() && self.disconnected.is_none() {
+            return Err(invalid("没有可恢复的断开会话"));
+        }
+        self.connection_generation = next_connection_generation();
         if self.trial.active.is_some() {
             self.interrupt_trial_unknown("reconnect_during_active_trial");
         }
@@ -741,6 +764,16 @@ impl ToolSession {
             return Err(invalid(
                 "试验进行中；仅允许读取快照、显式 stop_trial 或 update_trial_position",
             ));
+        }
+        if matches!(
+            command,
+            Command::Position { .. }
+                | Command::Velocity { .. }
+                | Command::Force { .. }
+                | Command::Impedance { .. }
+        ) && self.client.is_some()
+        {
+            self.pending_target = true;
         }
         self.record_event("command_input", json!({"command": &command}));
         let result = self.execute_inner(command);
@@ -1164,6 +1197,10 @@ impl ToolSession {
             let disconnected = client.connection_status().disconnected;
             self.client = Some(client);
             if let Some(reason) = disconnected {
+                if self.disconnected_reason.is_none() {
+                    self.connection_generation = next_connection_generation();
+                    self.disconnected_reason = Some(reason.clone());
+                }
                 self.interrupt_trial_unknown(&format!("transport_disconnected:{reason}"));
                 self.finish_recording_boundary("transport_disconnected");
             }
@@ -1505,6 +1542,97 @@ impl ToolSession {
         {
             self.last_telemetry = Some(reply);
         }
+    }
+
+    pub(crate) fn connection_generation(&self) -> u64 {
+        self.connection_generation
+    }
+
+    pub(crate) fn integration_identity(&self) -> Option<(String, String)> {
+        let reply = self.identity.as_ref()?;
+        let Response::Identity(identity) = reply.response().ok()? else {
+            return None;
+        };
+        let fields = identity.fields();
+        Some((hex(&fields.uid), hex(&fields.sample.run_nonce)))
+    }
+
+    pub(crate) fn integration_connected(&self) -> bool {
+        self.client
+            .as_ref()
+            .is_some_and(|client| client.connection_status().disconnected.is_none())
+    }
+
+    pub(crate) fn integration_pending_target(&self) -> bool {
+        self.pending_target
+    }
+
+    pub(crate) fn integration_unresolved_trial(&self) -> bool {
+        self.trial.active.is_some()
+            || self
+                .trial
+                .interrupted
+                .as_ref()
+                .is_some_and(|trial| !trial.unrecoverable)
+    }
+
+    pub(crate) fn integration_telemetry_age_ms(&self) -> Option<u64> {
+        self.last_telemetry.as_ref().map(|reply| {
+            Instant::now()
+                .saturating_duration_since(reply.received_at)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64
+        })
+    }
+
+    /// Active reads may contend with ongoing control. This gate uses decoded SDK fields.
+    pub(crate) fn integration_read_blocker(&self) -> Option<&'static str> {
+        if self.pending_target {
+            return Some("unresolved_target");
+        }
+        if self.integration_unresolved_trial() {
+            return Some("trial_active");
+        }
+        let Some(client) = self.client.as_ref() else {
+            return Some("transport_unknown");
+        };
+        if client.connection_status().disconnected.is_some() {
+            return Some("transport_unknown");
+        }
+        if client.heartbeat_status().enabled {
+            return Some("heartbeat_active");
+        }
+        let Some(reply) = self.last_telemetry.as_ref() else {
+            return Some("awaiting_telemetry");
+        };
+        if Instant::now().saturating_duration_since(reply.received_at) > Duration::from_secs(3) {
+            return Some("stale_telemetry");
+        }
+        let Ok(Response::Telemetry(telemetry)) = reply.response() else {
+            return Some("transport_unknown");
+        };
+        let fields = telemetry.fields();
+        if self
+            .identity
+            .as_ref()
+            .and_then(identity_facts)
+            .is_none_or(|identity| identity.run_nonce != fields.sample.run_nonce)
+        {
+            return Some("identity_changed");
+        }
+        if fields.target_mode != TargetMode::None
+            || fields.desired_axis != DesiredAxis::Idle
+            || fields.axis_state_raw != 1
+            || !fields.driver_state.has_status
+            || !fields.driver_state.qualified
+            || fields.driver_state.stale
+            || fields.driver_state.faulted
+            || fields.facts.device_operation_pending
+            || fields.facts.unknown_effect
+        {
+            return Some("not_idle");
+        }
+        None
     }
 
     fn trend_source(&self) -> Option<Value> {

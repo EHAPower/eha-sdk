@@ -8,6 +8,28 @@
 `eha-tool --help` 及对应子命令的 `--help` 为准。构建、安装和检查入口见
 [根贡献指南](../../CONTRIBUTING.md)。
 
+## 本机只读集成
+
+`webui --integration-token-file PATH` 显式启用 `/integration/v1/*`；省略时路由不可用。首次启动在
+指定路径创建由当前用户持有、权限为 `0600` 的 64 位十六进制 token 文件，重启严格校验后复用；
+每次启动仍产生新的随机实例身份。本入口目前仅支持 Unix。调用方使用
+`Authorization: Bearer <token>`，所有请求必须发往 `127.0.0.1`，任何 `Origin` 均被拒绝；
+凭据不输出到终端。请求上限 64 KiB，响应上限 1 MiB，最多 8 个绑定。
+
+`GET describe/targets`、`POST bindings`、`GET bindings/{id}/snapshot`、
+`POST bindings/{id}/read` 与 `DELETE bindings/{id}` 均位于该前缀下。绑定只引用 WebUI
+已拥有的会话；只允许显式连接列表中的 USB 候选，不扫描或新连 CAN。活动试验、心跳、
+未决目标或已连接会话门禁不足时，targets 仅返回 owner 已知目标，并标记
+`discovery_limited` 与原因；安全空闲时的 OS USB 枚举不保证硬截止时间。注销绑定绝不关闭设备连接。
+主动读取仅开放 status、measurements、diagnostics、Startup 和 User 配置原文；缓存快照不发设备
+查询。读取须核对实例、连接代次与 UID/run_nonce，并受全局心跳、试验、持续目标及新鲜 Idle
+遥测门禁约束；门禁不足时快照仍可查看原因。普通持续目标的未决标记在本 owner 生命周期内
+不会因本地 Stop 提交、断连或后收 Idle 遥测自动清除；该情形返回 `unresolved_target`。
+重启工具并不是停止动作；新实例仍须重新核对 Identity 和新鲜 Idle 遥测，且不能代替对先前未知
+设备影响的人工处理。外层计数和设备时间戳使用十进制文本，原生 eha-tool
+查询 JSON 保留为 `native_json_text` 字符串。单次 SDK 读取默认最多等待 5 秒，会同步占用
+WebUI 会话循环；取消 HTTP 请求不取消可能已提交的设备操作。采集完成不证明设备或机构安全。
+
 ## 使用方式
 
 ### 命令行

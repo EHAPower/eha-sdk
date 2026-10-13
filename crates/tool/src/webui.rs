@@ -25,6 +25,7 @@ use std::{
 use tiny_http::{Header, Method as HttpMethod, Response, Server, StatusCode};
 
 mod http_body;
+mod integration;
 mod workbench;
 
 #[cfg(test)]
@@ -61,6 +62,7 @@ enum Method {
     Get,
     Head,
     Post,
+    Delete,
     Other,
 }
 
@@ -176,6 +178,7 @@ fn request_method(request: &tiny_http::Request) -> Method {
         HttpMethod::Get => Method::Get,
         HttpMethod::Head => Method::Head,
         HttpMethod::Post => Method::Post,
+        HttpMethod::Delete => Method::Delete,
         _ => Method::Other,
     }
 }
@@ -433,10 +436,14 @@ pub(crate) fn serve(
     port: u16,
     odrive_python: Option<PathBuf>,
     runs_dir: Option<PathBuf>,
+    integration_token_file: Option<PathBuf>,
 ) -> Result<(), String> {
     let server = Server::http(("127.0.0.1", port)).map_err(|error| error.to_string())?;
     println!("WebUI 本地入口：http://127.0.0.1:{port}/");
     let mut workbench = Workbench::new(runs_dir.unwrap_or_else(Workbench::default_runs_dir));
+    if let Some(path) = integration_token_file {
+        workbench.integration = Some(integration::IntegrationState::new(&path)?);
+    }
     workbench.autoconnect_once();
     let mut odrive = OdriveView::new(odrive_python);
     let mut scan = CanScanView::new();
@@ -484,13 +491,29 @@ fn handle_received_request(
     scan: &mut CanScanView,
     body_reader: &BodyReader,
 ) -> Result<(), String> {
-    let is_json_write =
-        request_path(&request).starts_with("/api/") && request_method(&request) == Method::Post;
+    let integration = request_path(&request).starts_with("/integration/v1/");
+    if integration {
+        if let Err((status, code, message)) =
+            integration::authorize(&request, port, workbench.integration.as_ref())
+        {
+            return integration::respond_error(
+                request,
+                workbench.integration.as_ref(),
+                status,
+                code,
+                message,
+            );
+        }
+    }
+    let is_json_write = request_method(&request) == Method::Post
+        && (request_path(&request).starts_with("/api/") || integration);
     if !is_json_write {
         return handle_request_with_scan_body(request, port, workbench, odrive, scan, None);
     }
-    if let Err(message) = validate_write_request(&request, port) {
-        return respond_json(request, 403, json!({"ok":false,"message":message}));
+    if !integration {
+        if let Err(message) = validate_write_request(&request, port) {
+            return respond_json(request, 403, json!({"ok":false,"message":message}));
+        }
     }
     if json_body_is_prebuffered(&request) {
         // tiny-http 0.12's `request::new_request` has already copied this exact shape into a
@@ -545,6 +568,9 @@ fn handle_request_with_scan_body(
     scan.reap();
     let method = request_method(&request);
     let path = request_path(&request).to_owned();
+    if path.starts_with("/integration/v1/") {
+        return integration::dispatch(request, port, workbench, parsed_body);
+    }
     if path == "/api/snapshot" && method == Method::Get {
         let url = request.url().to_owned();
         let after = snapshot_after(&url);
@@ -1486,12 +1512,17 @@ pub(super) fn parse_json_body(
     request: &mut tiny_http::Request,
 ) -> Result<crate::RawFields, String> {
     let mut body = String::new();
+    let limit = if request_path(request).starts_with("/integration/v1/") {
+        64 * 1024
+    } else {
+        MAX_JSON_BODY
+    };
     request
         .as_reader()
-        .take(MAX_JSON_BODY + 1)
+        .take(limit + 1)
         .read_to_string(&mut body)
         .map_err(|error| error.to_string())?;
-    if body.len() as u64 > MAX_JSON_BODY {
+    if body.len() as u64 > limit {
         return Err("JSON 请求过大".into());
     }
     crate::RawFields::parse(&body).map_err(|error| format!("JSON 无效：{error}"))
