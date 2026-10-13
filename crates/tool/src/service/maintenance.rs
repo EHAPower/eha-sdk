@@ -76,7 +76,7 @@ pub(super) fn ledger_error(error: operations::Error) -> ApiError {
             operations::Error::Capacity | operations::Error::SequenceExhausted => {
                 "operation_capacity"
             }
-            operations::Error::Unresolved => "reservation_busy",
+            operations::Error::Unresolved | operations::Error::Busy => "reservation_busy",
             _ => "bad_request",
         },
         format!("{error:?}"),
@@ -304,12 +304,16 @@ pub(super) fn route(
                 maintenance: enabled,
                 control,
             };
-            let changed = state
-                .book
-                .grant(&member)
-                .is_some_and(|grant| grant.permissions != requested);
+            let previous = state.book.grant(&member).map(|grant| grant.permissions);
+            let changed = previous.is_some_and(|permissions| permissions != requested);
+            let explicitly_revoked_control =
+                previous.is_some_and(|permissions| permissions.control && !requested.control);
             let _control_scope = if control {
-                Some(state.scope(&member)?)
+                state
+                    .book
+                    .can_set_permissions(&member, requested)
+                    .map_err(book_error)?;
+                Some(state.scope_for_control_grant(&member, workbench)?)
             } else {
                 None
             };
@@ -317,6 +321,12 @@ pub(super) fn route(
                 .book
                 .set_permissions(member.clone(), requested)
                 .map_err(book_error)?;
+            if explicitly_revoked_control {
+                state.note_explicit_control_revoke(&member);
+            }
+            if control {
+                state.note_control_grant(&member);
+            }
             if changed {
                 state.retire_member_resources(&member, workbench);
             }
@@ -1057,5 +1067,112 @@ mod tests {
             fresh["grant_id"]
         );
         assert!(f.commands.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_new_alias_control_grant_retires_only_a_quiescent_revoked_scope() {
+        let mut f = fixture();
+        f.state.control_enabled = true;
+        let old = MemberKey::new(
+            &f.state.instance_id,
+            "can:1",
+            f.base["expected_identity"]["uid"].as_str().expect("uid"),
+            f.base["expected_identity"]["run_nonce"]
+                .as_str()
+                .expect("nonce"),
+            "6",
+        )
+        .expect("old alias");
+        f.state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = f.state.scope(&old).expect("old scope");
+        let old_stop = f
+            .state
+            .ledger
+            .stop_id(&old_scope)
+            .expect("old stop")
+            .to_owned();
+        let old_intent = Intent::new(old_scope.clone(), operations::Action::Stop, None, vec![])
+            .expect("old Stop intent");
+        let now = Instant::now();
+        f.state
+            .ledger
+            .admit_stop(&old_stop, old_intent, "operator", &mut f.state.ids, now)
+            .expect("known old Stop");
+        f.state
+            .ledger
+            .begin_attempt(&old_stop)
+            .expect("old Stop attempt");
+        f.state
+            .ledger
+            .finish_attempt(
+                &old_stop,
+                operations::Submission::LocallySubmitted,
+                operations::Effect::Known,
+                now,
+            )
+            .expect("known old Stop");
+        f.state
+            .book
+            .set_permissions(old.clone(), Permissions::default())
+            .expect("explicit revoke");
+        f.state.note_explicit_control_revoke(&old);
+
+        let path = format!("/service/v2/bindings/{}/permissions", f.binding_id);
+        let mut request = f.base.clone();
+        request["permissions"] = json!({"maintenance":false,"control":true});
+        let granted = call(&mut f, &path, Method::Post, request)
+            .expect("new alias control grant")
+            .1;
+
+        assert_ne!(granted["stop_request_id"], old_stop);
+        assert!(
+            granted["control_epoch"]
+                .as_str()
+                .expect("new epoch")
+                .parse::<u64>()
+                .expect("numeric epoch")
+                > old_scope.control_epoch
+        );
+        assert!(!f.state.scopes.contains_key(&old));
+        assert_eq!(f.state.ledger.stop_id(&old_scope), None);
+        assert!(
+            f.state.ledger.get(&old_stop).is_some(),
+            "known Stop receipt remains readable by its operation id"
+        );
+        let old_stop_body = json!({
+            "instance_id":f.state.instance_id,
+            "claimant_id":"operator",
+            "expected_scope":{
+                "target_id":old.target_id,
+                "expected_identity":{"uid":old.uid,"run_nonce":old.run_nonce},
+                "connection_generation":old.connection_generation,
+                "control_epoch":old_scope.control_epoch.to_string()
+            }
+        });
+        let mut control = super::super::control::State::new();
+        let error = super::super::control::route(
+            &format!("/service/v2/control-scopes/{old_stop}/stop"),
+            Method::Post,
+            &RawFields::parse(&old_stop_body.to_string()).expect("old Stop body"),
+            &mut f.bindings,
+            &mut f.state,
+            &mut control,
+            &mut f.owner,
+        )
+        .expect_err("retired scope must reject old canonical Stop POST before ledger replay");
+        assert_eq!(error.code, "binding_stale");
+        assert!(
+            f.commands.try_recv().is_err(),
+            "permission changes send no SDK bytes"
+        );
     }
 }

@@ -188,7 +188,7 @@ impl ReservationBook {
         member: MemberKey,
         permissions: Permissions,
     ) -> Result<Option<Grant>, Error> {
-        self.validate_member(&member)?;
+        self.can_set_permissions(&member, permissions)?;
         if self
             .grants
             .get(&member)
@@ -196,21 +196,6 @@ impl ReservationBook {
         {
             return Ok(self.grants.get(&member).cloned());
         }
-        if permissions != Permissions::default()
-            && !self.grants.contains_key(&member)
-            && self.grants.len() >= self.max_targets
-        {
-            return Err(Error::Capacity);
-        }
-        let next = if permissions == Permissions::default() {
-            None
-        } else {
-            Some(
-                self.next_grant_id
-                    .checked_add(1)
-                    .ok_or(Error::SequenceExhausted)?,
-            )
-        };
         // 退役完整的固定预留；排队或执行中的声明仍绑定原操作，
         // 因此撤销既不转移写入者，也不发送 Stop。
         let retired: Vec<_> = self
@@ -222,18 +207,45 @@ impl ReservationBook {
         for (id, claimant) in retired {
             self.release(&id, &claimant)?;
         }
-        if let Some(next) = next {
+        if permissions != Permissions::default() {
             let grant = Grant {
                 id: format!("{}-grant-{}", self.instance_id, self.next_grant_id),
                 permissions,
             };
-            self.next_grant_id = next;
+            self.next_grant_id += 1;
             self.grants.insert(member, grant.clone());
             Ok(Some(grant))
         } else {
             self.grants.remove(&member);
             Ok(None)
         }
+    }
+
+    pub(crate) fn can_set_permissions(
+        &self,
+        member: &MemberKey,
+        permissions: Permissions,
+    ) -> Result<(), Error> {
+        self.validate_member(member)?;
+        if self
+            .grants
+            .get(member)
+            .is_some_and(|grant| grant.permissions == permissions)
+        {
+            return Ok(());
+        }
+        if permissions != Permissions::default()
+            && !self.grants.contains_key(member)
+            && self.grants.len() >= self.max_targets
+        {
+            return Err(Error::Capacity);
+        }
+        if permissions != Permissions::default() {
+            self.next_grant_id
+                .checked_add(1)
+                .ok_or(Error::SequenceExhausted)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn grant(&self, member: &MemberKey) -> Option<&Grant> {

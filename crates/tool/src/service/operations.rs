@@ -161,10 +161,44 @@ impl RequestIds {
 
     /// 在公布范围具备 Stop 能力之前，为其规范范围预留；绝不因 TTL 到期而失效。
     pub(crate) fn reserve_stop(&mut self, scope: OperationScope) -> Result<String, Error> {
+        self.can_reserve_stop(&scope)?;
+        self.issue(Lane::Stop, scope, None)
+    }
+
+    pub(crate) fn can_reserve_stop(&self, scope: &OperationScope) -> Result<(), Error> {
+        self.can_reserve_stop_after_invalidating(scope, &[])
+    }
+
+    pub(crate) fn can_reserve_stop_after_invalidating(
+        &self,
+        scope: &OperationScope,
+        invalidating: &[String],
+    ) -> Result<(), Error> {
         if scope.members.len() != 1 {
             return Err(Error::InvalidScope);
         }
-        self.issue(Lane::Stop, scope, None)
+        OperationScope::new(scope.members.clone(), scope.control_epoch)?;
+        if scope.members.len() > self.max_members
+            || scope.members[0].instance_id != self.instance_id
+        {
+            return Err(Error::InvalidScope);
+        }
+        let state = &self.stop;
+        let mut reclaimed = BTreeSet::new();
+        for id in invalidating {
+            let (lane, sequence) = self.parse(id)?;
+            if lane == Lane::Stop && state.tickets.contains_key(&sequence) {
+                reclaimed.insert(sequence);
+            }
+        }
+        if state.tickets.len().saturating_sub(reclaimed.len()) >= state.capacity {
+            return Err(Error::Capacity);
+        }
+        state
+            .high_water
+            .checked_add(1)
+            .ok_or(Error::SequenceExhausted)?;
+        Ok(())
     }
 
     fn issue(
@@ -233,6 +267,10 @@ impl RequestIds {
         let (lane, sequence) = self.parse(id)?;
         self.lane_mut(lane).tickets.remove(&sequence);
         Ok(())
+    }
+
+    pub(crate) fn can_invalidate(&self, id: &str) -> Result<(), Error> {
+        self.parse(id).map(|_| ())
     }
 }
 
@@ -474,6 +512,41 @@ impl Ledger {
             },
         );
         Ok(id)
+    }
+
+    /// 检查在指定旧范围已退役后，新的 Stop 范围能否完整分配；不修改账本或请求编号。
+    pub(crate) fn can_reserve_stop_scope_after_retiring(
+        &self,
+        scope: &OperationScope,
+        ids: &RequestIds,
+        retiring: &[OperationScope],
+    ) -> Result<(), Error> {
+        self.validate_context(scope, ids)?;
+        if scope.members.len() != 1 {
+            return Err(Error::InvalidScope);
+        }
+        for old_scope in self.stop_slots.keys() {
+            if retiring.contains(old_scope) {
+                continue;
+            }
+            if old_scope.members[0].uid == scope.members[0].uid {
+                return Err(Error::Busy);
+            }
+        }
+        let retained = self
+            .stop_slots
+            .keys()
+            .filter(|old_scope| !retiring.contains(old_scope))
+            .count();
+        if retained >= self.stop_capacity {
+            return Err(Error::Capacity);
+        }
+        let invalidating = retiring
+            .iter()
+            .filter_map(|scope| self.stop_slots.get(scope))
+            .map(|slot| slot.request_id.clone())
+            .collect::<Vec<_>>();
+        ids.can_reserve_stop_after_invalidating(scope, &invalidating)
     }
 
     pub(crate) fn stop_fenced(&self, scope: &OperationScope) -> bool {
@@ -766,6 +839,50 @@ impl Ledger {
             return Err(Error::Busy);
         }
         ids.invalidate(&slot.request_id)?;
+        self.stop_slots.remove(scope);
+        Ok(())
+    }
+
+    fn check_revoked_stop_scope_retireable(&self, scope: &OperationScope) -> Result<(), Error> {
+        self.stop_slots.get(scope).ok_or(Error::MissingStopSlot)?;
+        let uid = &scope.members[0].uid;
+        if self.records.values().any(|record| {
+            record
+                .intent
+                .scope
+                .members
+                .iter()
+                .any(|member| &member.uid == uid)
+                && !record.reclaimable()
+        }) {
+            return Err(Error::Unresolved);
+        }
+        Ok(())
+    }
+
+    /// 明确撤权后的范围只在全部动作已知时退役；owner 的活动试验门禁由调用方负责。
+    /// 已知的 canonical Stop 回执仍可按普通回执规则读取，但其编号不再能占用新范围。
+    pub(crate) fn can_retire_revoked_stop_scope(
+        &self,
+        scope: &OperationScope,
+    ) -> Result<(), Error> {
+        self.check_revoked_stop_scope_retireable(scope)
+    }
+
+    pub(crate) fn retire_revoked_stop_scope(
+        &mut self,
+        scope: &OperationScope,
+        ids: &mut RequestIds,
+    ) -> Result<(), Error> {
+        self.check_revoked_stop_scope_retireable(scope)?;
+        let id = self
+            .stop_slots
+            .get(scope)
+            .expect("checked stop slot")
+            .request_id
+            .clone();
+        ids.can_invalidate(&id)?;
+        ids.invalidate(&id)?;
         self.stop_slots.remove(scope);
         Ok(())
     }
@@ -1144,6 +1261,86 @@ mod tests {
                 .expect("test invariant"),
             id
         );
+    }
+
+    #[test]
+    fn revoked_scope_retires_known_stop_slot_without_erasing_its_receipt() {
+        let now = Instant::now();
+        let mut ids = ids();
+        let mut ledger =
+            Ledger::new("instance", 2, 2, Duration::from_secs(30)).expect("test invariant");
+        let scope = scope();
+        let id = ledger
+            .reserve_stop_scope(scope.clone(), &mut ids)
+            .expect("test invariant");
+        let stop = Intent::new(scope.clone(), Action::Stop, None, vec![]).expect("test invariant");
+        ledger
+            .admit_stop(&id, stop, "manual", &mut ids, now)
+            .expect("test invariant");
+        ledger.begin_attempt(&id).expect("test invariant");
+        ledger
+            .finish_attempt(&id, Submission::LocallySubmitted, Effect::Known, now)
+            .expect("test invariant");
+
+        ledger
+            .retire_revoked_stop_scope(&scope, &mut ids)
+            .expect("known revoked scope retires immediately");
+
+        assert_eq!(ledger.stop_id(&scope), None);
+        assert_eq!(
+            ledger.get(&id).expect("known receipt remains").submission,
+            Submission::LocallySubmitted
+        );
+        assert_eq!(ids.claim(&id, &scope, now), Err(Error::Expired));
+    }
+
+    #[test]
+    fn known_current_trial_receipt_does_not_block_revoked_scope_retirement() {
+        let now = Instant::now();
+        let mut ids = ids();
+        let mut ledger =
+            Ledger::new("instance", 2, 2, Duration::from_secs(30)).expect("test invariant");
+        let scope = scope();
+        ledger
+            .reserve_stop_scope(scope.clone(), &mut ids)
+            .expect("test invariant");
+        let trial_id = ids
+            .issue_normal(scope.clone(), now)
+            .expect("test invariant");
+        let mut trial = intent(scope.clone(), "1");
+        trial.action = Action::TrialStart;
+        ledger
+            .admit_normal(&trial_id, trial, "operator", &mut ids, now)
+            .expect("test invariant");
+        ledger.begin_attempt(&trial_id).expect("test invariant");
+        ledger
+            .finish_attempt(&trial_id, Submission::LocallySubmitted, Effect::Known, now)
+            .expect("test invariant");
+        ledger.retain_current_trials([trial_id.as_str()].into_iter());
+
+        ledger
+            .retire_revoked_stop_scope(&scope, &mut ids)
+            .expect("known current trial receipt does not keep a revoked scope active");
+        assert!(ledger.get(&trial_id).is_some());
+        assert_eq!(ledger.stop_id(&scope), None);
+    }
+
+    #[test]
+    fn stop_slot_preflight_reclaims_only_the_retired_unconsumed_ticket_capacity() {
+        let mut ids =
+            RequestIds::new("instance", 2, 1, 2, Duration::from_secs(1)).expect("test invariant");
+        let mut ledger =
+            Ledger::new("instance", 2, 2, Duration::from_secs(1)).expect("test invariant");
+        let old = scope();
+        ledger
+            .reserve_stop_scope(old.clone(), &mut ids)
+            .expect("old canonical Stop");
+        let replacement =
+            OperationScope::new(vec![member("usb:b", "uid-a")], 2).expect("test invariant");
+
+        ledger
+            .can_reserve_stop_scope_after_retiring(&replacement, &ids, &[old])
+            .expect("the retiring unconsumed Stop ticket frees one projected slot");
     }
 
     #[test]

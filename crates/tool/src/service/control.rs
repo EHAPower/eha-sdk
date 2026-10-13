@@ -1964,8 +1964,8 @@ mod tests {
             .admit(
                 &mut common,
                 &mut wb,
-                member,
-                scope,
+                member.clone(),
+                scope.clone(),
                 None,
                 "operator",
                 &stop,
@@ -2016,6 +2016,21 @@ mod tests {
         .expect("completed current trial keeps receipt after release");
         assert_eq!(completed["trial"]["state"], "completed");
         assert_eq!(completed["operation"], original);
+
+        common
+            .book
+            .set_permissions(member.clone(), Permissions::default())
+            .expect("explicit old control revoke");
+        common.note_explicit_control_revoke(&member);
+        let alias =
+            MemberKey::new("test", "usb:4", &member.uid, &member.run_nonce, "4").expect("alias");
+        let replacement = common
+            .scope_for_control_grant(&alias, &mut wb)
+            .expect("completed trial receipt permits a quiescent explicit alias replacement");
+        assert!(replacement.control_epoch > scope.control_epoch);
+        assert_eq!(control.trials.get(&member), Some(&id));
+        assert!(common.ledger.get(&id).is_some());
+        assert_eq!(common.ledger.stop_id(&scope), None);
     }
 
     #[test]

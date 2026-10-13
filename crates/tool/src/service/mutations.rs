@@ -24,6 +24,7 @@ pub(super) struct State {
     pub(super) ids: RequestIds,
     pub(super) ledger: Ledger,
     pub(super) scopes: BTreeMap<MemberKey, OperationScope>,
+    explicitly_revoked_control: BTreeSet<MemberKey>,
     pub(super) reservations: BTreeMap<String, Held>,
     pub(super) tickets: BTreeMap<String, Ticket>,
     pub(super) receipts: BTreeMap<String, Receipt>,
@@ -109,6 +110,7 @@ impl State {
             ledger: Ledger::new(instance_id, MAX_OPERATIONS, MAX_SCOPES, TTL)
                 .map_err(|e| format!("{e:?}"))?,
             scopes: BTreeMap::new(),
+            explicitly_revoked_control: BTreeSet::new(),
             reservations: BTreeMap::new(),
             tickets: BTreeMap::new(),
             receipts: BTreeMap::new(),
@@ -358,6 +360,122 @@ impl State {
         self.scopes.insert(member.clone(), scope.clone());
         Ok(scope)
     }
+
+    fn preflight_scope_after_retiring(
+        &self,
+        member: &MemberKey,
+        retiring: &[OperationScope],
+    ) -> Result<OperationScope, ApiError> {
+        if self.scopes.len().saturating_sub(retiring.len()) >= MAX_SCOPES {
+            return Err(denied("operation_capacity", "固定执行范围容量已满"));
+        }
+        self.next_epoch
+            .checked_add(1)
+            .ok_or_else(|| denied("operation_capacity", "执行代次耗尽"))?;
+        let scope =
+            OperationScope::new(vec![member.clone()], self.next_epoch).map_err(ledger_error)?;
+        self.ledger
+            .can_reserve_stop_scope_after_retiring(&scope, &self.ids, retiring)
+            .map_err(ledger_error)?;
+        Ok(scope)
+    }
+
+    fn install_preflighted_scope(
+        &mut self,
+        member: &MemberKey,
+        scope: OperationScope,
+    ) -> OperationScope {
+        self.ledger
+            .reserve_stop_scope(scope.clone(), &mut self.ids)
+            .expect("preflighted stop scope allocation");
+        self.next_epoch = self
+            .next_epoch
+            .checked_add(1)
+            .expect("preflighted control epoch");
+        self.scopes.insert(member.clone(), scope.clone());
+        scope
+    }
+
+    /// 新观察 alias 只能接替已明确撤权、且 owner 本地状态已静止的同 UID 旧范围。
+    pub(super) fn scope_for_control_grant(
+        &mut self,
+        member: &MemberKey,
+        workbench: &mut Workbench,
+    ) -> Result<OperationScope, ApiError> {
+        if self.scopes.contains_key(member) {
+            return self.scope(member);
+        }
+        let retired: Vec<_> = self
+            .scopes
+            .iter()
+            .filter(|(old, _)| old.uid == member.uid && *old != member)
+            .map(|(old, scope)| (old.clone(), scope.clone()))
+            .collect();
+        for (old, scope) in &retired {
+            let explicitly_revoked = self.explicitly_revoked_control.contains(old);
+            let same_device_run = old.run_nonce == member.run_nonce;
+            let holds_reservation = self
+                .reservations
+                .values()
+                .any(|held| held.scope.members.contains(old));
+            let holds_ticket = self
+                .tickets
+                .values()
+                .any(|ticket| ticket.scope.members.contains(old));
+            let local_active = workbench
+                .integration_session_mut(&old.target_id)
+                .is_some_and(|session| {
+                    let recording = session.recording_snapshot();
+                    let blocker = session.integration_read_blocker();
+                    session.integration_unresolved_trial()
+                        || recording["active"] == true
+                        || recording["pending_start"] == true
+                        || recording["pending_finish"] == true
+                        || blocker.is_some_and(|reason| {
+                            !matches!(reason, "awaiting_telemetry" | "stale_telemetry")
+                        })
+                });
+            if !same_device_run
+                || !explicitly_revoked
+                || holds_reservation
+                || holds_ticket
+                || self.book.claim(&old.uid).is_some()
+                || local_active
+            {
+                return Err(denied(
+                    "reservation_busy",
+                    "同 UID 的原控制范围尚未安全退役",
+                ));
+            }
+            self.ledger
+                .can_retire_revoked_stop_scope(scope)
+                .map_err(ledger_error)?;
+            let stop_id = self
+                .ledger
+                .stop_id(scope)
+                .expect("preflighted fixed stop scope");
+            self.ids.can_invalidate(stop_id).map_err(ledger_error)?;
+        }
+        let retired_scopes: Vec<_> = retired.iter().map(|(_, scope)| scope.clone()).collect();
+        let next_scope = self.preflight_scope_after_retiring(member, &retired_scopes)?;
+        for (old, scope) in retired {
+            self.ledger
+                .retire_revoked_stop_scope(&scope, &mut self.ids)
+                .expect("preflighted fixed scope retirement");
+            self.scopes.remove(&old);
+            self.explicitly_revoked_control.remove(&old);
+        }
+        Ok(self.install_preflighted_scope(member, next_scope))
+    }
+
+    pub(super) fn note_explicit_control_revoke(&mut self, member: &MemberKey) {
+        self.explicitly_revoked_control.insert(member.clone());
+    }
+
+    pub(super) fn note_control_grant(&mut self, member: &MemberKey) {
+        self.explicitly_revoked_control.remove(member);
+    }
+
     pub(super) fn invalidate_reservation_tickets(&mut self, reservation_id: &str) {
         let ids: Vec<_> = self
             .tickets
@@ -598,6 +716,7 @@ impl State {
             {
                 self.scopes.remove(&member);
                 self.reconnect_required.remove(&member);
+                self.explicitly_revoked_control.remove(&member);
             }
         }
     }
@@ -1110,6 +1229,336 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn explicitly_revoked_quiescent_alias_retires_its_stop_scope_before_new_alias_grant() {
+        let mut state = State::new("instance").expect("state");
+        let old = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("old");
+        let new = MemberKey::new("instance", "usb:4", "uid-a", "nonce", "4").expect("new");
+        state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = state.scope(&old).expect("old scope");
+        let old_stop = state
+            .ledger
+            .stop_id(&old_scope)
+            .expect("old canonical Stop")
+            .to_owned();
+        state
+            .book
+            .set_permissions(old.clone(), Permissions::default())
+            .expect("explicit old revoke");
+        state.note_explicit_control_revoke(&old);
+
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+        let new_scope = state
+            .scope_for_control_grant(&new, &mut owner)
+            .expect("safe old alias retirement permits the new explicit grant");
+
+        assert_eq!(new_scope.members, vec![new.clone()]);
+        assert!(new_scope.control_epoch > old_scope.control_epoch);
+        assert!(!state.scopes.contains_key(&old));
+        assert_eq!(state.ledger.stop_id(&old_scope), None);
+        assert_eq!(
+            state.ids.claim(&old_stop, &old_scope, Instant::now()),
+            Err(super::super::operations::Error::Expired)
+        );
+    }
+
+    #[test]
+    fn same_member_control_grant_rotates_a_reclaimable_fenced_scope() {
+        let mut state = State::new("instance").expect("state");
+        let member = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("member");
+        state
+            .book
+            .set_permissions(
+                member.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("grant");
+        let old_scope = state.scope(&member).expect("old scope");
+        let stop = state
+            .ledger
+            .stop_id(&old_scope)
+            .expect("canonical Stop")
+            .to_owned();
+        let now = Instant::now();
+        state
+            .ledger
+            .admit_stop(
+                &stop,
+                Intent::new(old_scope.clone(), Action::Stop, None, vec![]).expect("Stop intent"),
+                "operator",
+                &mut state.ids,
+                now,
+            )
+            .expect("Stop admission");
+        state.ledger.begin_attempt(&stop).expect("Stop attempt");
+        state
+            .ledger
+            .finish_attempt(
+                &stop,
+                Submission::LocallySubmitted,
+                Effect::Known,
+                now - TTL - std::time::Duration::from_millis(1),
+            )
+            .expect("known Stop");
+
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+        let replacement = state
+            .scope_for_control_grant(&member, &mut owner)
+            .expect("same MemberKey follows the established fenced scope rotation");
+
+        assert!(replacement.control_epoch > old_scope.control_epoch);
+        assert_ne!(state.ledger.stop_id(&replacement), Some(stop.as_str()));
+        assert_eq!(state.ledger.stop_id(&old_scope), None);
+    }
+
+    #[test]
+    fn exhausted_new_epoch_leaves_the_revoked_old_alias_scope_intact() {
+        let mut state = State::new("instance").expect("state");
+        let old = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("old");
+        let new = MemberKey::new("instance", "usb:4", "uid-a", "nonce", "4").expect("new");
+        state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = state.scope(&old).expect("old scope");
+        let old_stop = state
+            .ledger
+            .stop_id(&old_scope)
+            .expect("old canonical Stop")
+            .to_owned();
+        state
+            .book
+            .set_permissions(old.clone(), Permissions::default())
+            .expect("explicit old revoke");
+        state.note_explicit_control_revoke(&old);
+        state.next_epoch = u64::MAX;
+
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+        assert_eq!(
+            state
+                .scope_for_control_grant(&new, &mut owner)
+                .expect_err("new epoch exhaustion must precede old scope retirement")
+                .code,
+            "operation_capacity"
+        );
+        assert_eq!(state.scopes.get(&old), Some(&old_scope));
+        assert_eq!(state.ledger.stop_id(&old_scope), Some(old_stop.as_str()));
+        assert!(
+            state
+                .ids
+                .claim(&old_stop, &old_scope, Instant::now())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn unresolved_old_alias_never_retires_to_admit_a_new_alias() {
+        let mut state = State::new("instance").expect("state");
+        let old = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("old");
+        let new = MemberKey::new("instance", "usb:4", "uid-a", "nonce", "4").expect("new");
+        state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = state.scope(&old).expect("old scope");
+        let now = Instant::now();
+        let id = state
+            .ids
+            .issue_normal(old_scope.clone(), now)
+            .expect("old ticket");
+        state
+            .ledger
+            .admit_normal(
+                &id,
+                Intent::new(old_scope.clone(), Action::Position, None, vec![]).expect("intent"),
+                "operator",
+                &mut state.ids,
+                now,
+            )
+            .expect("old operation");
+        state.ledger.begin_attempt(&id).expect("attempt");
+        state
+            .ledger
+            .finish_attempt(&id, Submission::Unknown, Effect::Unresolved, now)
+            .expect("unknown result");
+        state
+            .book
+            .set_permissions(old.clone(), Permissions::default())
+            .expect("explicit old revoke");
+        state.note_explicit_control_revoke(&old);
+
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+        assert_eq!(
+            state
+                .scope_for_control_grant(&new, &mut owner)
+                .expect_err("unknown old operation blocks alias replacement")
+                .code,
+            "reservation_busy"
+        );
+        assert_eq!(state.scopes.get(&old), Some(&old_scope));
+    }
+
+    #[test]
+    fn automatic_old_alias_revoke_never_authorizes_a_new_alias() {
+        let mut state = State::new("instance").expect("state");
+        let old = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("old");
+        let new = MemberKey::new("instance", "usb:4", "uid-a", "nonce", "4").expect("new");
+        state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = state.scope(&old).expect("old scope");
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+        state
+            .revoke(&old, &mut owner)
+            .expect("automatic identity retirement");
+
+        assert_eq!(
+            state
+                .scope_for_control_grant(&new, &mut owner)
+                .expect_err("automatic revoke must not transfer a control scope")
+                .code,
+            "reservation_busy"
+        );
+        assert_eq!(state.scopes.get(&old), Some(&old_scope));
+    }
+
+    #[test]
+    fn unobservable_old_owner_never_retires_to_admit_a_new_alias() {
+        let mut state = State::new("instance").expect("state");
+        let old = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("old");
+        let new = MemberKey::new("instance", "usb:4", "uid-a", "nonce", "4").expect("new");
+        state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = state.scope(&old).expect("old scope");
+        state
+            .book
+            .set_permissions(old.clone(), Permissions::default())
+            .expect("explicit old revoke");
+        state.note_explicit_control_revoke(&old);
+        let mut owner = Workbench::with_test_sessions(
+            crate::session::ToolSession::new(),
+            BTreeMap::from([(1, crate::session::ToolSession::new())]),
+        );
+
+        assert_eq!(
+            state
+                .scope_for_control_grant(&new, &mut owner)
+                .expect_err("unobservable old owner cannot prove heartbeat is off")
+                .code,
+            "reservation_busy"
+        );
+        assert_eq!(state.scopes.get(&old), Some(&old_scope));
+    }
+
+    #[test]
+    fn obsolete_scope_retirement_clears_its_explicit_revoke_marker() {
+        let mut state = State::new("instance").expect("state");
+        let member = MemberKey::new("instance", "can:1", "uid-a", "nonce", "6").expect("member");
+        state
+            .book
+            .set_permissions(
+                member.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("grant");
+        let scope = state.scope(&member).expect("scope");
+        state
+            .book
+            .set_permissions(member.clone(), Permissions::default())
+            .expect("explicit revoke");
+        state.note_explicit_control_revoke(&member);
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+
+        state.poll(&mut owner);
+
+        assert!(!state.scopes.contains_key(&member));
+        assert_eq!(state.ledger.stop_id(&scope), None);
+        assert!(!state.explicitly_revoked_control.contains(&member));
+    }
+
+    #[test]
+    fn explicit_old_revoke_never_transfers_control_across_run_nonce() {
+        let mut state = State::new("instance").expect("state");
+        let old = MemberKey::new("instance", "can:1", "uid-a", "old-run", "6").expect("old");
+        let new = MemberKey::new("instance", "usb:4", "uid-a", "new-run", "4").expect("new");
+        state
+            .book
+            .set_permissions(
+                old.clone(),
+                Permissions {
+                    maintenance: false,
+                    control: true,
+                },
+            )
+            .expect("old grant");
+        let old_scope = state.scope(&old).expect("old scope");
+        state
+            .book
+            .set_permissions(old.clone(), Permissions::default())
+            .expect("explicit old revoke");
+        state.note_explicit_control_revoke(&old);
+        let mut owner =
+            Workbench::with_test_sessions(crate::session::ToolSession::new(), BTreeMap::new());
+
+        assert_eq!(
+            state
+                .scope_for_control_grant(&new, &mut owner)
+                .expect_err("a new run cannot inherit an old revoked scope")
+                .code,
+            "reservation_busy"
+        );
+        assert_eq!(state.scopes.get(&old), Some(&old_scope));
+    }
+
     #[test]
     fn retired_owner_scopes_never_erase_or_overflow_readback_obligations() {
         let mut state = State::new("instance").expect("state");
