@@ -17,8 +17,8 @@ use std::{
 use tiny_http::{Response, StatusCode};
 
 const PROTOCOL: &str = "eha-tool.integration.v1";
-const RESPONSE_BYTES: usize = 1024 * 1024;
-const MAX_BINDINGS: usize = 8;
+pub(super) const RESPONSE_BYTES: usize = 1024 * 1024;
+pub(super) const MAX_BINDINGS: usize = 8;
 pub(super) const MIN_LEASE_MS: u64 = 1_000;
 pub(super) const MAX_LEASE_MS: u64 = 121_000;
 
@@ -378,7 +378,7 @@ impl IntegrationState {
                 return respond(
                     request,
                     200,
-                    super::v2::describe(&self.instance_id, RESPONSE_BYTES, MAX_BINDINGS),
+                    super::v2::describe(&self.instance_id, RESPONSE_BYTES, MAX_BINDINGS, false),
                 );
             }
             let mut value = self.envelope();
@@ -919,6 +919,23 @@ pub(super) fn authorize(
     port: u16,
     state: Option<&IntegrationState>,
 ) -> Result<(), (u16, &'static str, &'static str)> {
+    authorize_inner(request, port, state, false)
+}
+
+pub(super) fn authorize_direct_api(
+    request: &tiny_http::Request,
+    port: u16,
+    state: Option<&IntegrationState>,
+) -> Result<(), (u16, &'static str, &'static str)> {
+    authorize_inner(request, port, state, true)
+}
+
+fn authorize_inner(
+    request: &tiny_http::Request,
+    port: u16,
+    state: Option<&IntegrationState>,
+    allow_query: bool,
+) -> Result<(), (u16, &'static str, &'static str)> {
     let Some(state) = state else {
         return Err((404, "not_found", "本机集成未启用"));
     };
@@ -930,10 +947,11 @@ pub(super) fn authorize(
     if hosts.len() != 1 || hosts[0].value.as_str() != format!("127.0.0.1:{port}") {
         return Err((403, "origin_rejected", "Host 不是本机集成端口"));
     }
-    let v2_query = state.version == 2
-        && request_method(request) == Method::Get
-        && (request_path(request) == "/service/v2/events"
-            || request_path(request).starts_with("/service/v2/recordings/"));
+    let v2_query = (allow_query && request_method(request) == Method::Get)
+        || (state.version == 2
+            && request_method(request) == Method::Get
+            && (request_path(request) == "/service/v2/events"
+                || request_path(request).starts_with("/service/v2/recordings/")));
     if request.url().contains('?') && !v2_query {
         return Err((400, "bad_request", "集成路由不接受查询参数"));
     }
@@ -948,11 +966,11 @@ pub(super) fn authorize(
     if headers.len() != 1 || headers[0].value.as_str() != format!("Bearer {}", state.token) {
         return Err((401, "unauthorized", "集成凭据无效"));
     }
-    if request_method(request) == Method::Post
+    let json_write = request_method(request) == Method::Post
         || (state.version == 2
             && request_method(request) == Method::Delete
-            && request_path(request).starts_with("/service/v2/profiles/"))
-    {
+            && request_path(request).starts_with("/service/v2/profiles/"));
+    if json_write {
         if !header(request, "Content-Type").is_some_and(|value| {
             value
                 .split(';')
@@ -961,9 +979,10 @@ pub(super) fn authorize(
         }) {
             return Err((400, "bad_request", "请求需要 application/json"));
         }
-        if header(request, "Content-Length")
-            .and_then(|value| value.parse::<u64>().ok())
-            .is_some_and(|length| length > 65536)
+        if !allow_query
+            && header(request, "Content-Length")
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > 65536)
         {
             return Err((413, "bad_request", "JSON 请求超过 64 KiB"));
         }

@@ -325,12 +325,17 @@ mod tests {
         let server = tiny_http::Server::http(("127.0.0.1", 0)).expect("listener");
         let port = server.server_addr().to_ip().expect("IP").port();
         let token = fixture.0.join("token");
-        assert!(super::super::serve(port, None, None, path.clone(), Some(path.clone())).is_err());
+        assert!(
+            super::super::serve(port, None, None, path.clone(), Some(path.clone()), false).is_err()
+        );
         assert_eq!(fs::read(&path).expect("record cannot become token"), before);
-        assert!(super::super::serve(port, None, None, token.clone(), Some(path.clone())).is_err());
+        assert!(
+            super::super::serve(port, None, None, token.clone(), Some(path.clone()), false)
+                .is_err()
+        );
         assert_eq!(fs::read(&path).expect("after conflict"), before);
         fs::write(&token, b"invalid\n").expect("corrupt token");
-        assert!(super::super::serve(port, None, None, token, Some(path.clone())).is_err());
+        assert!(super::super::serve(port, None, None, token, Some(path.clone()), false).is_err());
         assert_eq!(fs::read(&path).expect("after bad token"), before);
         drop(guard);
     }
@@ -353,7 +358,8 @@ mod tests {
         let instance_path = path.clone();
         let token_path = token.clone();
         thread::spawn(move || {
-            let result = super::super::serve(port, None, None, token_path, Some(instance_path));
+            let result =
+                super::super::serve(port, None, None, token_path, Some(instance_path), false);
             let _ = sender.send(result);
         });
         let descriptor = (0..100)

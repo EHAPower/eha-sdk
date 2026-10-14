@@ -319,7 +319,7 @@ fn serve(directory: PathBuf, port: u16, scenario: Scenario, ttl: Duration) -> Re
         Some(runs.clone()),
         Some(directory.join(format!("port-{port}.token"))),
         Some(directory.join(format!("port-{port}.json"))),
-        false,
+        super::RouteMode::ServiceV2,
         move |_, credentials, _| {
             workbench(runs, credentials.expect("v2 credentials"), scenario, trace)
         },

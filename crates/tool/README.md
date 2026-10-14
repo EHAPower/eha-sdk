@@ -2,11 +2,13 @@
 
 # `eha-tool`
 
-`eha-tool` 是 EHA 的官方命令行工具，提供单次 CLI、持久 Shell 和本机 WebUI。它通过
+`eha-tool` 是 EHA 的官方命令行工具，提供单次 CLI、持久 Shell 和独立服务。它通过
 [`eha-sdk`](../../README.md)访问**明确选择**的控制器；协议、配置格式和客户接入规则仍由 SDK
 维护。本文说明工具旅程和资源边界；精确的命令、参数、默认值和版本以
 `eha-tool --help` 及对应子命令的 `--help` 为准。构建、安装和检查入口见
 [根贡献指南](../../CONTRIBUTING.md)。
+
+> **旧 WebUI 已冻结并弃用。** `eha-tool webui` 现有命令和功能仍可使用，以便既有部署过渡；不再新增功能或更新仅服务于该页面的实现，并计划在后续版本删除。冻结范围只包括旧 WebUI 及其专属实现：独立 `eha-tool` 服务、CLI、Shell 和共享 SDK 能力继续维护；后续图形入口为 `dsh-fieldkit` 插件。
 
 ## 本机只读集成
 

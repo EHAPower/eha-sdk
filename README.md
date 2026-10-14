@@ -6,7 +6,7 @@
 
 | 使用方式 | 入口 |
 |---|---|
-| 官方工具 | [`eha-tool` 的 CLI、Shell 与 WebUI](crates/tool/README.md) |
+| 官方工具 | [`eha-tool` 的 CLI、Shell 与独立服务](crates/tool/README.md)；旧 WebUI 已冻结、弃用，现有命令仍可使用，后续图形入口为 `dsh-fieldkit` 插件 |
 | Rust 程序 | 下方[最小调用](#最小-rust-调用)、rustdoc 和[示例](#示例与检查)；CAN、USB 共用 `host::Client` |
 | 自行实现 CAN 客户端 | [CAN 接入指南](CAN接入指南.md)，不依赖 Rust SDK |
 | 实现编解码或传输 | [公共应用通信协议](docs/通信协议/公共应用通信协议.md)、[CAN 绑定](docs/通信协议/CAN通信绑定.md)、[USB 绑定](docs/通信协议/USB通信绑定.md) |

@@ -48,6 +48,23 @@ mod workbench;
 
 use crate::webui::{StaticResponse, static_response};
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RouteMode {
+    Webui,
+    ServiceV2,
+    DirectApi,
+}
+
+impl RouteMode {
+    fn legacy_routes(self) -> bool {
+        matches!(self, Self::Webui | Self::DirectApi)
+    }
+
+    fn direct_api(self) -> bool {
+        matches!(self, Self::DirectApi)
+    }
+}
+
 #[cfg(test)]
 struct Sessions(Workbench);
 
@@ -431,7 +448,7 @@ pub(crate) fn serve_webui(
         runs_dir,
         integration_token_file,
         None,
-        true,
+        RouteMode::Webui,
     )
 }
 
@@ -441,6 +458,7 @@ pub(crate) fn serve(
     runs_dir: Option<PathBuf>,
     token_file: PathBuf,
     instance_file: Option<PathBuf>,
+    direct_api: bool,
 ) -> Result<(), String> {
     run(
         port,
@@ -448,25 +466,40 @@ pub(crate) fn serve(
         runs_dir,
         Some(token_file),
         instance_file,
-        false,
+        if direct_api {
+            RouteMode::DirectApi
+        } else {
+            RouteMode::ServiceV2
+        },
     )
 }
 
 fn prepare_workbench(
     runs_dir: Option<PathBuf>,
     credentials: Option<integration::IntegrationState>,
-    legacy_routes: bool,
+    mode: RouteMode,
 ) -> Workbench {
     let mut workbench = Workbench::new(runs_dir.unwrap_or_else(Workbench::default_runs_dir));
-    workbench.legacy_routes = legacy_routes;
+    workbench.legacy_routes = mode.legacy_routes();
+    workbench.direct_api = mode.direct_api();
     if let Some(credentials) = credentials {
-        workbench.mutations =
-            Some(mutations::State::new(&credentials.instance_id).expect("fixed mutation limits"));
+        if mode != RouteMode::DirectApi {
+            workbench.mutations = Some(
+                mutations::State::new(&credentials.instance_id).expect("fixed mutation limits"),
+            );
+        }
         workbench.v2 = Some(credentials.for_v2());
-        workbench.integration = Some(credentials);
+        if mode != RouteMode::DirectApi {
+            workbench.integration = Some(credentials);
+        }
     }
-    if legacy_routes {
+    if mode == RouteMode::Webui {
         workbench.autoconnect_once();
+    }
+    if mode == RouteMode::DirectApi {
+        workbench.control = None;
+        workbench.control_groups = None;
+        workbench.control_reads = None;
     }
     workbench
 }
@@ -477,7 +510,7 @@ fn run(
     runs_dir: Option<PathBuf>,
     token_file: Option<PathBuf>,
     instance_file: Option<PathBuf>,
-    legacy_routes: bool,
+    mode: RouteMode,
 ) -> Result<(), String> {
     run_with_workbench(
         port,
@@ -485,7 +518,7 @@ fn run(
         runs_dir,
         token_file,
         instance_file,
-        legacy_routes,
+        mode,
         prepare_workbench,
     )
 }
@@ -497,14 +530,14 @@ fn run_with_workbench(
     runs_dir: Option<PathBuf>,
     token_file: Option<PathBuf>,
     instance_file: Option<PathBuf>,
-    legacy_routes: bool,
+    mode: RouteMode,
     make_workbench: impl FnOnce(
         Option<PathBuf>,
         Option<integration::IntegrationState>,
-        bool,
+        RouteMode,
     ) -> Workbench,
 ) -> Result<(), String> {
-    let instance_file = if legacy_routes {
+    let instance_file = if mode == RouteMode::Webui {
         None
     } else {
         Some(match instance_file {
@@ -523,7 +556,7 @@ fn run_with_workbench(
     let mut credentials = token_file
         .as_deref()
         .map(|path| {
-            if legacy_routes {
+            if mode == RouteMode::Webui {
                 integration::IntegrationState::legacy(path)
             } else {
                 integration::IntegrationState::new(path)
@@ -534,13 +567,13 @@ fn run_with_workbench(
         credentials.endpoint = format!("http://127.0.0.1:{port}");
     }
     let server = http_io::server(port)?;
-    let mut workbench = make_workbench(runs_dir, credentials, legacy_routes);
+    let mut workbench = make_workbench(runs_dir, credentials, mode);
     let mut odrive = OdriveView::new(odrive_python);
     let mut scan = CanScanView::new();
     let mut io_deadlines = http_io::Deadlines::default();
     let body_reader = BodyReader::new();
     let stop_reader = stop_body::StopBodyReader::new();
-    let published = if legacy_routes {
+    let published = if mode == RouteMode::Webui {
         None
     } else {
         let state = workbench.v2.as_ref().expect("serve credentials");
@@ -559,7 +592,7 @@ fn run_with_workbench(
             &descriptor,
         )?)
     };
-    let ready = if legacy_routes {
+    let ready = if mode == RouteMode::Webui {
         format!("WebUI 本地入口：http://127.0.0.1:{port}/")
     } else {
         v2::ready(
@@ -674,6 +707,7 @@ fn handle_received_request(
     let path = request_path(&request);
     let service_v2 = path.starts_with("/service/v2/");
     let integration = path.starts_with("/integration/v1/");
+    let direct_api = workbench.direct_api && path.starts_with("/api/");
     if !workbench.legacy_routes && !service_v2 && !integration {
         return v2::not_found(request, workbench.v2.as_ref());
     }
@@ -695,6 +729,12 @@ fn handle_received_request(
             message,
         );
     }
+    if direct_api
+        && let Err((status, code, message)) =
+            integration::authorize_direct_api(&request, port, workbench.v2.as_ref())
+    {
+        return integration::respond_error(request, workbench.v2.as_ref(), status, code, message);
+    }
     #[cfg(test)]
     if let Some(fixture) = workbench.p5_fixture.as_ref() {
         if !p5_fixture::allowed_path(path, request_method(&request)) {
@@ -713,6 +753,7 @@ fn handle_received_request(
         }
     }
     if !service_v2
+        && !direct_api
         && workbench.control_blocks_sync()
         && (path.starts_with("/api/")
             || matches!(request_method(&request), Method::Post | Method::Delete))
@@ -732,6 +773,7 @@ fn handle_received_request(
     }
     if !integration
         && !service_v2
+        && !direct_api
         && let Err(message) = validate_write_request(&request, port)
     {
         return respond_json(request, 403, json!({"ok":false,"message":message}));
@@ -743,7 +785,7 @@ fn handle_received_request(
         let body = parse_json_body(&mut request);
         return handle_request_with_scan_body(request, port, workbench, odrive, scan, Some(body));
     }
-    let error_envelope = if service_v2 {
+    let error_envelope = if service_v2 || direct_api {
         workbench
             .v2
             .as_ref()
@@ -815,6 +857,9 @@ fn handle_request_with_scan_body(
     }
     if path.starts_with("/integration/v1/") {
         return integration::dispatch(request, port, workbench, parsed_body);
+    }
+    if workbench.direct_api && !path.starts_with("/api/") {
+        return v2::not_found(request, workbench.v2.as_ref());
     }
     if path == "/api/snapshot" && method == Method::Get {
         let url = request.url().to_owned();
@@ -1500,6 +1545,9 @@ fn handle_request_with_scan_body(
             _ => respond_json(request, 404, json!({"ok":false,"message":"未知 API 路径"})),
         };
     }
+    if workbench.direct_api {
+        return v2::not_found(request, workbench.v2.as_ref());
+    }
     respond_static(request, static_response(method, &path))
 }
 
@@ -1886,7 +1934,7 @@ mod tests {
         let mut workbench = super::prepare_workbench(
             None,
             Some(super::integration::IntegrationState::for_test()),
-            false,
+            super::RouteMode::ServiceV2,
         );
         assert!(!workbench.legacy_routes);
         assert!(workbench.integration_session_mut("can:1").is_none());
@@ -1938,6 +1986,100 @@ mod tests {
         assert_eq!(ready["event"], "ready");
         assert_eq!(ready["instance_id"], "i-test");
         assert!(ready.get("token").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_api_keeps_lifecycle_but_exposes_only_authenticated_api_routes()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        let mut workbench = super::prepare_workbench(
+            None,
+            Some(super::integration::IntegrationState::for_test()),
+            super::RouteMode::DirectApi,
+        );
+        assert!(workbench.legacy_routes);
+        assert!(workbench.direct_api);
+        assert!(workbench.mutations.is_none());
+        assert!(workbench.integration.is_none());
+        assert!(workbench.control.is_none());
+
+        let (status, describe) = super::integration::tests::call(
+            &mut workbench,
+            "GET",
+            "/service/v2/describe",
+            None,
+            true,
+            false,
+        )?;
+        assert_eq!(status, 200);
+        assert_eq!(
+            describe["capabilities"],
+            json!(["instance_status", "service_shutdown", "direct_api"])
+        );
+        assert_eq!(describe["limitations"]["mutation_ledger_supported"], false);
+        assert_eq!(
+            describe["limitations"]["sdk_read_execution"],
+            "synchronous_workbench"
+        );
+        assert_eq!(describe["limitations"]["read_gate"], "native_workbench");
+        for field in [
+            "mutations_supported",
+            "maintenance_supported",
+            "control_supported",
+            "can_connect_supported",
+            "recording_write_supported",
+        ] {
+            assert_eq!(describe["limitations"][field], true, "{field}");
+        }
+        assert!(describe["limits"].get("max_bindings").is_none());
+        assert!(
+            describe["limits"]
+                .get("max_maintenance_reservations")
+                .is_none()
+        );
+        let (status, _) = super::integration::tests::call(
+            &mut workbench,
+            "GET",
+            "/service/v2/targets",
+            None,
+            true,
+            false,
+        )?;
+        assert_eq!(status, 404);
+
+        let mut odrive = OdriveView::new(None);
+        let mut scan = super::CanScanView::new();
+        let reader = super::BodyReader::new();
+        for (path, expected) in [("/api/config/schema", "200"), ("/", "404")] {
+            let server = Server::http(("127.0.0.1", 0))?;
+            let address = server.server_addr().to_ip().ok_or("no IP socket")?;
+            let text = format!(
+                "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer test-token\r\nConnection: close\r\n\r\n",
+                address.port()
+            );
+            let client = thread::spawn(move || -> std::io::Result<String> {
+                let mut stream = TcpStream::connect(address)?;
+                stream.write_all(text.as_bytes())?;
+                let mut response = String::new();
+                stream.read_to_string(&mut response)?;
+                Ok(response)
+            });
+            super::handle_received_request(
+                server.recv()?,
+                address.port(),
+                &mut workbench,
+                &mut odrive,
+                &mut scan,
+                &reader,
+                &super::stop_body::StopBodyReader::new(),
+            )?;
+            assert!(
+                client
+                    .join()
+                    .map_err(|_| "client panic")??
+                    .contains(expected)
+            );
+        }
         Ok(())
     }
 

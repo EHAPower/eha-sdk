@@ -77,6 +77,9 @@ enum Command {
         /// 带 odrive==0.5.1.post0 的 Python。
         #[arg(long)]
         odrive_python: Option<PathBuf>,
+        /// 仅暴露经认证的 Workbench 直通 API（/api/*），不启用 WebUI 或 v2 准入账本。
+        #[arg(long)]
+        direct_api: bool,
     },
     /// 启动仅限本机访问、持有持久 SDK 会话的 WebUI
     Webui {
@@ -128,12 +131,14 @@ fn main() -> ExitCode {
             instance_file,
             runs_dir,
             odrive_python,
+            direct_api,
         }) => service::serve(
             port.get(),
             odrive_python,
             runs_dir,
             token_file,
             instance_file,
+            direct_api,
         ),
         Some(Command::Webui {
             port,

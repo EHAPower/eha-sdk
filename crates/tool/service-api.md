@@ -21,6 +21,41 @@ SDK 私有状态推断服务行为。
 未出现在该数组之前不得调用。客户端遇到未知 `api_version`、缺少必需 capability 或
 不同 `protocol` 必须拒绝该功能，不能降级为直连设备。
 
+## Direct API 模式
+
+`eha-tool serve --direct-api` 保持同一发现记录、`eha-tool.service.v2` envelope 与
+Bearer 认证运输层，但其设备接口固定为既有 Workbench 的 `/api/*`。`describe` 只发布
+`instance_status`、`service_shutdown` 与 `direct_api`；客户端使用此模式前必须检查
+`direct_api`，不得调用任何其他 `/service/v2/*` 设备、绑定、permission、reservation、
+operation 或控制范围接口。除 `GET /service/v2/describe`、`GET /service/v2/instance` 与
+`POST /service/v2/shutdown` 外，其他 `/service/v2/*` 一律返回 `not_found`。
+
+该模式不启动 WebUI、不会自动连接设备，也不初始化 mutation ledger、reservation、
+permission、claim、operation ticket 或 unknown lock。`/api/*` 请求仍只接受回环 Host、
+一个正确的 Bearer token 且拒绝任何 `Origin`；写入请求使用 JSON。静态页面及其他非
+`/api/*` 路径返回 `404`。请求和响应沿用冻结 WebUI 的原始 DTO，插件必须把原始 JSON
+作为命令结果反馈，不能把本地提交当作设备执行结论。
+
+| 请求 | Direct API DTO |
+| --- | --- |
+| `GET /api/devices`、`GET /api/adapters`、`GET /api/connections`、`GET /api/config/schema` | 枚举 USB 候选、CAN 适配器/档案或读取 schema。|
+| `GET /api/snapshot?transport=usb\|can&node=0..127` | 返回指定 Workbench 会话的缓存快照；CAN `node` 可选。|
+| `POST /api/connect`、`/api/disconnect`、`/api/reconnect` | 请求含 `transport:"usb"` 与 `serial`，或现有 CAN/managed connection DTO；所有动作显式指定通路。|
+| `POST /api/action` | `{transport,node?,action,...}`；action 为 `status`、`measurements`、`diagnostics`、`telemetry`、`config_read`、`config_validate`、`config_save_and_restart`、`restore_factory_and_restart`、`reset_application`、`enter_update`、`heartbeat_start`、`heartbeat_stop`、`heartbeat_once`、`position`、`velocity`、`force`、`impedance`、`stop`。数值字段沿用 ToolSession DTO。|
+| `POST /api/trial`、`/api/group` | 单台 `{transport,node?,action:"start"\|"stop"\|"target",trial?,mm?}`；群组沿用 `{action:"trial_start"\|"stop"\|"heartbeat_start"\|"heartbeat_stop",nodes,trial?}`。`trial` 仍是 ToolSession 原生 `TrialRequest`。|
+| `POST /api/recording`、`GET /api/recordings`、`GET /api/recordings/{id}/{file}` | 单台 `{transport,node?,action:"start"\|"stop"}`；文件名仅 `metadata.json`、`events.jsonl`、`telemetry.csv`。|
+| `POST /api/can/connect`、`/api/can/scan`、`GET /api/odrive/devices`、`POST /api/odrive/read` | 沿用冻结 Workbench 的 CAN 与 ODrive DTO。|
+
+`/api/action` 直接在唯一 Workbench owner 上调用现有 ToolSession。普通同步读取或命令
+执行期间不会被另一个 HTTP 请求抢占；显式 Stop 仍使用 ToolSession 已有路径，但 Direct
+API 不承诺额外的 HTTP Stop 抢占或优先级。试验、Stop、范围和生命周期保持 ToolSession
+原生行为，不由本模式新增产品层状态机。
+
+Direct API 的 `describe.limitations.sdk_read_execution` 固定为
+`"synchronous_workbench"`，与普通服务模式的 `"unique_client_begin_poll"` 区分。
+`read_gate` 为 `"native_workbench"`，表示请求直接遵循 ToolSession/Workbench 原生行为，
+不表示 v2 的只读门禁。
+
 ## 通用对象
 
 ```json

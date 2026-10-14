@@ -130,7 +130,7 @@ mod tests {
         let mut workbench = crate::service::prepare_workbench(
             None,
             Some(crate::service::integration::IntegrationState::for_test()),
-            false,
+            crate::service::RouteMode::ServiceV2,
         );
         let mut odrive = OdriveView::new(None);
         let mut scan = CanScanView::new();

@@ -63,6 +63,7 @@ pub(crate) struct Workbench {
     pub(super) control_groups: Option<super::control_groups::State>,
     pub(super) control_reads: Option<super::control_reads::State>,
     pub(super) legacy_routes: bool,
+    pub(super) direct_api: bool,
     #[cfg(test)]
     pub(super) p5_fixture: Option<super::p5_fixture::Context>,
 }
@@ -87,6 +88,7 @@ impl Workbench {
             control_groups: Some(super::control_groups::State::new()),
             control_reads: Some(super::control_reads::State::new()),
             legacy_routes: true,
+            direct_api: false,
             #[cfg(test)]
             p5_fixture: None,
         }
@@ -133,6 +135,7 @@ impl Workbench {
             control_groups: Some(super::control_groups::State::new()),
             control_reads: Some(super::control_reads::State::new()),
             legacy_routes: true,
+            direct_api: false,
             #[cfg(test)]
             p5_fixture: None,
         }

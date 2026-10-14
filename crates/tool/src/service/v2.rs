@@ -25,53 +25,70 @@ pub(super) fn ready(
     value
 }
 
-pub(super) fn describe(instance_id: &str, response_bytes: usize, max_bindings: usize) -> Value {
+pub(super) fn describe(
+    instance_id: &str,
+    response_bytes: usize,
+    max_bindings: usize,
+    direct_api: bool,
+) -> Value {
     let mut value = envelope(instance_id);
     value["tool_version"] = json!(env!("EHA_TOOL_VERSION"));
     value["dto_schema_version"] = json!(1);
     value["config_format_version"] = json!(eha_sdk::config::FORMAT_VERSION);
-    value["capabilities"] = json!([
-        "instance_status",
-        "service_shutdown",
-        "targets",
-        "binding_attach",
-        "binding_lease",
-        "binding_renew",
-        "usb_connect",
-        "snapshot",
-        "read_status",
-        "read_measurements",
-        "read_diagnostics",
-        "read_config_startup",
-        "read_config_user",
-        "read_config_factory",
-        "config_schema",
-        "config_validate",
-        "maintenance",
-        "maintenance_permissions",
-        "maintenance_reservations",
-        "operation_ids",
-        "operation_read",
-        "async_reads",
-        "managed_profiles",
-        "usb_profiles",
-        "advanced_can",
-        "selected_node_connections",
-        "adapter_discovery",
-        "connections",
-        "can_scan",
-        "events",
-        "recordings_read",
-        "odrive_read",
-        "read_jobs"
-    ]);
-    value["limits"] = json!({"request_bytes":65536,"response_bytes":response_bytes,
+    value["capabilities"] = if direct_api {
+        json!(["instance_status", "service_shutdown", "direct_api"])
+    } else {
+        json!([
+            "instance_status",
+            "service_shutdown",
+            "targets",
+            "binding_attach",
+            "binding_lease",
+            "binding_renew",
+            "usb_connect",
+            "snapshot",
+            "read_status",
+            "read_measurements",
+            "read_diagnostics",
+            "read_config_startup",
+            "read_config_user",
+            "read_config_factory",
+            "config_schema",
+            "config_validate",
+            "maintenance",
+            "maintenance_permissions",
+            "maintenance_reservations",
+            "operation_ids",
+            "operation_read",
+            "async_reads",
+            "managed_profiles",
+            "usb_profiles",
+            "advanced_can",
+            "selected_node_connections",
+            "adapter_discovery",
+            "connections",
+            "can_scan",
+            "events",
+            "recordings_read",
+            "odrive_read",
+            "read_jobs"
+        ])
+    };
+    value["limits"] = if direct_api {
+        json!({"request_bytes":1048576,
+            "shutdown_response_grace_ms":500,"http_max_connections":64,
+            "http_body_wire_bytes":8388608,"http_header_bytes":16384,
+            "http_response_workers":16,"http_pending_requests":64,
+            "http_io_deadline_ms":super::http_io::IO_DEADLINE_MS})
+    } else {
+        json!({"request_bytes":65536,"response_bytes":response_bytes,
         "sdk_read_timeout_ms":5000,"max_maintenance_reservations":16,"max_mutation_members":1,"max_operation_tickets":32,"max_normal_operations":32,"max_stop_scopes":16,"operation_receipt_retention_ms":30000,"max_maintenance_readbacks":16,"operation_ticket_ttl_ms":30000,"control_max_group_members":16,"max_bindings":max_bindings,"shutdown_response_grace_ms":500,
         "event_max_events":4096,"event_max_bytes":4194304,"event_max_batch":100,"event_retention_ms":30000,
         "event_max_payload_bytes":8192,"max_connections":16,"scan_max_nodes":16,"job_history":16,
         "recording_metadata_total_bytes":262144,"recording_max_runs":128,"recording_max_entries":1024,"recording_chunk_bytes":65536,
-        "http_max_connections":64,"http_body_wire_bytes":8388608,"http_header_bytes":16384,"http_response_workers":16,"http_pending_requests":64,"http_io_deadline_ms":super::http_io::IO_DEADLINE_MS,"binding_lease_min_ms":integration::MIN_LEASE_MS,"binding_lease_max_ms":integration::MAX_LEASE_MS});
-    if super::control::RELEASED {
+        "http_max_connections":64,"http_body_wire_bytes":8388608,"http_header_bytes":16384,"http_response_workers":16,"http_pending_requests":64,"http_io_deadline_ms":super::http_io::IO_DEADLINE_MS,"binding_lease_min_ms":integration::MIN_LEASE_MS,"binding_lease_max_ms":integration::MAX_LEASE_MS})
+    };
+    if !direct_api && super::control::RELEASED {
         value["capabilities"]
             .as_array_mut()
             .expect("capability array")
@@ -86,16 +103,31 @@ pub(super) fn describe(instance_id: &str, response_bytes: usize, max_bindings: u
                 .map(|name| json!(name)),
             );
     }
-    value["limitations"] = json!({
-        "device_execution_confirmation":false,"mutations_supported":true,"maintenance_supported":true,"control_supported":super::control::RELEASED,
-        "can_connect_supported":true,"can_attach_existing_session_only":false,"recording_write_supported":super::control::RELEASED,
-        "read_gate":"existing_global_readonly_gate",
-        "control_effect_evidence":"unresolved_target_latch_only",
-        "sdk_read_execution":"unique_client_begin_poll",
-        "shutdown_stops_devices":false,"shutdown_response_delivery":"bounded_best_effort",
-        "instance_liveness":"authenticated_describe_instance_match",
-        "mutation_ledger_supported":true
-    });
+    value["limitations"] = if direct_api {
+        json!({
+            "device_execution_confirmation":false,
+            "mutations_supported":true,"maintenance_supported":true,
+            "control_supported":true,"can_connect_supported":true,
+            "recording_write_supported":true,"read_gate":"native_workbench",
+            "sdk_read_execution":"synchronous_workbench",
+            "shutdown_stops_devices":false,"shutdown_response_delivery":"bounded_best_effort",
+            "instance_liveness":"authenticated_describe_instance_match",
+            "mutation_ledger_supported":false,"direct_api":true,
+            "direct_api_base_path":"/api"
+        })
+    } else {
+        json!({
+            "device_execution_confirmation":false,"mutations_supported":!direct_api,"maintenance_supported":!direct_api,"control_supported":if direct_api { false } else { super::control::RELEASED },
+            "can_connect_supported":!direct_api,"can_attach_existing_session_only":false,"recording_write_supported":if direct_api { false } else { super::control::RELEASED },
+            "read_gate":if direct_api { "native_workbench" } else { "existing_global_readonly_gate" },
+            "control_effect_evidence":"unresolved_target_latch_only",
+            "sdk_read_execution":if direct_api { "synchronous_workbench" } else { "unique_client_begin_poll" },
+            "shutdown_stops_devices":false,"shutdown_response_delivery":"bounded_best_effort",
+            "instance_liveness":"authenticated_describe_instance_match",
+            "mutation_ledger_supported":!direct_api,"direct_api":direct_api,
+            "direct_api_base_path":if direct_api { Some("/api") } else { None::<&str> }
+        })
+    };
     value
 }
 
@@ -160,7 +192,33 @@ pub(super) fn dispatch(
     let mut state = workbench.v2.take().ok_or("集成认证状态已丢失")?;
     let path = request_path(&request).to_owned();
     let method = request_method(&request);
-    let result = if path == "/service/v2/instance" && method == Method::Get {
+    let result = if workbench.direct_api {
+        if path == "/service/v2/describe" && method == Method::Get {
+            integration::respond(
+                request,
+                200,
+                describe(
+                    &state.instance_id,
+                    integration::RESPONSE_BYTES,
+                    integration::MAX_BINDINGS,
+                    true,
+                ),
+            )
+        } else if path == "/service/v2/instance" && method == Method::Get {
+            instance_status(&state, workbench)
+                .and_then(|value| integration::respond(request, 200, value))
+        } else if path == "/service/v2/shutdown" && method == Method::Post {
+            shutdown(request, &mut state, workbench, parsed_body)
+        } else {
+            integration::respond_error(
+                request,
+                Some(&state),
+                404,
+                "not_found",
+                "direct API 服务只提供 describe、instance、shutdown 与 /api/*",
+            )
+        }
+    } else if path == "/service/v2/instance" && method == Method::Get {
         instance_status(&state, workbench)
             .and_then(|value| integration::respond(request, 200, value))
     } else if path == "/service/v2/shutdown" && method == Method::Post {
@@ -273,7 +331,7 @@ fn instance_status(
     value["activity"] = json!({"trial_active":workbench.has_active_trial(),
         "trial_unresolved":workbench.has_pending_interrupted_trial(),"read_blocker":read_blocker});
     value["control_effect"] = json!({"state":if pending_target { "unknown" } else { "not_observed" },
-        "reason_code":if pending_target { Some("unresolved_target") } else { None },"mutation_ledger_supported":true});
+        "reason_code":if pending_target { Some("unresolved_target") } else { None },"mutation_ledger_supported":workbench.mutations.is_some()});
     value["device_stop_requested"] = json!(false);
     value["message"] = json!(
         "退出只结束服务会话，不请求设备 Stop；活动心跳、试验、记录和未决效果须由人工判断，不能据此认定设备已停止。"
