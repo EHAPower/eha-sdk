@@ -2,35 +2,13 @@
 
 # `eha-tool`
 
-`eha-tool` 是 EHA 的官方命令行工具，提供单次 CLI、持久 Shell 和独立服务。它通过
+`eha-tool` 是 EHA 的官方命令行工具，提供单次 CLI、持久 Shell 和本机 WebUI。它通过
 [`eha-sdk`](../../README.md)访问**明确选择**的控制器；协议、配置格式和客户接入规则仍由 SDK
 维护。本文说明工具旅程和资源边界；精确的命令、参数、默认值和版本以
 `eha-tool --help` 及对应子命令的 `--help` 为准。构建、安装和检查入口见
 [根贡献指南](../../CONTRIBUTING.md)。
 
-> **旧 WebUI 已冻结并弃用。** `eha-tool webui` 现有命令和功能仍可使用，以便既有部署过渡；不再新增功能或更新仅服务于该页面的实现，并计划在后续版本删除。冻结范围只包括旧 WebUI 及其专属实现：独立 `eha-tool` 服务、CLI、Shell 和共享 SDK 能力继续维护；后续图形入口为 `dsh-fieldkit` 插件。
-
-## 本机只读集成
-
-`webui --integration-token-file PATH` 显式启用 `/integration/v1/*`；省略时路由不可用。首次启动在
-指定路径创建由当前用户持有、权限为 `0600` 的 64 位十六进制 token 文件，重启严格校验后复用；
-每次启动仍产生新的随机实例身份。本入口目前仅支持 Unix。调用方使用
-`Authorization: Bearer <token>`，所有请求必须发往 `127.0.0.1`，任何 `Origin` 均被拒绝；
-凭据不输出到终端。请求上限 64 KiB，响应上限 1 MiB，最多 8 个绑定。
-
-`GET describe/targets`、`POST bindings`、`GET bindings/{id}/snapshot`、
-`POST bindings/{id}/read` 与 `DELETE bindings/{id}` 均位于该前缀下。绑定只引用 WebUI
-已拥有的会话；只允许显式连接列表中的 USB 候选，不扫描或新连 CAN。活动试验、心跳、
-未决目标或已连接会话门禁不足时，targets 仅返回 owner 已知目标，并标记
-`discovery_limited` 与原因；安全空闲时的 OS USB 枚举不保证硬截止时间。注销绑定绝不关闭设备连接。
-主动读取仅开放 status、measurements、diagnostics、Startup 和 User 配置原文；缓存快照不发设备
-查询。读取须核对实例、连接代次与 UID/run_nonce，并受全局心跳、试验、持续目标及新鲜 Idle
-遥测门禁约束；门禁不足时快照仍可查看原因。普通持续目标的未决标记在本 owner 生命周期内
-不会因本地 Stop 提交、断连或后收 Idle 遥测自动清除；该情形返回 `unresolved_target`。
-重启工具并不是停止动作；新实例仍须重新核对 Identity 和新鲜 Idle 遥测，且不能代替对先前未知
-设备影响的人工处理。外层计数和设备时间戳使用十进制文本，原生 eha-tool
-查询 JSON 保留为 `native_json_text` 字符串。单次 SDK 读取默认最多等待 5 秒，会同步占用
-WebUI 会话循环；取消 HTTP 请求不取消可能已提交的设备操作。采集完成不证明设备或机构安全。
+`eha-tool webui` 是持续维护的图形入口，可继续开发功能、修复问题和更新测试。
 
 ## 使用方式
 
@@ -52,7 +30,7 @@ flowchart LR
     F --> E["分别判断采用、输出许可<br/>设备影响与机构效果"]
 ```
 
-枚举不会打开设备或扫描总线，不能说明连接或 Identity 已核对。默认直连 `device` 的每个动作新建本地
+枚举不会打开设备或扫描总线，不能说明连接或 Identity 已核对。`device` 的每个动作新建本地
 会话、核对 Identity、执行一个动作后关闭本地句柄；单次调用返回后不保留会话、心跳或 USB 传输编号及其保护状态。因此两个独立 USB `device` 进程不构成同一串行会话；连续查询、维护核对或脚本自动化使用已有的 `shell --batch`，在同一 SDK 会话内完成，不把独立调用的超时自动重发。USB 目标使用完整
 序列号；CAN 目标可选已保存的 `--connection ID`，或给出高级 `--can-channel` 与 `--node`，可选
 `--can-mode classic|fd`（默认 `fd`）和 `--can-python` 指定带 `python-can` 的解释器。受管档案仅支持
@@ -97,33 +75,6 @@ eha-tool device --can-channel "$EHA_CAN_CHANNEL" --node "$EHA_CAN_NODE" --can-mo
 只完成连接和所请求的业务；不启动心跳、不恢复控制或重放旧操作。`--can-python PATH` 仅覆盖本次操作，不保存到档案。物理断开后先恢复实际连接，再由用户显式执行连接。
 `inspect --json` 只输出身份、运行实例和更新路由；`--version` 不访问设备。无参数仅在标准输入和输出
 都是终端时进入 Shell；管道或重定向中无参数只显示帮助。
-
-#### 显式共享服务只读 CLI
-
-默认 `device` 保持上述单次直连。只有显式给出 `--via-service` 的私有实例描述符绝对路径，
-才使用 `/service/v2` 认证现有服务；还须明确给出该实例内的 `--target-id`，不能与 USB、
-连接档案或任何 CAN 直连参数混用。描述符、token 文件和父目录复用服务的 Unix 私有权限、
-UID、无符号链接与无硬链接检查。凭据不输出。
-
-```sh
-eha-tool device --via-service /absolute/private/instance.json --target-id can:7 status
-eha-tool device --via-service /absolute/private/instance.json --target-id usb:完整序列号 measurements
-eha-tool device --via-service /absolute/private/instance.json --target-id can:7 config-read --view startup
-```
-
-此入口只 attach 已连接的 owner 会话；不隐式连接、选择第一候选或另开设备。P1 支持
-`status`、`measurements`、`diagnostics` 和 `config-read --view startup|user`，总是直接输出服务的
-`native_json_text` 原文；`--json` 可保留在调用中，输出也保持该原文。Factory 配置、`--output`
-导出及其它控制、维护、观察或试验动作均明确 `unsupported`。精确服务合同见
-[service-api.md](service-api.md)。
-
-`--timeout-secs` 默认 5，共享服务允许 1 至 60 秒，每个 HTTP 请求有独立截止时间；
-连接、凭据、版本、实例、UID/run_nonce 或代次错误立即结束，不回落直连、不自动重放。
-CLI为观察申请 `2 × timeout-secs × 1000 + 1000` 毫秒租约；取得绑定ID后，即使读取超时或
-实例变化也只对已验证的原实例观察ID做一次有界 best-effort DELETE。attach 回复丢失而ID未知时，
-由服务单调时钟租约到期回收名额。清理和到期只解除观察 binding，不 Stop、不断开 owner、
-不改变心跳或目标；不以重启服务恢复观察容量。长观察客户端可申请最多121000毫秒租约，
-通过合同定义的 `renew` 后台续约；未申请租约的现有观察和v1兼容入口保持原生命周期。
 
 #### 控制与停止
 

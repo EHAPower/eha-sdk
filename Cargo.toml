@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
 members = ["crates/config", "crates/protocol", "crates/tool", "crates/transport"]
-exclude = ["vendor/tiny_http"]
 
 [package]
 name = "eha-sdk"
@@ -53,6 +52,3 @@ unsafe_code = "forbid"
 unwrap_used = "deny"
 panic = "deny"
 unreachable = "deny"
-
-[patch.crates-io]
-tiny_http = { path = "vendor/tiny_http" }

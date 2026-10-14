@@ -11,13 +11,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-#[path = "recording_worker.rs"]
-mod worker;
-
-pub(crate) use worker::Recording;
-
-// The synchronous serializer is confined to the file worker.
-pub(crate) struct DiskRecording {
+pub(crate) struct Recording {
     id: String,
     directory: PathBuf,
     metadata_path: PathBuf,
@@ -30,7 +24,7 @@ pub(crate) struct DiskRecording {
     started_at: Instant,
 }
 
-impl DiskRecording {
+impl Recording {
     pub(crate) fn start(root: &Path, metadata: Value) -> Result<Self, String> {
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -108,10 +102,6 @@ impl DiskRecording {
             "elapsed_ms": self.started_at.elapsed().as_millis(),
             "data": data,
         });
-        self.event_value(event)
-    }
-
-    pub(super) fn event_value(&mut self, event: Value) -> Result<(), String> {
         serde_json::to_writer(&mut self.events, &event).map_err(|error| error.to_string())?;
         self.events
             .write_all(b"\n")
@@ -120,23 +110,7 @@ impl DiskRecording {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(crate) fn telemetry(&mut self, telemetry: &Value, gap: bool) -> Result<(), String> {
-        self.telemetry_at(
-            telemetry,
-            gap,
-            unix_time_ms(),
-            self.started_at.elapsed().as_millis(),
-        )
-    }
-
-    pub(super) fn telemetry_at(
-        &mut self,
-        telemetry: &Value,
-        gap: bool,
-        unix_time_ms: u128,
-        elapsed_ms: u128,
-    ) -> Result<(), String> {
         let cell = |value: &Value| serde_json::to_string(value).unwrap_or_else(|_| "null".into());
         let main = telemetry["main_values"].as_array();
         let time_us = &telemetry["sample"]["snapshot_time_us"];
@@ -160,8 +134,8 @@ impl DiskRecording {
             ]
         };
         let mut line = vec![
-            unix_time_ms.to_string(),
-            elapsed_ms.to_string(),
+            unix_time_ms().to_string(),
+            self.started_at.elapsed().as_millis().to_string(),
             cell(time_us),
             cell(sequence),
             cell(&telemetry["target_mode"]),
@@ -258,9 +232,8 @@ mod tests {
     fn unique_runs_keep_numeric_values_and_quality_columns() {
         let root = std::env::temp_dir().join(format!("eha-tool-recording-{}", std::process::id()));
         let mut first =
-            DiskRecording::start(&root, json!({"device_uid":"a"})).expect("first recording");
-        let second =
-            DiskRecording::start(&root, json!({"device_uid":"b"})).expect("second recording");
+            Recording::start(&root, json!({"device_uid":"a"})).expect("first recording");
+        let second = Recording::start(&root, json!({"device_uid":"b"})).expect("second recording");
         assert_ne!(first.snapshot()["id"], second.snapshot()["id"]);
         first
             .telemetry(

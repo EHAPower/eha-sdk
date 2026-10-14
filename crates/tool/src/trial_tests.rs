@@ -14,12 +14,10 @@ use eha_sdk::{
         self, Direction, Message, SampleData,
         responses::{
             CanProfile, ConfigDataFields, ConfigDataWriter, ConfigRecordState, ConfigView,
-            ContactState, DesiredAxis, DiagnosticsFields, DriverState, EvidenceState,
-            FallbackReason, IdentityFields, IdentityText, MeasurementFields, MeasurementValues,
-            ModelState, PositiveForceChannel, ReferenceKind, RunIdentity, SourceQuality,
-            StartupSource, TargetIngress, TargetMode, TelemetryFacts, TelemetryFields, ValueFields,
-            ValueResult, ValueState, encode_diagnostics, encode_identity, encode_measurements,
-            encode_status, encode_telemetry,
+            ContactState, DesiredAxis, DriverState, EvidenceState, FallbackReason, IdentityFields,
+            IdentityText, ReferenceKind, RunIdentity, SourceQuality, StartupSource, TargetIngress,
+            TargetMode, TelemetryFacts, TelemetryFields, ValueFields, ValueResult, ValueState,
+            encode_identity, encode_status, encode_telemetry,
         },
     },
 };
@@ -47,7 +45,6 @@ pub(crate) enum FixtureBehavior {
     PreflightFails,
     StartUnknown,
     StopUnknown,
-    UiLive,
 }
 
 struct TrialHarness {
@@ -84,16 +81,6 @@ fn identity_bytes_with_nonce_for(
     node: u8,
     run_nonce: [u8; 16],
 ) -> Vec<u8> {
-    identity_bytes_named(query_id, uid, node, run_nonce, "trial-test")
-}
-
-fn identity_bytes_named(
-    query_id: u32,
-    uid: [u8; 12],
-    node: u8,
-    run_nonce: [u8; 16],
-    version: &str,
-) -> Vec<u8> {
     let fields = IdentityFields {
         sample: SampleData {
             query_id,
@@ -116,7 +103,7 @@ fn identity_bytes_named(
         odrive_evidence: EvidenceState::Unavailable,
         brt27_evidence: EvidenceState::Unavailable,
         text: IdentityText {
-            version,
+            version: "trial-test",
             source_revision: "",
             build_information: "",
             odrive_binding: "",
@@ -240,7 +227,7 @@ fn telemetry_bytes_with_facts(
     bytes
 }
 
-pub(super) fn trial_request(command: Command) -> TrialRequest {
+fn trial_request(command: Command) -> TrialRequest {
     TrialRequest {
         command,
         envelope: TrialEnvelope {
@@ -306,10 +293,6 @@ fn active(request: TrialRequest, started_at: Instant, started_sample_time_us: u6
 }
 
 fn startup_config_bytes(query_id: u32) -> Vec<u8> {
-    config_read_bytes(query_id, ConfigView::Startup)
-}
-
-fn config_read_bytes(query_id: u32, view: ConfigView) -> Vec<u8> {
     let record = br#"{"config":{"protection":{"hard_position_min_mm":-10.0,"hard_position_max_mm":10.0,"hard_velocity_max_mm_s":2.0,"hard_force_max_n":10.0}}}"#;
     let fields = ConfigDataFields {
         sample: SampleData {
@@ -318,7 +301,7 @@ fn config_read_bytes(query_id: u32, view: ConfigView) -> Vec<u8> {
             snapshot_sequence: 5,
             snapshot_time_us: 5_000,
         },
-        view,
+        view: ConfigView::Startup,
         record_state: ConfigRecordState::Complete,
         startup_source: StartupSource::User,
         fallback_reason: FallbackReason::None,
@@ -333,77 +316,7 @@ fn config_read_bytes(query_id: u32, view: ConfigView) -> Vec<u8> {
     bytes
 }
 
-fn readonly_observation_bytes(query_id: u32, category: u8) -> Vec<u8> {
-    let sample = SampleData {
-        query_id,
-        run_nonce: [9; 16],
-        snapshot_sequence: 12,
-        snapshot_time_us: 12_000,
-    };
-    if category == 3 {
-        let fields = DiagnosticsFields {
-            sample,
-            decision_age_us: 0,
-            device_evidence_age_us: 0,
-            overflow: false,
-            entries: &[],
-        };
-        let mut bytes = vec![0; fields.encoded_len().expect("diagnostic length")];
-        encode_diagnostics(&fields, &mut bytes).expect("diagnostics encode");
-        return bytes;
-    }
-    let value = ValueFields::new(
-        0.0,
-        ValueState::new(ValueResult::Available, SourceQuality::Qualified, true),
-    );
-    let fields = MeasurementFields {
-        sample,
-        values: MeasurementValues {
-            position_mm: value,
-            velocity_mm_s: value,
-            raw_pressure_a_mpa: value,
-            raw_pressure_b_mpa: value,
-            filtered_pressure_a_mpa: value,
-            filtered_pressure_b_mpa: value,
-            main_force_n: value,
-            protection_force_n: value,
-        },
-        position_age_us: 0,
-        velocity_age_us: 0,
-        pressure_pair_age_us: 0,
-        position_reference_count: 0,
-        effective_area_mm2: 1.0,
-        positive_force_channel: PositiveForceChannel::ElectricalB,
-        reference_state: true,
-        model_state: ModelState::Available,
-        pressure_batch_sequence: 1,
-    };
-    let mut bytes = vec![0; MeasurementFields::encoded_len()];
-    encode_measurements(&fields, &mut bytes).expect("measurements encode");
-    bytes
-}
-
 fn can_observation_bytes(query_id: u32, sequence: u32, qualified: bool) -> Vec<u8> {
-    can_ui_observation(
-        query_id,
-        sequence,
-        qualified,
-        TargetMode::None,
-        [0.0; 3],
-        false,
-        false,
-    )
-}
-
-fn can_ui_observation(
-    query_id: u32,
-    sequence: u32,
-    qualified: bool,
-    target: TargetMode,
-    values: [f32; 3],
-    unknown: bool,
-    non_idle: bool,
-) -> Vec<u8> {
     let fields = TelemetryFields {
         sample: SampleData {
             query_id,
@@ -412,18 +325,10 @@ fn can_ui_observation(
             snapshot_time_us: u64::from(sequence) * 1_000,
         },
         decision_age_us: 0,
-        target_mode: target,
-        target_ingress: if target == TargetMode::None {
-            TargetIngress::None
-        } else {
-            TargetIngress::Can
-        },
-        facts: TelemetryFacts {
-            output_allowed: target != TargetMode::None,
-            unknown_effect: unknown,
-            ..Default::default()
-        },
-        target_values: values,
+        target_mode: TargetMode::None,
+        target_ingress: TargetIngress::None,
+        facts: TelemetryFacts::default(),
+        target_values: [0.0; 3],
         can_adoption_blockers: 0,
         usb_adoption_blockers: 0,
         output_blockers: 0,
@@ -438,11 +343,7 @@ fn can_ui_observation(
         candidate_rpm: value(0.0),
         last_submitted_rpm: value(0.0),
         submitted_age_us: 0,
-        axis_state_raw: if target == TargetMode::None && !non_idle {
-            1
-        } else {
-            8
-        },
+        axis_state_raw: 1,
         axis_error_raw: 0,
         driver_age_us: 0,
         driver_state: DriverState {
@@ -451,11 +352,7 @@ fn can_ui_observation(
             stale: false,
             faulted: false,
         },
-        desired_axis: if target == TargetMode::None && !non_idle {
-            DesiredAxis::Idle
-        } else {
-            DesiredAxis::ClosedLoop
-        },
+        desired_axis: DesiredAxis::Idle,
         can_heartbeat_age_us: 0,
         usb_heartbeat_age_us: u32::MAX,
         can_contact: ContactState::Active,
@@ -481,15 +378,6 @@ pub(crate) struct FixtureProbe {
 }
 
 impl FixtureProbe {
-    pub(crate) fn disconnect(&self) {
-        self.sink
-            .lock()
-            .expect("fixture sink")
-            .as_ref()
-            .expect("started fixture")
-            .disconnected("synthetic passive disconnect");
-    }
-
     pub(crate) fn inject_idle(&self, sequence: u32) {
         self.inject_idle_at(sequence, Instant::now());
     }
@@ -523,219 +411,30 @@ pub(crate) fn session_fixture(
     uid: [u8; 12],
     behavior: FixtureBehavior,
 ) -> (ToolSession, FixtureProbe) {
-    let live = if behavior == FixtureBehavior::UiLive {
-        let (trace, _) = crate::service::p5_fixture::Trace::new(Duration::from_secs(15));
-        Some(UiOptions {
-            scenario: crate::service::p5_fixture::Scenario::Healthy,
-            trace,
-        })
-    } else {
-        None
-    };
-    session_fixture_configured(node, uid, behavior, live)
-}
-
-impl ToolSession {
-    pub(crate) fn arm_ui_trial_audit_failure(&mut self) -> bool {
-        let Some(recording) = self.recording.as_mut() else {
-            return false;
-        };
-        recording.arm_trial_audit_failure();
-        true
-    }
-}
-
-pub(crate) struct UiOptions {
-    pub(crate) scenario: crate::service::p5_fixture::Scenario,
-    pub(crate) trace: crate::service::p5_fixture::Trace,
-}
-
-pub(crate) fn ui_session_fixture(
-    node: u8,
-    uid: [u8; 12],
-    options: UiOptions,
-) -> (ToolSession, FixtureProbe) {
-    session_fixture_configured(node, uid, FixtureBehavior::UiLive, Some(options))
-}
-
-fn session_fixture_configured(
-    node: u8,
-    uid: [u8; 12],
-    behavior: FixtureBehavior,
-    live: Option<UiOptions>,
-) -> (ToolSession, FixtureProbe) {
-    let is_live = live.is_some();
-    // 只改变合成观测轴状态，不生成目标、心跳或未决效果。
-    let non_idle = live
-        .as_ref()
-        .is_some_and(|options| options.scenario == crate::service::p5_fixture::Scenario::NotIdle);
     let observed = Arc::new(Mutex::new(Observed::default()));
     let sink_slot = Arc::new(Mutex::new(None));
     let sequence = Arc::new(std::sync::atomic::AtomicU64::new(30));
     let backend_observed = Arc::clone(&observed);
     let backend_sink_slot = Arc::clone(&sink_slot);
-    let backend_sequence = Arc::clone(&sequence);
     let backend = Backend::spawn("eha-tool-group-fixture", move |commands, sink| {
         *backend_sink_slot.lock().expect("fixture sink lock") = Some(sink.clone());
         let mut pump = Pump::new(commands, sink);
-        let mut next_passive = Instant::now();
-        let mut delayed_reads = std::collections::VecDeque::<(Instant, Vec<u8>, u64)>::new();
-        let mut target = TargetMode::None;
-        let mut target_values = [0.0; 3];
-        let mut target_unknown = false;
-        let mut pending_stop_observation = false;
-        let mut queued_noted = false;
         while pump.poll() {
-            if let Some(live) = &live {
-                if Instant::now() >= next_passive {
-                    let seq = backend_sequence.fetch_add(1, Ordering::Relaxed) as u32;
-                    pump.sink.received(can_ui_observation(
-                        0,
-                        seq,
-                        true,
-                        target,
-                        target_values,
-                        target_unknown,
-                        non_idle,
-                    ));
-                    if pending_stop_observation {
-                        live.trace.event(
-                            "synthetic_post_stop_observation",
-                            node,
-                            None,
-                            json!({"sequence":seq,"target_mode":"none","driver":if non_idle { "closed_loop" } else { "idle" }}),
-                        );
-                        pending_stop_observation = false;
-                    }
-                    next_passive = Instant::now() + Duration::from_millis(50);
-                }
-                while delayed_reads
-                    .front()
-                    .is_some_and(|(due, _, _)| Instant::now() >= *due)
-                {
-                    let (_, bytes, id) = delayed_reads.pop_front().expect("due reply");
-                    pump.sink.received(bytes);
-                    live.trace
-                        .event("read_reply", node, Some(id), json!({"delayed":true}));
-                }
-            }
             for lane in 0..3 {
                 while let Some(request) = pump.take(lane) {
                     let message = protocol::decode(&request.bytes, Direction::HostToFirmware)
                         .expect("tool emits contract-valid request");
-                    if let Some(live) = &live {
-                        use crate::service::p5_fixture::Scenario;
-                        let is_target = matches!(
-                            message,
-                            Message::Position(_)
-                                | Message::Velocity(_)
-                                | Message::Force(_)
-                                | Message::Impedance { .. }
-                        );
-                        if is_target && live.scenario == Scenario::QueuedTarget {
-                            if !queued_noted {
-                                live.trace.event(
-                                    "target_returned_unsent",
-                                    node,
-                                    Some(request.id),
-                                    json!({"handoff_to_driver":false}),
-                                );
-                                queued_noted = true;
-                            }
-                            pump.put_back(request);
-                            break;
-                        }
-                        let action = match message {
-                            Message::Position(_) => "position",
-                            Message::Velocity(_) => "velocity",
-                            Message::Force(_) => "force",
-                            Message::Impedance { .. } => "impedance",
-                            Message::Stop => "stop",
-                            Message::Heartbeat => "heartbeat",
-                            _ => "read",
-                        };
-                        live.trace.event(
-                            "pump_taken",
-                            node,
-                            Some(request.id),
-                            json!({"action":action}),
-                        );
-                        if is_target && live.scenario == Scenario::TakenTarget {
-                            live.trace.event(
-                                "target_receipt_held",
-                                node,
-                                Some(request.id),
-                                json!({"handoff_to_driver":true,"submission_receipt":false}),
-                            );
-                            continue;
-                        }
-                    }
                     match message {
                         Message::Query {
                             query_id,
                             category: 0,
                         } => {
                             pump.sink.submitted(request.id);
-                            pump.sink.received(if is_live {
-                                identity_bytes_named(query_id, uid, node, [9; 16], "UI_SYNTHETIC")
-                            } else {
-                                identity_bytes_for(query_id, uid, node)
-                            });
+                            pump.sink.received(identity_bytes_for(query_id, uid, node));
                         }
                         Message::ReadConfig { query_id, view: 2 } => {
                             pump.sink.submitted(request.id);
                             pump.sink.received(startup_config_bytes(query_id));
-                        }
-                        Message::ReadConfig { query_id, view: 1 } => {
-                            pump.sink.submitted(request.id);
-                            pump.sink
-                                .received(config_read_bytes(query_id, ConfigView::UserRecord));
-                        }
-                        Message::ReadConfig { query_id, view: 0 } => {
-                            pump.sink.submitted(request.id);
-                            pump.sink
-                                .received(config_read_bytes(query_id, ConfigView::Factory));
-                        }
-                        Message::Query {
-                            query_id,
-                            category: category @ (2 | 3),
-                        } => {
-                            if delayed_reads.len() >= 2 {
-                                pump.sink.failed(
-                                    request.id,
-                                    "UI_SYNTHETIC 延迟回复容量已满",
-                                    false,
-                                );
-                                if let Some(live) = &live {
-                                    live.trace.event(
-                                        "read_capacity_rejected",
-                                        node,
-                                        Some(request.id),
-                                        json!({"query_id":query_id.to_string()}),
-                                    );
-                                }
-                                continue;
-                            }
-                            pump.sink.submitted(request.id);
-                            let bytes = readonly_observation_bytes(query_id, category);
-                            if live.as_ref().is_some_and(|options| {
-                                options.scenario == crate::service::p5_fixture::Scenario::SlowRead
-                            }) {
-                                // 已取消等待的旧 query 仍可迟到；两个固定槽保留各自原 wire ID。
-                                delayed_reads.push_back((
-                                    Instant::now() + Duration::from_secs(3),
-                                    bytes,
-                                    request.id,
-                                ));
-                                live.as_ref().expect("live").trace.event(
-                                    "read_reply_held",
-                                    node,
-                                    Some(request.id),
-                                    json!({"delay_ms":3000,"query_id":query_id.to_string()}),
-                                );
-                            } else {
-                                pump.sink.received(bytes);
-                            }
                         }
                         Message::Query {
                             query_id,
@@ -745,31 +444,9 @@ fn session_fixture_configured(
                             let qualified = behavior != FixtureBehavior::PreflightFails;
                             // 先交付启动所需的被动事实，再唤醒 Status 等待者；测试不依赖
                             // 两次 EventSink 写入之间的线程调度。设备快照时间仍晚于 Status。
-                            if is_live {
-                                let seq = backend_sequence.fetch_add(2, Ordering::Relaxed) as u32;
-                                pump.sink.received(can_ui_observation(
-                                    0,
-                                    seq + 1,
-                                    qualified,
-                                    target,
-                                    target_values,
-                                    target_unknown,
-                                    non_idle,
-                                ));
-                                pump.sink.received(can_ui_observation(
-                                    query_id,
-                                    seq,
-                                    qualified,
-                                    target,
-                                    target_values,
-                                    target_unknown,
-                                    non_idle,
-                                ));
-                            } else {
-                                pump.sink.received(can_observation_bytes(0, 11, qualified));
-                                pump.sink
-                                    .received(can_observation_bytes(query_id, 10, qualified));
-                            }
+                            pump.sink.received(can_observation_bytes(0, 11, qualified));
+                            pump.sink
+                                .received(can_observation_bytes(query_id, 10, qualified));
                         }
                         Message::Position(mm) | Message::Velocity(mm) | Message::Force(mm) => {
                             let mut observed = backend_observed.lock().expect("observed lock");
@@ -778,21 +455,7 @@ fn session_fixture_configured(
                                 observed.positions.push(mm);
                             }
                             drop(observed);
-                            if is_live {
-                                target = match message {
-                                    Message::Position(_) => TargetMode::Position,
-                                    Message::Velocity(_) => TargetMode::Velocity,
-                                    _ => TargetMode::Force,
-                                };
-                                target_values = [mm, 0.0, 0.0];
-                            }
-                            if behavior == FixtureBehavior::StartUnknown
-                                || live.as_ref().is_some_and(|options| {
-                                    options.scenario
-                                        == crate::service::p5_fixture::Scenario::TargetUnknown
-                                })
-                            {
-                                target_unknown = true;
+                            if behavior == FixtureBehavior::StartUnknown {
                                 pump.sink.failed(request.id, "synthetic target loss", true);
                             } else {
                                 pump.sink.submitted(request.id);
@@ -800,16 +463,7 @@ fn session_fixture_configured(
                         }
                         Message::Impedance { .. } => {
                             backend_observed.lock().expect("observed lock").targets += 1;
-                            if is_live {
-                                target = TargetMode::Impedance;
-                            }
-                            if behavior == FixtureBehavior::StartUnknown
-                                || live.as_ref().is_some_and(|options| {
-                                    options.scenario
-                                        == crate::service::p5_fixture::Scenario::TargetUnknown
-                                })
-                            {
-                                target_unknown = true;
+                            if behavior == FixtureBehavior::StartUnknown {
                                 pump.sink.failed(request.id, "synthetic target loss", true);
                             } else {
                                 pump.sink.submitted(request.id);
@@ -817,58 +471,13 @@ fn session_fixture_configured(
                         }
                         Message::Stop => {
                             backend_observed.lock().expect("observed lock").stops += 1;
-                            if behavior == FixtureBehavior::StopUnknown
-                                || live.as_ref().is_some_and(|options| {
-                                    options.scenario
-                                        == crate::service::p5_fixture::Scenario::StopUnknown
-                                })
-                            {
+                            if behavior == FixtureBehavior::StopUnknown {
                                 pump.sink.failed(request.id, "synthetic stop loss", true);
                             } else {
                                 pump.sink.submitted(request.id);
-                                if is_live {
-                                    target = TargetMode::None;
-                                    target_values = [0.0; 3];
-                                    target_unknown = false;
-                                    pending_stop_observation = true;
-                                }
                             }
                         }
-                        Message::Heartbeat if is_live => {
-                            pump.sink.submitted(request.id);
-                        }
                         other => panic!("unexpected group fixture request: {other:?}"),
-                    }
-                    if let Some(live) = &live {
-                        let failed = matches!(message, Message::Stop)
-                            && live.scenario == crate::service::p5_fixture::Scenario::StopUnknown
-                            || matches!(
-                                message,
-                                Message::Position(_)
-                                    | Message::Velocity(_)
-                                    | Message::Force(_)
-                                    | Message::Impedance { .. }
-                            ) && live.scenario
-                                == crate::service::p5_fixture::Scenario::TargetUnknown;
-                        let action = match message {
-                            Message::Position(_) => "position",
-                            Message::Velocity(_) => "velocity",
-                            Message::Force(_) => "force",
-                            Message::Impedance { .. } => "impedance",
-                            Message::Stop => "stop",
-                            Message::Heartbeat => "heartbeat",
-                            _ => "read",
-                        };
-                        live.trace.event(
-                            if failed {
-                                "submission_unknown"
-                            } else {
-                                "local_submitted"
-                            },
-                            node,
-                            Some(request.id),
-                            json!({"action":action,"device_execution_confirmed":false}),
-                        );
                     }
                 }
             }
@@ -877,29 +486,12 @@ fn session_fixture_configured(
     })
     .expect("group fixture backend starts");
     let mut client = Client::new(backend);
-    if is_live {
-        // 与 Workbench 的正式会话同为 4096；直接挂载 Client 时也须接好趋势队列。
-        client
-            .enable_telemetry_queue(4096)
-            .expect("合成 UI 遥测队列");
-    }
     let identity = client
         .identify(None, &eha_sdk::host::Wait::new(Duration::from_millis(100)))
         .expect("fixture Identity succeeds");
-    let mut session = ToolSession::new().with_timeout(if is_live {
-        Duration::from_secs(5)
-    } else {
-        Duration::from_millis(100)
-    });
-    if is_live {
-        session = session.with_telemetry_trend(4096);
-    }
+    let mut session = ToolSession::new().with_timeout(Duration::from_millis(100));
     session.request = Some(ConnectionRequest::Can {
-        channel: if is_live {
-            format!("UI_SYNTHETIC-{node}")
-        } else {
-            format!("fixture-{node}")
-        },
+        channel: format!("fixture-{node}"),
         node,
         mode: "fd".into(),
         python: None,
@@ -914,109 +506,6 @@ fn session_fixture_configured(
             next_sequence: sequence,
         },
     )
-}
-
-#[test]
-fn ui_live_fixture_keeps_fresh_observations_without_polling_from_ui() {
-    let (mut session, _probe) = session_fixture(1, [0xa1; 12], FixtureBehavior::UiLive);
-    session
-        .execute(Command::Status)
-        .expect("initial observation");
-    thread::sleep(Duration::from_millis(350));
-    let snapshot = session.snapshot();
-    let age = snapshot.telemetry.expect("passive telemetry")["received_age_ms"]
-        .as_u64()
-        .expect("integer age");
-    assert!(age < 150, "UI-independent observation stale: {age}ms");
-    assert_eq!(
-        snapshot.identity.expect("identity")["text"]["version"],
-        "UI_SYNTHETIC"
-    );
-}
-
-#[test]
-fn ui_live_fixture_trial_deadline_advances_without_ui_reads() {
-    let (mut session, probe) = session_fixture(2, [0xa2; 12], FixtureBehavior::UiLive);
-    let mut request = trial_request(Command::Position { mm: 1.0 });
-    request.duration_s = Some(0.3);
-    session
-        .start_trial(request)
-        .expect("real preflight and local target");
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        session.tick();
-        let trial = session.trial_snapshot();
-        if trial["stop_reason"] == "duration_elapsed" && trial["stop_observed"] == true {
-            break;
-        }
-        assert!(Instant::now() < deadline, "trial {trial}");
-        thread::sleep(Duration::from_millis(5));
-    }
-    let observed = probe.observed.lock().expect("counts");
-    assert_eq!(observed.targets, 1);
-    assert_eq!(observed.stops, 1);
-}
-
-#[test]
-fn ui_slow_read_cancel_then_new_query_keeps_late_reply_ownership() {
-    use crate::service::p5_fixture::{Scenario, Trace};
-    use eha_sdk::{host::Wait, session::QueryKind};
-    use std::task::Poll;
-    let (trace, events) = Trace::new(Duration::from_secs(10));
-    let (mut session, _probe) = ui_session_fixture(
-        1,
-        [0xa1; 12],
-        UiOptions {
-            scenario: Scenario::SlowRead,
-            trace,
-        },
-    );
-    let client = session.client.as_mut().expect("unique actual Client");
-    let wait = Wait::new(Duration::from_secs(5));
-    client
-        .begin_query(QueryKind::Diagnostics, &wait)
-        .expect("first query");
-    let held = |events: &std::sync::mpsc::Receiver<Value>| {
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let event = events
-                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                .expect("read held stage");
-            if event["kind"] == "read_reply_held" {
-                break event;
-            }
-        }
-    };
-    let first = held(&events);
-    client
-        .cancel_query()
-        .expect("cancel waiting, not old bytes");
-    client
-        .begin_query(QueryKind::Diagnostics, &wait)
-        .expect("second query");
-    let second = held(&events);
-    assert_ne!(first["transport_local_id"], second["transport_local_id"]);
-    let deadline = Instant::now() + Duration::from_secs(4);
-    let reply = loop {
-        match client.poll_query() {
-            Poll::Ready(result) => {
-                break result.expect("second reply, backend survives old cancellation");
-            }
-            Poll::Pending => {
-                assert!(Instant::now() < deadline);
-                thread::sleep(Duration::from_millis(2));
-            }
-        }
-    };
-    let Response::Diagnostics(data) = reply.response().expect("official diagnostics") else {
-        panic!("wrong kind");
-    };
-    assert_eq!(
-        data.sample().query_id().to_string(),
-        second["facts"]["query_id"]
-            .as_str()
-            .expect("second actual wire query ID")
-    );
 }
 
 fn harness() -> (ToolSession, TrialHarness) {
@@ -1134,27 +623,6 @@ fn reconnect_connector(
     }))
 }
 
-pub(super) fn settle_control(session: &mut ToolSession) {
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        let Some(pending) = session.pending_control.as_ref() else {
-            return;
-        };
-        if pending.autonomous_stop {
-            let _ = session.poll_control();
-        } else if pending.trial_position {
-            session.flush_trial_position(Instant::now());
-        } else {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "local control submission did not complete"
-        );
-        thread::yield_now();
-    }
-}
-
 fn tick_after_telemetry(
     session: &mut ToolSession,
     harness: &TrialHarness,
@@ -1169,7 +637,6 @@ fn tick_after_telemetry(
     let deadline = Instant::now() + Duration::from_millis(100);
     loop {
         session.tick();
-        settle_control(session);
         if expected_sequence.is_some_and(|sequence| {
             session
                 .last_telemetry
@@ -1202,9 +669,7 @@ fn deadline_from_initial_unknown_telemetry_submits_one_stop() {
 
     // 起始时没有任何 Telemetry；deadline 仍只构成一次明确 Stop 意图。
     session.tick();
-    settle_control(&mut session);
     session.tick();
-    settle_control(&mut session);
 
     assert_eq!(harness.observed.lock().expect("observed lock").stops, 1);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
@@ -1343,7 +808,6 @@ fn interrupted_trial_reconnects_then_explicit_stop_needs_a_fresh_idle() {
     let deadline = Instant::now() + Duration::from_millis(100);
     while session.trial_snapshot()["state"] != "completed" {
         session.tick();
-        settle_control(&mut session);
         assert!(Instant::now() < deadline, "fresh Idle did not confirm Stop");
         thread::sleep(Duration::from_millis(1));
     }
@@ -1426,7 +890,6 @@ fn position_slider_coalesces_to_latest_and_is_limited_to_twenty_hz() {
         .update_trial_position(2.0)
         .expect("latest target replaces it");
     session.tick();
-    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![2.0]
@@ -1436,7 +899,6 @@ fn position_slider_coalesces_to_latest_and_is_limited_to_twenty_hz() {
         .update_trial_position(3.0)
         .expect("next target merges");
     session.tick();
-    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![2.0],
@@ -1444,7 +906,6 @@ fn position_slider_coalesces_to_latest_and_is_limited_to_twenty_hz() {
     );
     thread::sleep(Duration::from_millis(55));
     session.tick();
-    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![2.0, 3.0]
@@ -1460,17 +921,8 @@ fn target_adoption_transition_does_not_turn_initial_submit_into_stop() {
     // This is the actual first local target submission, followed by the normal firmware
     // adoption window where it still reports Idle / output disallowed / pending.
     session
-        .begin_initial_submission(Command::Position { mm: 5.0 })
-        .expect("initial begins");
-    loop {
-        match session.poll_control() {
-            std::task::Poll::Ready(result) => {
-                result.expect("initial position submits locally");
-                break;
-            }
-            std::task::Poll::Pending => std::thread::yield_now(),
-        }
-    }
+        .execute_trial_command(Command::Position { mm: 5.0 })
+        .expect("initial position submits locally");
     tick_after_telemetry(
         &mut session,
         &harness,
@@ -1523,7 +975,6 @@ fn unknown_position_submission_stops_once_and_never_replays_a_target() {
 
     session.update_trial_position(4.0).expect("target merges");
     session.tick();
-    settle_control(&mut session);
     assert_eq!(
         harness.observed.lock().expect("observed lock").positions,
         vec![4.0]
@@ -1532,7 +983,6 @@ fn unknown_position_submission_stops_once_and_never_replays_a_target() {
     assert!(session.update_trial_position(5.0).is_err());
     thread::sleep(Duration::from_millis(55));
     session.tick();
-    settle_control(&mut session);
 
     let observed = harness.observed.lock().expect("observed lock");
     assert_eq!(observed.positions, vec![4.0]);
@@ -1599,18 +1049,15 @@ fn stop_confirmation_requires_a_receipt_after_stop_submission() {
     // physically received before Stop and therefore cannot acknowledge that Stop.
     probe.inject_idle(100);
     session.tick();
-    settle_control(&mut session);
     probe.inject_idle(101);
     session.stop_trial().expect("Stop submits locally");
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
 
     // A fresh receipt after the local Stop submission is needed in addition to its
     // newer device timestamp and strict idle/driver/fact fields.
     probe.inject_idle(102);
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "completed");
 }
 
@@ -1624,7 +1071,6 @@ fn unknown_stop_is_not_retried_and_can_only_finish_from_later_telemetry() {
     ));
     probe.inject_idle(100);
     session.tick();
-    settle_control(&mut session);
 
     let error = session
         .stop_trial()
@@ -1641,7 +1087,6 @@ fn unknown_stop_is_not_retried_and_can_only_finish_from_later_telemetry() {
 
     probe.inject_idle(101);
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "completed");
 }
 
@@ -1657,7 +1102,6 @@ fn stale_telemetry_stops_even_when_its_device_sample_is_not_new() {
     ));
     probe.inject_idle_at(100, Instant::now() - Duration::from_millis(300));
     session.tick();
-    settle_control(&mut session);
 
     assert_eq!(probe.observed.lock().expect("observed lock").stops, 1);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
@@ -1692,7 +1136,6 @@ fn reach_requires_a_new_matching_current_run_sample() {
     thread::sleep(Duration::from_millis(4));
     // Reusing the same sample does not accumulate settling time into a false arrival.
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "active");
 
     tick_after_telemetry(
@@ -1746,7 +1189,6 @@ fn stop_confirmation_overdue_keeps_owner_and_preserves_late_confirmation() {
         .stop_attempt_finished_at = Some(Instant::now() - Duration::from_secs(1));
 
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert_eq!(session.trial_snapshot()["stop_confirmation_overdue"], true);
     assert!(session.execute(Command::Status).is_err());
@@ -1758,12 +1200,10 @@ fn stop_confirmation_overdue_keeps_owner_and_preserves_late_confirmation() {
     );
     session.stop_trial().expect("重复停止不重发");
     session.tick();
-    settle_control(&mut session);
     assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
 
     probe.inject_idle(100);
     session.tick();
-    settle_control(&mut session);
     let completed = session.trial_snapshot();
     assert_eq!(completed["state"], "completed");
     assert_eq!(completed["stop_observed"], true);
@@ -1837,9 +1277,7 @@ fn recording_failure_stops_once_without_flushing_queued_position_or_completing_r
         .last_position_submit = None;
 
     session.tick();
-    settle_control(&mut session);
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert_eq!(session.recording_snapshot()["failed"], true);
@@ -1850,7 +1288,6 @@ fn recording_failure_stops_once_without_flushing_queued_position_or_completing_r
     }
     probe.inject_idle(100);
     session.tick();
-    settle_control(&mut session);
     assert_eq!(session.trial_snapshot()["state"], "completed");
     assert_eq!(session.trial_snapshot()["stop_reason"], "recording_failed");
     session.finish_recording_boundary("disconnect");
@@ -1884,7 +1321,6 @@ fn recording_finish_failure_cannot_bypass_trial_stop() {
     assert_eq!(session.trial_snapshot()["state"], "stopping");
     assert!(session.recording_error.is_some());
     session.tick();
-    settle_control(&mut session);
     assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
     std::fs::remove_dir_all(root).expect("清理测试记录");
 }
@@ -1907,244 +1343,11 @@ fn stop_confirmation_deadline_uses_receipt_time_instead_of_tick_time() {
         probe.inject_idle_at(100, finished + receipt_delay);
 
         session.tick();
-        settle_control(&mut session);
         assert_eq!(session.trial_snapshot()["state"], "completed");
         assert_eq!(
             session.trial_snapshot()["stop_confirmation_overdue"],
             overdue
         );
         assert_eq!(probe.observed.lock().expect("提交观测").stops, 1);
-    }
-}
-
-pub(crate) fn begin_autonomous_stop_fixture(session: &mut ToolSession) {
-    session.trial.active = Some(active(
-        trial_request(Command::Position { mm: 1.0 }),
-        Instant::now(),
-        10,
-    ));
-    session
-        .submit_trial_stop("duration_elapsed")
-        .expect("autonomous Stop queued");
-}
-
-fn initial_waiting_for_receipt(session: &mut ToolSession, probe: &FixtureProbe) {
-    let request = trial_request(Command::Position { mm: 1.0 });
-    session.prepare_trial(&request).expect("preflight");
-    session.begin_trial_start(request).expect("begin start");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while session.pending_control.is_none() {
-        assert!(session.poll_trial_start().is_pending());
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-    while probe.observed.lock().expect("observed").targets == 0 {
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-}
-
-fn disconnect_fixture(probe: &FixtureProbe) {
-    let sink = probe
-        .sink
-        .lock()
-        .expect("sink")
-        .as_ref()
-        .expect("live sink")
-        .clone();
-    sink.event(eha_sdk::host::backend::Event::Disconnected(
-        "test disconnect".into(),
-    ));
-}
-
-#[test]
-fn recording_stop_cancels_inflight_initial_with_unknown_receipt_and_releases_stop_slot() {
-    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-    let root =
-        std::env::temp_dir().join(format!("eha-recording-start-cancel-{}", std::process::id()));
-    session.start_recording(&root).expect("recording");
-    initial_waiting_for_receipt(&mut session, &probe);
-    session.begin_recording_stop().expect("finish admitted");
-    assert!(
-        matches!(session.poll_trial_start(),std::task::Poll::Ready(Err(error)) if error.unknown && error.local_stage.as_deref()==Some("may_have_been_submitted"))
-    );
-    settle_control(&mut session);
-    assert_eq!(probe.observed.lock().expect("observed").stops, 1);
-    assert!(session.pending_control.is_none());
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match session.poll_recording_stop() {
-            std::task::Poll::Ready(result) => {
-                result.expect("finished");
-                break;
-            }
-            std::task::Poll::Pending => {
-                assert!(Instant::now() < deadline);
-                thread::yield_now();
-            }
-        }
-    }
-    std::fs::remove_dir_all(root).expect("cleanup");
-}
-
-#[test]
-fn disconnect_preserves_initial_unknown_receipt_and_clears_its_pending_control() {
-    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-    initial_waiting_for_receipt(&mut session, &probe);
-    disconnect_fixture(&probe);
-    session.tick();
-    assert!(
-        matches!(session.poll_trial_start(),std::task::Poll::Ready(Err(error)) if error.unknown && error.local_stage.as_deref()==Some("may_have_been_submitted"))
-    );
-    assert!(session.pending_control.is_none());
-    assert!(session.trial.interrupted.is_some());
-}
-
-#[test]
-fn disconnect_keeps_stop_terminal_on_the_interrupted_trial() {
-    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-    session
-        .start_trial(trial_request(Command::Position { mm: 1.0 }))
-        .expect("start");
-    session.begin_control(Command::Stop).expect("Stop begins");
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while probe.observed.lock().expect("observed").stops == 0 {
-        assert!(Instant::now() < deadline);
-        thread::yield_now();
-    }
-    disconnect_fixture(&probe);
-    session.tick();
-    assert!(matches!(session.poll_control(),std::task::Poll::Ready(Err(error)) if error.unknown));
-    let interrupted = session.trial.interrupted.as_ref().expect("interrupted");
-    assert!(interrupted.active.stop_attempt_finished_at.is_some());
-    assert_eq!(
-        interrupted
-            .active
-            .stop_submission
-            .as_ref()
-            .expect("receipt")["error"]["unknown"],
-        true
-    );
-}
-
-#[test]
-fn first_position_completion_starts_the_twenty_hz_cadence() {
-    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-    initial_waiting_for_receipt(&mut session, &probe);
-    session
-        .trial
-        .active
-        .as_mut()
-        .expect("active")
-        .last_position_submit = Some(Instant::now() - Duration::from_secs(1));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match session.poll_trial_start() {
-            std::task::Poll::Ready(result) => {
-                result.expect("initial submitted");
-                break;
-            }
-            std::task::Poll::Pending => {
-                assert!(Instant::now() < deadline);
-                thread::yield_now();
-            }
-        }
-    }
-    session
-        .begin_trial_target(2.0)
-        .expect("next target admitted");
-    assert!(session.poll_trial_target().is_pending());
-    assert!(
-        session.pending_control.is_none(),
-        "initial actual completion starts the 50ms wait"
-    );
-    assert_eq!(
-        probe.observed.lock().expect("observed").positions,
-        vec![1.0]
-    );
-}
-
-#[test]
-fn pending_observation_preserves_connection_scope_without_hiding_known_disconnect() {
-    let (mut session, _) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-    assert!(session.connection_observation_connected(std::task::Poll::Pending));
-    session.disconnected_reason = Some("known disconnect".into());
-    assert!(!session.connection_observation_connected(std::task::Poll::Pending));
-}
-
-#[test]
-fn invalid_recording_stop_does_not_cancel_an_initial_submission() {
-    let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-    initial_waiting_for_receipt(&mut session, &probe);
-    assert!(session.begin_recording_stop().is_err());
-    let deadline = Instant::now() + Duration::from_secs(1);
-    loop {
-        match session.poll_trial_start() {
-            std::task::Poll::Ready(result) => {
-                result.expect("initial submitted");
-                break;
-            }
-            std::task::Poll::Pending => {
-                assert!(Instant::now() < deadline);
-                thread::yield_now();
-            }
-        }
-    }
-    assert_eq!(probe.observed.lock().expect("observed").stops, 0);
-}
-
-#[test]
-fn audited_trial_rechecks_recording_failure_before_initial_submission() {
-    for (projected, released) in [(false, false), (true, false), (false, true), (true, true)] {
-        let (mut session, probe) = session_fixture(1, [7; 12], FixtureBehavior::Ready);
-        let root = std::env::temp_dir().join(format!(
-            "eha-audit-recheck-{}-{projected}-{released}",
-            std::process::id()
-        ));
-        session.start_recording(&root).expect("recording");
-        let request = trial_request(Command::Position { mm: 1.0 });
-        session.prepare_trial(&request).expect("preflight");
-        session.begin_trial_audit(request.clone()).expect("audit");
-        let deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            match session.poll_trial_audit() {
-                std::task::Poll::Ready(result) => {
-                    result.expect("audited");
-                    break;
-                }
-                std::task::Poll::Pending => {
-                    assert!(Instant::now() < deadline);
-                    thread::yield_now();
-                }
-            }
-        }
-        if released {
-            session
-                .begin_trial_start(request.clone())
-                .expect("release before failure");
-        }
-        let error = session
-            .recording
-            .as_mut()
-            .expect("recording")
-            .event("oversized", json!({"payload":"x".repeat(65_537)}))
-            .expect_err("writer marks evidence partial");
-        if projected {
-            session.recording_error = Some(error);
-        }
-        if !released {
-            session
-                .begin_trial_start(request)
-                .expect("release before submission check");
-        }
-        let rejected = matches!(session.poll_trial_start(),std::task::Poll::Ready(Err(error)) if error.local_stage.as_deref()==Some("not_submitted") && !error.unknown);
-        let targets = probe.observed.lock().expect("observed").targets;
-        drop(session);
-        std::fs::remove_dir_all(root).expect("cleanup");
-        assert!(
-            rejected,
-            "failed recording must invalidate earlier audit (projected={projected}, released={released})"
-        );
-        assert_eq!(targets, 0);
     }
 }

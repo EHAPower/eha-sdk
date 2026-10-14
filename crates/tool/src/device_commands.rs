@@ -37,12 +37,6 @@ pub struct DeviceCommand {
     /// 以稳定的结构化 JSON 输出动作结果与会话快照。
     #[arg(long)]
     json: bool,
-    /// 显式附着现有共享服务；必须是私有实例描述符的绝对路径，失败不回落直连。
-    #[arg(long, requires = "target_id", conflicts_with_all = ["usb", "can_channel", "connection", "node", "can_mode", "can_python"])]
-    via_service: Option<PathBuf>,
-    /// 共享服务内明确的目标 ID，例如 usb:完整序列号 或 can:节点号。
-    #[arg(long, requires = "via_service")]
-    target_id: Option<String>,
     /// USB 设备的完整序列号；SDK 会重新枚举并认领 `ff:45:01` Bulk 接口。
     #[arg(long, conflicts_with_all = ["can_channel", "connection"])]
     usb: Option<String>,
@@ -201,9 +195,6 @@ enum Action {
 }
 
 pub fn run(command: DeviceCommand) -> Result<(), String> {
-    if command.via_service.is_some() {
-        return run_via_service(command);
-    }
     let (mm_s, seconds) = match command.action {
         Action::VelocityTest { mm_s, seconds } => (mm_s, seconds),
         _ => return run_session(command),
@@ -218,52 +209,13 @@ pub fn run(command: DeviceCommand) -> Result<(), String> {
     let wait = Wait::new(Duration::from_secs(command.timeout_secs));
     let request = connection_request(&command)?;
     let selected_usb = matches!(request, ConnectionRequest::Usb { .. });
-    // owner 先声明，Client 后声明；所有错误返回均先关闭 Backend 再释放 USB owner。
-    let (_owner, backend) = open_backend(&request)?;
+    let backend = open_backend(&request)?;
     let mut client = Client::new(backend);
     let identity = client.identify(None, &wait).map_err(format_sdk_error)?;
     print_reply("固件 Identity 回复", &identity)?;
     verify_expected_uid(&request, &identity)?;
     velocity_test(&mut client, &wait, selected_usb, mm_s, seconds)?;
     client.close();
-    Ok(())
-}
-
-fn run_via_service(command: DeviceCommand) -> Result<(), String> {
-    use crate::service_client::ReadAction;
-    let action = match &command.action {
-        Action::Status => ReadAction::Status,
-        Action::Measurements => ReadAction::Measurements,
-        Action::Diagnostics => ReadAction::Diagnostics,
-        Action::ConfigRead { view, output: None } => match view.as_str() {
-            "startup" => ReadAction::ConfigStartup,
-            "user" => ReadAction::ConfigUser,
-            _ => return Err("unsupported: P1 共享服务只支持 startup/user 配置读取".into()),
-        },
-        Action::ConfigRead {
-            output: Some(_), ..
-        } => {
-            return Err(
-                "unsupported: P1 共享服务 config-read 输出原生 JSON；尚不支持 --output".into(),
-            );
-        }
-        _ => {
-            return Err(
-                "unsupported: P1 共享服务只提供 status、measurements、diagnostics、config-read"
-                    .into(),
-            );
-        }
-    };
-    let text = crate::service_client::read(
-        command.via_service.as_deref().expect("显式共享服务分支"),
-        command
-            .target_id
-            .as_deref()
-            .ok_or("bad_request: --via-service 必须带 --target-id")?,
-        action,
-        Duration::from_secs(command.timeout_secs),
-    )?;
-    println!("{text}");
     Ok(())
 }
 
@@ -502,24 +454,8 @@ fn connection_request(command: &DeviceCommand) -> Result<ConnectionRequest, Stri
     }
 }
 
-fn open_backend(
-    request: &ConnectionRequest,
-) -> Result<
-    (
-        Option<crate::owner_lock::OwnerGuard>,
-        eha_sdk::host::backend::Backend,
-    ),
-    String,
-> {
-    let owner = match request {
-        ConnectionRequest::Usb { serial } => {
-            let key =
-                crate::owner_lock::ResourceKey::usb(serial).map_err(|error| error.to_string())?;
-            Some(crate::owner_lock::OwnerGuard::acquire(&key).map_err(|error| error.to_string())?)
-        }
-        _ => None,
-    };
-    let backend = match request {
+fn open_backend(request: &ConnectionRequest) -> Result<eha_sdk::host::backend::Backend, String> {
+    match request {
         ConnectionRequest::Usb { serial } => usb::open(serial),
         ConnectionRequest::Can {
             channel,
@@ -543,8 +479,7 @@ fn open_backend(
                 crate::runtime::python(python.as_deref())?,
             ),
         ),
-    }?;
-    Ok((owner, backend))
+    }
 }
 
 fn verify_expected_uid(request: &ConnectionRequest, identity: &Reply) -> Result<(), String> {
@@ -904,16 +839,6 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn one_shot_usb_busy_fails_before_device_open() {
-        let serial = format!("eha-device-busy-{}", std::process::id());
-        let key = crate::owner_lock::ResourceKey::usb(&serial).expect("key");
-        let _owner = crate::owner_lock::OwnerGuard::acquire(&key).expect("先占用");
-        let error = super::open_backend(&super::ConnectionRequest::Usb { serial })
-            .err()
-            .expect("竞争失败不打开 USB");
-        assert!(error.starts_with("owner_busy:"));
-    }
-    #[test]
     fn cli_control_parses_decimal_once_and_rejects_loss_before_device_io() {
         #[derive(clap::Parser)]
         struct TestCli {
@@ -945,8 +870,6 @@ mod tests {
     fn missing_usb_velocity_test(mm_s: f32) -> DeviceCommand {
         DeviceCommand {
             json: false,
-            via_service: None,
-            target_id: None,
             usb: Some("missing-usb-serial".into()),
             can_channel: None,
             connection: None,
@@ -984,94 +907,6 @@ mod tests {
                 "status",
             ])
             .is_err()
-        );
-    }
-
-    #[test]
-    fn shared_service_cli_requires_explicit_target_and_rejects_direct_parameters() {
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            device: DeviceCommand,
-        }
-        use clap::{CommandFactory, Parser};
-        let help = TestCli::command().render_long_help().to_string();
-        assert!(help.contains("--via-service"));
-        assert!(help.contains("--target-id"));
-        let base = [
-            "test",
-            "--via-service",
-            "/private/instance.json",
-            "--target-id",
-            "can:7",
-        ];
-        for action in ["status", "measurements", "diagnostics", "config-read"] {
-            let mut args = base.to_vec();
-            args.push(action);
-            TestCli::try_parse_from(args).expect("显式共享只读命令");
-        }
-        assert!(
-            TestCli::try_parse_from(["test", "--via-service", "/private/instance.json", "status"])
-                .is_err()
-        );
-        assert!(TestCli::try_parse_from(["test", "--target-id", "can:7", "status"]).is_err());
-        for (flag, value) in [
-            ("--usb", "serial"),
-            ("--can-channel", "can0"),
-            ("--connection", "bench"),
-            ("--node", "7"),
-            ("--can-mode", "classic"),
-            ("--can-python", "/usr/bin/python3"),
-        ] {
-            let mut args = base.to_vec();
-            args.extend([flag, value, "status"]);
-            assert!(TestCli::try_parse_from(args).is_err(), "{flag}");
-        }
-    }
-
-    #[test]
-    fn shared_service_unsupported_and_connection_failure_never_enter_direct_path() {
-        #[derive(clap::Parser)]
-        struct TestCli {
-            #[command(flatten)]
-            device: DeviceCommand,
-        }
-        use clap::Parser;
-        let base = [
-            "test",
-            "--via-service",
-            "/missing/eha-service-instance.json",
-            "--target-id",
-            "can:7",
-        ];
-        for action in [
-            "stop",
-            "reset-application",
-            "enter-update",
-            "restore-factory-and-restart",
-        ] {
-            let mut args = base.to_vec();
-            args.push(action);
-            assert!(
-                run(TestCli::try_parse_from(args).expect("parse").device)
-                    .expect_err("unsupported")
-                    .starts_with("unsupported:")
-            );
-        }
-        let mut args = base.to_vec();
-        args.extend(["config-read", "--view", "factory"]);
-        assert!(
-            run(TestCli::try_parse_from(args).expect("parse").device)
-                .expect_err("unsupported")
-                .starts_with("unsupported:")
-        );
-        let mut args = base.to_vec();
-        args.push("status");
-        // 若进入默认直连路径会报未选择USB/CAN；此处只允许明确服务文件错误。
-        assert!(
-            run(TestCli::try_parse_from(args).expect("parse").device)
-                .expect_err("missing descriptor")
-                .starts_with("private_file_invalid:")
         );
     }
 }

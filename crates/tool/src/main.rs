@@ -16,10 +16,7 @@ mod build_metadata {
 mod device_commands;
 mod devices;
 mod odrive_commands;
-mod owner_lock;
 mod runtime;
-mod service;
-mod service_client;
 mod session;
 mod shell;
 mod webui;
@@ -60,27 +57,6 @@ enum Command {
     Connection(device_commands::ConnectionCommand),
     /// 独立读取 ODrive USB 状态，不控制设备或改变 H723 会话
     Odrive(odrive_commands::OdriveCommand),
-    /// 启动仅本机的认证 SDK 服务；启动不连接设备或启用心跳
-    Serve {
-        /// 仅在 127.0.0.1 上监听的端口
-        #[arg(long)]
-        port: NonZeroU16,
-        /// 首次创建 token，重启读取同一权限 0600 的文件。
-        #[arg(long)]
-        token_file: PathBuf,
-        /// 私有发现记录绝对路径；省略时按端口放入每用户系统数据目录。
-        #[arg(long)]
-        instance_file: Option<PathBuf>,
-        /// 记录目录；省略时使用系统本地数据目录。
-        #[arg(long)]
-        runs_dir: Option<PathBuf>,
-        /// 带 odrive==0.5.1.post0 的 Python。
-        #[arg(long)]
-        odrive_python: Option<PathBuf>,
-        /// 仅暴露经认证的 Workbench 直通 API（/api/*），不启用 WebUI 或 v2 准入账本。
-        #[arg(long)]
-        direct_api: bool,
-    },
     /// 启动仅限本机访问、持有持久 SDK 会话的 WebUI
     Webui {
         /// 仅在 127.0.0.1 上监听的端口
@@ -92,9 +68,6 @@ enum Command {
         /// 记录试验原始数据的目录；省略时使用系统本地数据目录。
         #[arg(long)]
         runs_dir: Option<PathBuf>,
-        /// 启用仅本机只读集成；首次创建 token，重启读取同一受限文件。
-        #[arg(long)]
-        integration_token_file: Option<PathBuf>,
     },
 }
 
@@ -125,27 +98,11 @@ fn main() -> ExitCode {
         Some(Command::Device(command)) => device_commands::run(command),
         Some(Command::Connection(command)) => device_commands::run_connection(command),
         Some(Command::Odrive(command)) => odrive_commands::run(command),
-        Some(Command::Serve {
-            port,
-            token_file,
-            instance_file,
-            runs_dir,
-            odrive_python,
-            direct_api,
-        }) => service::serve(
-            port.get(),
-            odrive_python,
-            runs_dir,
-            token_file,
-            instance_file,
-            direct_api,
-        ),
         Some(Command::Webui {
             port,
             odrive_python,
             runs_dir,
-            integration_token_file,
-        }) => webui::serve(port.get(), odrive_python, runs_dir, integration_token_file),
+        }) => webui::serve(port.get(), odrive_python, runs_dir),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -213,13 +170,6 @@ impl RawFields {
 
     pub(crate) fn contains(&self, name: &str) -> bool {
         self.0.contains_key(name)
-    }
-
-    pub(crate) fn reject_unknown(&self, allowed: &[&str]) -> Result<(), String> {
-        if let Some(name) = self.0.keys().find(|name| !allowed.contains(&name.as_str())) {
-            return Err(format!("未知字段：{name}"));
-        }
-        Ok(())
     }
 }
 

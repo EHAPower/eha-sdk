@@ -2,11 +2,8 @@
 //! 桌面客户 API。`Client` 串行提交业务，独立 I/O 线程维持收发和显式心跳。
 //! 所有数据副本拥有自己的字节；本地提交绝不表示目标采用或设备执行。
 pub mod backend;
-mod observations;
-mod submissions;
-pub use observations::ClientObservation;
 
-use crate::session::{MutationKind, QueryKind, QueryMatch, Session};
+use crate::session::{MutationKind, QueryKind, Session};
 pub use backend::{AdapterStatus, Backend, HeartbeatStatus, TransportStatus};
 use backend::{Command, Event, Received, SendRequest};
 use protocol::responses::{ConfigView, DataUnavailableFields};
@@ -17,7 +14,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    task::Poll,
     time::{Duration, Instant},
 };
 
@@ -63,7 +59,7 @@ mod tests {
             ValueState::new(ValueResult::Never, SourceQuality::Unknown, false),
         )
     }
-    pub(super) fn telemetry(run_nonce: [u8; 16], sequence: u32) -> Vec<u8> {
+    fn telemetry(run_nonce: [u8; 16], sequence: u32) -> Vec<u8> {
         let fields = TelemetryFields {
             sample: SampleData {
                 query_id: 0,
@@ -141,7 +137,7 @@ mod tests {
         responses::encode_identity(&fields, &mut bytes).expect("identity encodes");
         bytes
     }
-    pub(super) fn verified_client(run_nonce: [u8; 16]) -> Client {
+    fn verified_client(run_nonce: [u8; 16]) -> Client {
         let backend = Backend::spawn("telemetry-queue-test", |receiver, _| {
             while let Ok(command) = receiver.recv() {
                 if matches!(command, crate::host::backend::Command::Close) {
@@ -240,94 +236,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|status| status.errors >= 1)
         );
-    }
-
-    #[test]
-    fn poll_budget_yields_with_events_still_queued() {
-        let mut client = verified_client([1; 16]);
-        client
-            .begin_query(crate::session::QueryKind::Status, &Wait::default())
-            .expect("begin");
-        for id in 100..117 {
-            client.backend.sink.submitted(id);
-        }
-        assert!(client.poll_query().is_pending());
-        assert_eq!(
-            client.backend.sink.0.0.lock().expect("inbox").events.len(),
-            1
-        );
-        assert!(client.poll_query().is_pending());
-        assert!(
-            client
-                .backend
-                .sink
-                .0
-                .0
-                .lock()
-                .expect("inbox")
-                .events
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn poll_lock_contention_and_expiry_never_wait_for_the_inbox_lock() {
-        let mut client = verified_client([1; 16]);
-        client
-            .begin_query(crate::session::QueryKind::Status, &Wait::default())
-            .expect("begin");
-        let sink = client.backend.sink.clone();
-        let guard = sink.0.0.lock().expect("hold inbox");
-        assert!(client.poll_query().is_pending());
-        client.pending_query.as_mut().expect("pending").deadline = Instant::now();
-        let std::task::Poll::Ready(Err(error)) = client.poll_query() else {
-            panic!("deadline fails without taking inbox lock")
-        };
-        assert!(matches!(error.failure, Failure::Timeout));
-        assert_eq!(error.local, LocalStage::MayHaveBeenSubmitted);
-        assert!(error.observed_transport.is_none());
-        drop(guard);
-
-        let wait = Wait::default();
-        client
-            .begin_query(crate::session::QueryKind::Status, &wait)
-            .expect("begin after timeout");
-        client
-            .backend
-            .sink
-            .submitted(client.pending_query.as_ref().expect("pending").id);
-        assert!(client.poll_query().is_pending());
-        let guard = sink.0.0.lock().expect("hold inbox");
-        wait.cancellation.cancel();
-        let std::task::Poll::Ready(Err(error)) = client.poll_query() else {
-            panic!("cancellation fails without taking inbox lock")
-        };
-        assert!(matches!(error.failure, Failure::Cancelled));
-        assert_eq!(error.local, LocalStage::FullySubmitted);
-        assert!(error.observed_transport.is_none());
-        drop(guard);
-    }
-
-    #[test]
-    fn poll_does_not_suspend_worker_heartbeat() {
-        let (backend, commands, sink) = Backend::endpoint();
-        let mut client = verified_client([1; 16]);
-        client.backend = backend;
-        client.heartbeat_hz = Some(100);
-        let mut pump = super::backend::Pump::new(commands, sink);
-        client.start_heartbeat().expect("start heartbeat");
-        client
-            .begin_query(crate::session::QueryKind::Status, &Wait::default())
-            .expect("begin");
-        assert!(client.poll_query().is_pending());
-        assert!(pump.poll());
-        let heartbeat = pump.take(0).expect("worker still schedules heartbeat");
-        assert_eq!(heartbeat.id, 0);
-        pump.sink.submitted(heartbeat.id);
-        assert_eq!(client.heartbeat_status().submitted, 1);
-        assert!(client.poll_query().is_pending());
-        client.cancel_query().expect("cancel wait only");
-        assert!(client.heartbeat_status().enabled);
     }
 }
 
@@ -450,29 +358,11 @@ pub struct ClientState {
 
 /// 一台设备的串行业务调用方；打开后须先核对身份，资源释放不发送控制或停止。
 pub struct Client {
-    pending_query: Option<PendingQuery>,
-    pending_submission: Option<submissions::PendingSubmission>,
     backend: Backend,
     identity_verified: bool,
     session: Session,
     sequence: u64,
     heartbeat_hz: Option<u32>,
-}
-
-struct PendingQuery {
-    matcher: QueryMatch,
-    id: u64,
-    deadline: Instant,
-    cancel: Arc<AtomicBool>,
-    wait: Wait,
-    stage: LocalStage,
-    early_reply: Option<Reply>,
-}
-
-impl Drop for PendingQuery {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Release);
-    }
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -487,8 +377,6 @@ impl Client {
     /// 装配独占后端，初始身份未核对且周期心跳未启动。
     pub fn new(backend: Backend) -> Self {
         Self {
-            pending_query: None,
-            pending_submission: None,
             backend,
             identity_verified: false,
             session: Session::new(),
@@ -503,8 +391,6 @@ impl Client {
     /// 的传输序号和 guard 历史。不能以一次性 `can::open` / `usb::open` 重置传输状态。
     pub fn resume(backend: Backend, state: ClientState) -> Self {
         Self {
-            pending_query: None,
-            pending_submission: None,
             backend,
             identity_verified: false,
             session: state.session,
@@ -538,22 +424,10 @@ impl Client {
 
     fn require_identity(&self) -> Result<(), Error> {
         if !self.identity_verified || self.session.identity().is_none() {
-            Err(self.query_error(
+            Err(self.error(
                 Failure::Session("请先 identify 核对身份".into()),
                 LocalStage::NotSubmitted,
             ))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn require_idle(&self) -> Result<(), Error> {
-        if self.pending_query.is_some() || self.pending_submission.is_some() {
-            Err(Error {
-                failure: Failure::Session("已有业务等待中，请先 poll 或显式结束对应等待".into()),
-                local: LocalStage::NotSubmitted,
-                observed_transport: None,
-            })
         } else {
             Ok(())
         }
@@ -573,56 +447,32 @@ impl Client {
         message: &Message<'_>,
         wait: &Wait,
     ) -> Result<(u64, Instant, Arc<AtomicBool>), Error> {
-        self.send_inner(message, wait, None)
-    }
-
-    fn send_control(
-        &mut self,
-        message: &Message<'_>,
-        wait: &Wait,
-    ) -> Result<(u64, Instant, backend::QueueCancellation), Error> {
-        let cancellation = backend::QueueCancellation::default();
-        let (id, deadline, _) = self.send_inner(message, wait, Some(cancellation.clone()))?;
-        Ok((id, deadline, cancellation))
-    }
-
-    fn send_inner(
-        &mut self,
-        message: &Message<'_>,
-        wait: &Wait,
-        queued: Option<backend::QueueCancellation>,
-    ) -> Result<(u64, Instant, Arc<AtomicBool>), Error> {
         let deadline = Instant::now()
             .checked_add(wait.timeout)
             .ok_or_else(|| invalid("等待期限无法表示"))?;
         if wait.timeout.is_zero() || wait.cancellation.is_cancelled() {
-            return Err(self.query_error(Failure::Cancelled, LocalStage::NotSubmitted));
+            return Err(self.error(Failure::Cancelled, LocalStage::NotSubmitted));
         }
         let bytes = Self::encode(message)?;
         self.sequence = self
             .sequence
             .checked_add(1)
             .ok_or_else(|| invalid("本地调用编号耗尽"))?;
-        let cancelled = queued
-            .as_ref()
-            .map(backend::QueueCancellation::flag)
-            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let request = SendRequest {
-            id: self.sequence,
-            bytes,
-            deadline,
-            cancelled: cancelled.clone(),
-        };
-        let command = match queued {
-            Some(token) => Command::CancellableSend(request, token),
-            None => Command::Send(request),
-        };
-        self.backend.tx.try_send(command).map_err(|error| {
-            self.query_error(
-                Failure::Disconnected(error.to_string()),
-                LocalStage::NotSubmitted,
-            )
-        })?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.backend
+            .tx
+            .try_send(Command::Send(SendRequest {
+                id: self.sequence,
+                bytes,
+                deadline,
+                cancelled: cancelled.clone(),
+            }))
+            .map_err(|error| {
+                self.error(
+                    Failure::Disconnected(error.to_string()),
+                    LocalStage::NotSubmitted,
+                )
+            })?;
         Ok((self.sequence, deadline, cancelled))
     }
 
@@ -739,7 +589,6 @@ impl Client {
         expected_uid: Option<[u8; 12]>,
         wait: &Wait,
     ) -> Result<Reply, Error> {
-        self.require_idle()?;
         self.identity_verified = false;
         let expected_uid =
             expected_uid.or_else(|| self.session.identity().map(|identity| identity.uid));
@@ -778,26 +627,7 @@ impl Client {
         self.query(QueryKind::Config(view as u8), wait)
     }
 
-    /// 开始一次只读查询，不等待本地提交或设备回复。
-    ///
-    /// 支持 Status、Measurements、Diagnostics 和 Config(0..=2)；身份核对仍用
-    /// [`Self::identify`]。本 Client 同时只保存一个查询，期限从本次开始计算。
-    /// 等待期间，仅 poll/cancel、缓存与状态读取、遥测队列和后台心跳开关可用；
-    /// 所有同步业务调用均返回错误，不消费该查询的事件。显式停止须先 cancel_query。
-    pub fn begin_query(&mut self, kind: QueryKind, wait: &Wait) -> Result<(), Error> {
-        if kind == QueryKind::Identity {
-            return Err(invalid("身份查询请使用 identify"));
-        }
-        if matches!(kind, QueryKind::Config(view) if view > 2) {
-            return Err(invalid(
-                "配置视图必须为 Factory(0)、UserRecord(1) 或 Startup(2)",
-            ));
-        }
-        self.begin_query_inner(kind, wait)
-    }
-
-    fn begin_query_inner(&mut self, kind: QueryKind, wait: &Wait) -> Result<(), Error> {
-        self.require_idle()?;
+    fn query(&mut self, kind: QueryKind, wait: &Wait) -> Result<Reply, Error> {
         if kind != QueryKind::Identity {
             self.require_identity()?;
         }
@@ -809,172 +639,53 @@ impl Client {
         })?;
         let message = matcher.request();
         let (id, deadline, cancel) = self.send(&message, wait)?;
-        self.pending_query = Some(PendingQuery {
-            matcher,
-            id,
-            deadline,
-            cancel,
-            wait: wait.clone(),
-            stage: LocalStage::MayHaveBeenSubmitted,
-            early_reply: None,
-        });
-        Ok(())
-    }
-
-    /// 有界推进查询：最多消费 16 个普通事件，锁忙或无事件即返回 Pending。
-    /// 不睡眠、不等待回复；完成或失败后自动释放查询槽。后台心跳独立运行。
-    /// 没有查询时返回 InvalidInput；旧回复只会按本次 query_id、run_nonce 和主题匹配。
-    pub fn poll_query(&mut self) -> Poll<Result<Reply, Error>> {
-        let Some(mut pending) = self.pending_query.take() else {
-            return Poll::Ready(Err(invalid("没有等待中的查询")));
-        };
-        for _ in 0..16 {
-            let event = self.try_query_event(&pending, Instant::now());
-            let idle = matches!(event, Ok(None));
-            if let Poll::Ready(result) = self.advance_query(&mut pending, event) {
-                return Poll::Ready(result);
-            }
-            if idle {
-                break;
-            }
-        }
-        self.pending_query = Some(pending);
-        Poll::Pending
-    }
-
-    /// 结束查询等待并尽可能取消尚未提交的发送，返回已观察到的本地提交阶段。
-    /// 不撤回已发字节、不发送 Stop、不关闭后台心跳；迟到回复不会匹配后续查询。
-    /// MayHaveBeenSubmitted 表示取消前未观察到本地提交结果，不保证字节尚未发出。
-    /// 官方后端取出查询后隔离等待取消；若尚未开始发送而 put_back，恢复排队取消。
-    /// 真正在途的查询不被等待取消中止；原发送期限仍有效，Stop 等待正常发送边界。
-    pub fn cancel_query(&mut self) -> Result<LocalStage, Error> {
-        self.pending_query
-            .take()
-            .map(|pending| pending.stage)
-            .ok_or_else(|| invalid("没有等待中的查询"))
-    }
-
-    fn try_query_event(
-        &self,
-        pending: &PendingQuery,
-        now: Instant,
-    ) -> Result<Option<Event>, Failure> {
-        self.try_pending_event(&pending.wait, pending.deadline, now)
-    }
-
-    fn try_pending_event(
-        &self,
-        wait: &Wait,
-        deadline: Instant,
-        now: Instant,
-    ) -> Result<Option<Event>, Failure> {
-        if wait.cancellation.is_cancelled() {
-            return Err(Failure::Cancelled);
-        }
-        if now >= deadline {
-            return Err(Failure::Timeout);
-        }
-        let mut inbox = match self.backend.sink.0.0.try_lock() {
-            Ok(inbox) => inbox,
-            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
-            Err(std::sync::TryLockError::Poisoned(_)) => {
-                return Err(Failure::Disconnected("I/O 状态锁失效".into()));
-            }
-        };
-        if let Some(event) = inbox.events.pop_front() {
-            return Ok(Some(event));
-        }
-        if let Some(reason) = &inbox.disconnected {
-            return Err(Failure::Disconnected(reason.clone()));
-        }
-        Ok(None)
-    }
-
-    fn query_error(&self, failure: Failure, local: LocalStage) -> Error {
-        Error {
-            failure,
-            local,
-            observed_transport: self
-                .backend
-                .sink
-                .0
-                .0
-                .try_lock()
-                .ok()
-                .map(|inbox| Box::new(inbox.transport.clone())),
-        }
-    }
-
-    fn advance_query(
-        &self,
-        pending: &mut PendingQuery,
-        event: Result<Option<Event>, Failure>,
-    ) -> Poll<Result<Reply, Error>> {
-        match event {
-            Ok(Some(Event::Submitted(got))) if got == pending.id => {
-                pending.stage = LocalStage::FullySubmitted;
-                if let Some(reply) = pending.early_reply.take() {
-                    return Poll::Ready(self.finish_query_reply(reply, pending.stage));
-                }
-            }
-            Ok(Some(Event::Failed(got, failure))) if got == pending.id => {
-                return Poll::Ready(Err(self.query_error(
-                    Failure::Transport {
-                        detail: failure.detail,
-                        raw: Vec::new(),
-                    },
-                    if failure.may_have_sent {
-                        pending.stage
-                    } else {
-                        LocalStage::NotSubmitted
-                    },
-                )));
-            }
-            Ok(Some(Event::Message(received))) => {
-                let reply: Reply = received.into();
-                let response = match reply.response() {
-                    Ok(response) => response,
-                    Err(error) => {
-                        return Poll::Ready(Err(self.query_error(error.failure, pending.stage)));
-                    }
-                };
-                if pending.matcher.matches(&response) {
-                    if pending.stage == LocalStage::FullySubmitted {
-                        return Poll::Ready(self.finish_query_reply(reply, pending.stage));
-                    }
-                    if pending.early_reply.is_none() {
-                        pending.early_reply = Some(reply);
-                    }
-                }
-            }
-            Ok(Some(Event::Disconnected(reason))) => {
-                return Poll::Ready(Err(
-                    self.query_error(Failure::Disconnected(reason), pending.stage)
-                ));
-            }
-            Ok(Some(Event::TransportError { detail, raw })) => {
-                return Poll::Ready(Err(
-                    self.query_error(Failure::Transport { detail, raw }, pending.stage)
-                ));
-            }
-            Err(failure) => {
-                return Poll::Ready(Err(self.query_error(failure, pending.stage)));
-            }
-            Ok(_) => {}
-        }
-        Poll::Pending
-    }
-
-    fn query(&mut self, kind: QueryKind, wait: &Wait) -> Result<Reply, Error> {
-        self.begin_query_inner(kind, wait)?;
-        let mut pending = self
-            .pending_query
-            .take()
-            .ok_or_else(|| invalid("缺少查询"))?;
+        let mut stage = LocalStage::MayHaveBeenSubmitted;
+        let mut early_reply = None;
         loop {
-            let event = self.next_event(pending.deadline, &pending.wait).map(Some);
-            if let Poll::Ready(result) = self.advance_query(&mut pending, event) {
-                return result;
+            match self.next_event(deadline, wait) {
+                Ok(Event::Submitted(got)) if got == id => {
+                    stage = LocalStage::FullySubmitted;
+                    if let Some(reply) = early_reply.take() {
+                        return self.finish_query_reply(reply, stage);
+                    }
+                }
+                Ok(Event::Failed(got, failure)) if got == id => {
+                    return Err(self.error(
+                        Failure::Transport {
+                            detail: failure.detail,
+                            raw: Vec::new(),
+                        },
+                        if failure.may_have_sent {
+                            stage
+                        } else {
+                            LocalStage::NotSubmitted
+                        },
+                    ));
+                }
+                Ok(Event::Message(received)) => {
+                    let reply: Reply = received.into();
+                    let response = reply.response()?;
+                    if matcher.matches(&response) {
+                        if stage == LocalStage::FullySubmitted {
+                            return self.finish_query_reply(reply, stage);
+                        }
+                        if early_reply.is_none() {
+                            early_reply = Some(reply);
+                        }
+                    }
+                }
+                Ok(Event::Disconnected(reason)) => {
+                    return Err(self.error(Failure::Disconnected(reason), stage));
+                }
+                Ok(Event::TransportError { detail, raw }) => {
+                    cancel.store(true, Ordering::Release);
+                    return Err(self.error(Failure::Transport { detail, raw }, stage));
+                }
+                Ok(_) => {}
+                Err(failure) => {
+                    cancel.store(true, Ordering::Release);
+                    return Err(self.error(failure, stage));
+                }
             }
         }
     }
@@ -982,7 +693,7 @@ impl Client {
     fn finish_query_reply(&self, reply: Reply, stage: LocalStage) -> Result<Reply, Error> {
         match reply.response()? {
             Response::DataUnavailable(unavailable) => {
-                Err(self.query_error(Failure::DataUnavailable(unavailable.fields()), stage))
+                Err(self.error(Failure::DataUnavailable(unavailable.fields()), stage))
             }
             _ => Ok(reply),
         }
@@ -1124,7 +835,6 @@ impl Client {
         self.submit(Message::Stop, wait)
     }
     fn submit(&mut self, message: Message<'_>, wait: &Wait) -> Result<LocalSubmission, Error> {
-        self.require_idle()?;
         self.require_identity()?;
         let (id, deadline, cancel) = self.send(&message, wait)?;
         self.await_submission(None, id, deadline, cancel, wait, true)
@@ -1183,8 +893,32 @@ impl Client {
         record: Option<&[u8]>,
         wait: &Wait,
     ) -> Result<LocalSubmission, Error> {
-        let (matcher, id, deadline, cancel) =
-            self.prepare_mutation_submission(kind, record, wait)?;
+        self.require_identity()?;
+        let matcher = self.session.next_mutation(kind).map_err(|error| {
+            self.error(
+                Failure::Session(format!("{error:?}")),
+                LocalStage::NotSubmitted,
+            )
+        })?;
+        let bytes = matcher.identity.to_bytes();
+        let identity =
+            ExpectedIdentity::new(&bytes).map_err(|error| invalid(format!("{error:?}")))?;
+        let message = match kind {
+            MutationKind::SaveAndRestart => Message::SaveAndRestart {
+                query_id: matcher.query_id,
+                identity,
+                record: record.ok_or_else(|| invalid("缺少完整记录"))?,
+            },
+            MutationKind::ResetApplication => Message::ResetApplication {
+                query_id: matcher.query_id,
+                identity,
+            },
+            MutationKind::EnterUpdate => Message::EnterUpdate {
+                query_id: matcher.query_id,
+                identity,
+            },
+        };
+        let (id, deadline, cancel) = self.send(&message, wait)?;
         self.await_submission(Some(matcher), id, deadline, cancel, wait, true)
     }
 }

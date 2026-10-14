@@ -167,27 +167,16 @@ def explicit_bus(can, encoded):
         raise ValueError("显式 python-can 配置必须是对象")
     interface = config.get("interface")
     channel = config.get("channel")
-    if not isinstance(interface, str) or not interface.strip() or isinstance(channel, bool) or not isinstance(channel, (str, int)) or (isinstance(channel, str) and not channel.strip()):
+    if not isinstance(interface, str) or not interface.strip() or not isinstance(channel, str) or not channel.strip():
         raise ValueError("显式 python-can 配置必须包含 interface 和 channel")
-    # 官方 load_config 会将 state 转成 BusState；冻结为枚举名后在此恢复。
-    if "state" in config and isinstance(config["state"], str):
-        try:
-            config["state"] = can.BusState[config["state"]]
-        except KeyError as error:
-            raise ValueError("显式 python-can state 无效") from error
     timing = config.get("timing")
     if timing is not None:
         if not isinstance(timing, dict):
             raise ValueError("显式 python-can timing 必须是对象")
-        timing = dict(timing)
-        timing_kind = timing.pop("_eha_timing_kind", "fd")
-        if timing_kind not in ("classic", "fd"):
-            raise ValueError("显式 python-can timing 类型无效")
         try:
-            constructor = can.BitTiming if timing_kind == "classic" else can.BitTimingFd
-            config["timing"] = constructor(**timing)
+            config["timing"] = can.BitTimingFd(**timing)
         except Exception as error:
-            raise ValueError(f"无法构造 CAN {timing_kind} 位时序: {error}") from error
+            raise ValueError(f"无法构造 CAN FD 位时序: {error}") from error
         # `timing` 是 python-can 的完整位时序输入；不要再传可能被后端忽略的
         # bitrate/data_bitrate 标量，避免不同 driver 对两份设置取舍不同。
         config.pop("bitrate", None)
