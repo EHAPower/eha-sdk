@@ -183,7 +183,7 @@ jobs:
           if host != expected:
               raise SystemExit(f'runner Rust host {host} does not match expected {expected}')
           PY
-          ldd --version | head -n 1
+          ldd --version
 
       - name: 构建 eha-tool
         shell: bash
