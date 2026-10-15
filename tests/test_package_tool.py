@@ -5,7 +5,10 @@ import argparse
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -77,6 +80,18 @@ class PackageToolTests(unittest.TestCase):
                 patch.object(package_tool, "install_dependencies"), \
                 patch.object(package_tool, "check_runtime", side_effect=health_error):
             package_tool.package(args)
+
+    def test_commands_print_utf8_with_a_legacy_console_encoding(self):
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        environment = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        for script in ("package_tool.py", "smoke_tool_bundle.py"):
+            with self.subTest(script=script):
+                result = subprocess.run(
+                    [sys.executable, str(scripts / script), "--help"],
+                    env=environment, capture_output=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("发行包", result.stdout.decode("utf-8"))
 
     def test_native_targets_and_architecture_aliases(self):
         for target, (system, architecture) in package_tool.TARGETS.items():

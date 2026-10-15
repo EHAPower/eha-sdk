@@ -298,4 +298,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Windows 重定向输出可能仍采用本地代码页；发行日志统一使用 UTF-8。
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
     raise SystemExit(main())
