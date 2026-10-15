@@ -38,7 +38,7 @@ def main():
         return
     commands = [
         ["cargo", "fmt", "--all", "--", "--check"],
-        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_python_can.py"],
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
         ["cargo", "test", "--workspace", "--all-targets", "--locked"],
         ["node", "--test", *[
             str(path.relative_to(root))

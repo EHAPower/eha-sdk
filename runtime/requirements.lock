@@ -1,7 +1,8 @@
 # Copyright The eha-sdk Contributors
 #
 # 由 `scripts/package_tool.py` 以 --require-hashes 安装到随包 CPython 3.13。
-# 仅支持 manifest.json 中当前列出的 aarch64-apple-darwin 运行时。
+# 支持 manifest.json 中列出的 Apple Silicon macOS、Linux amd64/arm64 与
+# Windows amd64/arm64 运行时；wrapt 是唯一带 CPython/平台 wheel 的直接依赖。
 packaging==26.3 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
 pyserial==3.5 \
@@ -11,4 +12,8 @@ python-can==4.6.1 \
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
 wrapt==1.17.3 \
-    --hash=sha256:16ecf15d6af39246fe33e507105d67e4b81d8f8d2c6598ff7e3ca1b8a37213f7
+    --hash=sha256:16ecf15d6af39246fe33e507105d67e4b81d8f8d2c6598ff7e3ca1b8a37213f7 \
+    --hash=sha256:6fd1ad24dc235e4ab88cda009e19bf347aabb975e44fd5c2fb22a3f6e4141277 \
+    --hash=sha256:0ed61b7c2d49cee3c027372df5809a59d60cf1b6c2f81ee980a091f3afed6a2d \
+    --hash=sha256:1f0b2f40cf341ee8cc1a97d51ff50dddb9fcc73241b9143ec74b30fc4f44f6cb \
+    --hash=sha256:7425ac3c54430f5fc5e7b6f41d41e704db073309acfc09305816bc6a0b26bb16

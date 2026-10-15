@@ -24,7 +24,7 @@
 
 SDK 的 `CanChannel` 只发送和接收原始帧：Rust 应用以 `CanChannelFactory` 接入自己的系统／驱动服务，SDK 不发现、初始化或恢复物理 CAN 设备，也不解释厂商协议或指定比特率。Python 不是公共协议或 Rust SDK 的必需依赖。
 
-官方 `eha-tool` 提供两条明确边界的接入路径。普通路径使用每用户 `connections.json` 中保存的连接档案：位置为 `XDG_CONFIG_HOME/eha-tool/connections.json`，macOS 为 `~/Library/Application Support/eha-tool/connections.json`，未设 `XDG_CONFIG_HOME` 的其它系统为 `~/.config/eha-tool/connections.json`。工具只支持其中 `adapter.kind="canable2"` 的 CANable2/SLCAN 档案：按保存的稳定 USB 序列号寻找唯一串口，并应用 1 Mbps 仲裁速率、2 Mbps FD 数据速率的预设。它不识别或实现厂商 USB 协议，也不尝试复位或恢复驱动。
+官方 `eha-tool` 提供两条明确边界的接入路径。普通路径使用每用户 `connections.json` 中保存的连接档案：macOS/Linux 优先使用 `XDG_CONFIG_HOME/eha-tool/connections.json`；未设置时，macOS 为 `~/Library/Application Support/eha-tool/connections.json`，Linux 为 `~/.config/eha-tool/connections.json`。Windows 忽略 `XDG_CONFIG_HOME`，使用 `%LOCALAPPDATA%/eha-tool/connections.json`（未设置时回退 `%APPDATA%/eha-tool/connections.json`）。工具只支持其中 `adapter.kind="canable2"` 的 CANable2/SLCAN 档案：按保存的稳定 USB 序列号寻找唯一串口，并应用 1 Mbps 仲裁速率、2 Mbps FD 数据速率的预设。它不识别或实现厂商 USB 协议，也不尝试复位或恢复驱动。
 
 连接档案包含名称、适配器序列号、EHA 节点、帧形态、可选自动连接与默认标记；`connection save` 先通过 Identity 和已有 UID 门禁，才写入或绑定预期 EHA UID，Python 路径只用于本次操作而不写入档案。普通用户用 `connection adapters [--can-python PATH]` 列出候选、`connection list` 查看档案，再用下列命令保存、连接或删除档案：
 
@@ -36,22 +36,29 @@ eha-tool connection delete ID
 eha-tool device --connection ID ACTION
 ```
 
-精确参数和输出以各子命令的 `--help` 为准。发布 bundle 通过私有 `runtime/python` 运行已锁定的 `python-can` 和 `pyserial`，因此普通使用不依赖 `PATH`、`pip`、虚拟环境或 `can.conf`。
+精确参数和输出以各子命令的 `--help` 为准。发布 bundle 通过私有 `runtime/python` 运行已锁定的 `python-can==4.6.1` 和 `pyserial==3.5`，因此普通使用不依赖 `PATH`、`pip`、虚拟环境或 `can.conf`。
 
 同序列号候选不唯一、适配器缺失、通道打不开、Identity 失败或返回 UID 不等于档案预期 UID 时，工具拒绝连接；绝不改用另一串口、适配器、USB 或历史目标。首次连接和物理重连只执行 Identity：不自启 Heartbeat、不恢复控制、不重放目标或维护操作。用户先处理实际物理连接，再显式发起通信恢复。
 
-更换电脑时复制完整发行目录，在新主机首次执行 `connection adapters`，选择实际可见适配器并 `connection save`，再显式连接；普通路径不需要手改设备路径、Python 或 `can.conf`。档案保存在运行 backend 的该用户目录，不在浏览器中；换 CAN 适配器须新建档案或明确重新绑定，旧档案不会静默指向新硬件。一个运行中的 WebUI CAN 网络绑定其首次打开的适配器；要切换到另一档案/适配器，先结束该网络上的会话，再重启 WebUI 后连接。
+更换电脑时下载与该主机系统和 CPU 架构一致的完整发行包并整体解压，在新主机首次执行 `connection adapters`，选择实际可见适配器并 `connection save`，再显式连接；普通路径不需要手改设备路径、Python 或 `can.conf`。档案保存在运行 backend 的该用户目录，不在浏览器中；换 CAN 适配器须新建档案或明确重新绑定，旧档案不会静默指向新硬件。一个运行中的 WebUI CAN 网络绑定其首次打开的适配器；要切换到另一档案/适配器，先结束该网络上的会话，再重启 WebUI 后连接。
 
-高级路径保留 `--can-channel CONTEXT --node N [--can-mode classic|fd] [--can-python PATH]`，供其它 `python-can` 后端使用。`CONTEXT` 仍按 `python-can` 的命名配置或等价 `CAN_CONFIG_<CONTEXT>` 环境配置提供；调用方负责所选设备的驱动、权限、总线设置及恢复。`--can-mode` 和 SDK 的 `transport::can::Mode` 只选择 EHA CAN 绑定所要求的帧形态，必须与控制器实际启动配置一致；`fd` 仍要求操作系统、驱动和设备实际支持 CAN FD 与 BRS。可参照 [python-can 配置说明](https://python-can.readthedocs.io/en/stable/configuration.html) 与 [总线接口](https://python-can.readthedocs.io/en/stable/bus.html)。
+高级路径保留 `--can-channel CONTEXT --node N [--can-mode classic|fd] [--can-python PATH]`，供其它 `python-can` 后端使用。随包 runtime 也可运行其中已包含依赖的后端；当某厂商后端还需要厂商 SDK、Python 包或解释器环境时，再用 `--can-python PATH` 显式覆盖为自备 Python。`CONTEXT` 仍按 `python-can` 的命名配置或等价 `CAN_CONFIG_<CONTEXT>` 环境配置提供；调用方负责所选设备的驱动、权限、总线设置及恢复。`--can-mode` 和 SDK 的 `transport::can::Mode` 只选择 EHA CAN 绑定所要求的帧形态，必须与控制器实际启动配置一致；`fd` 仍要求操作系统、驱动和设备实际支持 CAN FD 与 BRS。可参照 [python-can 配置说明](https://python-can.readthedocs.io/en/stable/configuration.html) 与 [总线接口](https://python-can.readthedocs.io/en/stable/bus.html)。
 
-发布包制作者为每个已验证的 OS／架构构建工具与 runtime。当前受支持的普通 bundle 使用：
+发布包按下表的 OS／架构组合构建；请从工作流产物或已发布发行包中选择相符的一项，解压后保留完整目录，不要移动 `eha-tool`／`eha-tool.exe`、`runtime/` 或其中的文件。当前工作流可以产出这些包，但不等同于已发布下载地址或实际 CAN 硬件验证。
 
-```sh
-python3 scripts/package_tool.py --binary /abs/target/release/eha-tool \
-  --target aarch64-apple-darwin --output /abs/eha-tool-aarch64-apple-darwin
-```
+| 主机 | CPU | 打包目标 | 归档与入口 |
+| --- | --- | --- | --- |
+| macOS | arm64 | `aarch64-apple-darwin` | `tar.gz`，`./eha-tool webui` |
+| Linux（GNU glibc，最低 2.35） | amd64 | `x86_64-unknown-linux-gnu` | `tar.gz`，`./eha-tool webui` |
+| Linux（GNU glibc，最低 2.35） | arm64 | `aarch64-unknown-linux-gnu` | `tar.gz`，`./eha-tool webui` |
+| Windows 10/11 | amd64 | `x86_64-pc-windows-msvc` | `.zip`，PowerShell 中 `./eha-tool.exe webui` |
+| Windows 11 | arm64 | `aarch64-pc-windows-msvc` | `.zip`，PowerShell 中 `./eha-tool.exe webui` |
 
-输出目录含 `eha-tool` 与 `runtime/`；这只证明包已生成，不证明任一 CAN 适配器、EHA 身份、总线、控制或机构效果。驱动打开、写调用返回或工具显示“已连接”也只证明本地阶段；仍以同一通路的 Identity 核对身份与通信设置。
+Linux 包以 Ubuntu 22.04 构建，面向 GNU glibc 系统；Alpine/musl 不在该包的运行范围。Windows 包含 `eha-tool.exe`、`runtime/python/python.exe` 和随 Python runtime 提供的 VC runtime 文件，用户不需安装 Python、pip 或 MSVC。设备驱动、访问权限、实际总线条件及厂商 SDK 仍由适配器和操作系统决定。
+
+发布包制作者在对应目标的本机／原生 CI runner 构建工具与 runtime；`package_tool.py` 拒绝在不匹配系统或 CPU 架构的宿主上制包，二进制须由对应 target 构建。具体制包维护方式见[贡献指南](CONTRIBUTING.md#依赖)。
+
+输出目录含 `eha-tool`（Windows 为 `eha-tool.exe`）与 `runtime/`；这只证明包已生成，不证明任一 CAN 适配器、EHA 身份、总线、控制或机构效果。驱动打开、写调用返回或工具显示“已连接”也只证明本地阶段；仍以同一通路的 Identity 核对身份与通信设置。
 
 ## 报文定义入口
 

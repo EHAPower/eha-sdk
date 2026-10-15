@@ -10,6 +10,15 @@
 
 `eha-tool webui` 是持续维护的图形入口，可继续开发功能、修复问题和更新测试。
 
+### 发行包
+
+从工作流产物或已发布发行包选择与主机匹配的包，整体解压后运行：macOS/Linux 使用
+`./eha-tool webui`，Windows 在 PowerShell 使用 `./eha-tool.exe webui`。不要单独移动可执行文件；同级
+`runtime/` 提供固定的 Python 和 CAN 依赖，因此普通 CANable2/SLCAN 连接不需要安装 Python、pip 或配置
+`can.conf`。发行包覆盖 macOS arm64、Linux GNU glibc amd64/arm64、Windows amd64 和 Windows 11 arm64；Linux
+需要 glibc 2.35 或更高，不支持 Alpine/musl。连接档案路径、适配器切换和高级后端条件见
+[CAN 接入指南](../../CAN接入指南.md#主机-can-通道)。
+
 ## 使用方式
 
 ### 命令行

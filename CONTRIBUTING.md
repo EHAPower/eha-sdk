@@ -14,19 +14,29 @@
 | 完整软件检查 | Python 3、Node.js 24、Clippy、rustfmt、`thumbv7em-none-eabihf` target；Python 脚本仅使用标准库 |
 | 更新工具 Web UI vendor 资源 | Node.js 24、npm；前端包由 `crates/tool/webui/package.json`／`package-lock.json` 管理 |
 | 已构建工具运行（仅 USB） | 匹配主机系统和架构的可执行文件；页面资源已内嵌，EHA 操作不需要 Python 或 Node.js |
-| 已构建工具运行（外部 CAN） | 普通发行 bundle 随附私有 `runtime/python`，可直接使用已支持 CANable2/SLCAN 连接档案；其它适配器仍需调用方明确提供带 `python-can` 的解释器、上下文、驱动、权限和总线参数。安装、打包和持久配置见 [CAN 接入指南](CAN接入指南.md#主机-can-通道) |
+| 已构建工具运行（外部 CAN） | 普通发行 bundle 随附私有 `runtime/python`，可直接使用已支持 CANable2/SLCAN 连接档案和其中已包含依赖的高级 `python-can` 后端；后端另有厂商 Python 包或 SDK 时，调用方通过 `--can-python` 明确提供解释器，并负责驱动、权限和总线参数。安装、打包和持久配置见 [CAN 接入指南](CAN接入指南.md#主机-can-通道) |
 | ODrive USB 独立只读（可选） | Python 3、`odrive==0.5.1.post0`（自带 Fibre）、PyUSB、libusb 1.0，以及 USB 驱动／访问权限 |
 
 普通 CAN bundle 的根目录只有 `eha-tool` 与私有 `runtime/python/...`。运行时隔离导入锁定的 `python-can==4.6.1`、`pyserial==3.5` 及其依赖，并保留 CPython 与各分发包许可证到 `runtime/licenses`；损坏或不匹配时工具在五秒健康检查内失败，绝不改用 `PATH` 的 Python。源码构建只可显式设置 `EHA_TOOL_DEVELOPER_PYTHON`，`--can-python PATH` 始终是高级覆盖。
 
-当前已验证的 macOS arm64 bundle 在构建出本机工具后制作：
+发行包由 `.github/workflows/tool-bundles.yml` 在对应系统和架构的原生 runner 上制作：macOS arm64、Linux GNU glibc amd64/arm64、Windows amd64/arm64。Linux job 固定 Ubuntu 22.04 作为 glibc 2.35 基线；Windows 使用 MSVC runner，分别面向 Windows 10/11 amd64 与 Windows 11 arm64。工作流上传归档产物，不会自行创建 Release；发布者应在测试后选择和发布这些产物。
+
+本地制包也必须在与目标相同的 OS 和 CPU 架构上执行。先在该主机构建 release 工具，再执行：
 
 ```sh
 python3 scripts/package_tool.py --binary /abs/target/release/eha-tool \
-  --target aarch64-apple-darwin --output /abs/eha-tool-aarch64-apple-darwin
+  --target TARGET --output /abs/eha-tool-TARGET --archive
 ```
 
-其它 OS 或架构未经该入口验证时明确拒绝；不要以本地源码虚拟环境替代正式 bundle 的运行时检查。
+Windows 制包前，在 PowerShell 设置 `$env:RUSTFLAGS = '-C target-feature=+crt-static'`，并执行
+`cargo build -p eha-tool --release --locked --target TARGET`；`--binary` 选择
+`target/TARGET/release/eha-tool.exe`。这让主程序静态链接 CRT，避免依赖用户另装 VC 运行库；
+随包 Python 仍使用自己目录中的 DLL。CI 还检查主程序的 DLL 导入，拒绝动态 VC/UCRT 依赖。
+构建选项见 [Rust CRT 链接说明](https://doc.rust-lang.org/reference/linkage.html#static-and-dynamic-c-runtimes)。
+
+其中 `TARGET` 为 `aarch64-apple-darwin`、`x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-pc-windows-msvc` 或 `aarch64-pc-windows-msvc`。`--archive` 在 Windows 输出 `.zip`，在 Unix 输出 `.tar.gz`，同时保留完整目录；不能只分发根可执行文件。制包会下载固定的 Python 3.13.16 runtime（PBS 20261009），按哈希安装锁定的 `python-can==4.6.1`、`pyserial==3.5` 和依赖，并将许可证写入 `runtime/licenses`。用户运行已生成的发行包时不需要联网安装 Python 或依赖。不要以本地源码虚拟环境替代正式 bundle 的运行时检查。
+
+用 `python3 scripts/smoke_tool_bundle.py ARCHIVE` 检查刚生成的本机发行包；工作流也使用这一入口。它在带空格的新目录解压，移除系统 Python 的搜索路径并设置无效 Python 环境，验证工具启动、连接档案目录和 CAN 枚举，不打开适配器或连接控制器。
 
 ## 构建与检查
 

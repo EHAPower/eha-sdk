@@ -1,0 +1,214 @@
+name: eha-tool 可携带发行包
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle_desktop:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            python_arch: arm64
+            rustflags: ''
+            binary: eha-tool
+            archive: .tar.gz
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            python_arch: x64
+            rustflags: '-C target-feature=+crt-static'
+            binary: eha-tool.exe
+            archive: .zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            python_arch: arm64
+            rustflags: '-C target-feature=+crt-static'
+            binary: eha-tool.exe
+            archive: .zip
+
+    steps:
+      - name: 检出 SDK
+        uses: actions/checkout@v4
+
+      # 打包器只用此 Python 构造私有 runtime；发行包运行时不依赖它。
+      - name: 准备打包 Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          architecture: ${{ matrix.python_arch }}
+
+      - name: 准备原生 Rust 稳定版
+        shell: bash
+        run: |
+          rustup toolchain install stable-${{ matrix.target }} --profile minimal
+          rustup default stable-${{ matrix.target }}
+          python - <<'PY'
+          import subprocess
+
+          host = next(
+              line.split(':', 1)[1].strip()
+              for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines()
+              if line.startswith('host:')
+          )
+          expected = '${{ matrix.target }}'
+          if host != expected:
+              raise SystemExit(f'runner Rust host {host} does not match expected {expected}')
+          PY
+
+      - name: 构建 eha-tool
+        shell: bash
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build -p eha-tool --release --locked --target ${{ matrix.target }}
+
+      - name: 拒绝主程序依赖 Visual C++ 动态运行库
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          EHA_TOOL_BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+        run: |
+          $binary = Join-Path $env:GITHUB_WORKSPACE $env:EHA_TOOL_BINARY
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "找不到已构建的 eha-tool: $binary"
+          }
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere -PathType Leaf)) {
+            throw "找不到 Visual Studio 的 vswhere: $vswhere"
+          }
+          $install = & $vswhere -latest -products * -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($install)) {
+            throw 'vswhere 未返回 Visual Studio 安装目录'
+          }
+          $preferredHost = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'Hostarm64' } else { 'Hostx64' }
+          $dumpbins = @(Get-ChildItem -Path (Join-Path $install 'VC\Tools\MSVC\*\bin\Host*\*\dumpbin.exe') -File -ErrorAction SilentlyContinue |
+            Sort-Object @{ Expression = {
+              if ($_.FullName -like "*\$preferredHost\*") { 0 }
+              elseif ($_.FullName -like '*\Hostx64\*') { 1 }
+              else { 2 }
+            } }, FullName)
+          if ($dumpbins.Count -eq 0) {
+            throw "在 $install 中找不到可用 dumpbin.exe"
+          }
+          $dependencies = $null
+          foreach ($dumpbin in $dumpbins) {
+            $output = @(& $dumpbin.FullName /DEPENDENTS $binary 2>&1)
+            if ($LASTEXITCODE -eq 0) {
+              $dependencies = $output
+              break
+            }
+          }
+          if ($null -eq $dependencies) {
+            throw '所有候选 dumpbin.exe 都无法检查 eha-tool.exe'
+          }
+          $dependencyText = $dependencies -join "`n"
+          Write-Host $dependencyText
+          $forbidden = '(?im)^\s*(?:VCRUNTIME[^\s]*\.DLL|MSVCP[^\s]*\.DLL|MSVCR\d+\.DLL|UCRTBASE\.DLL|api-ms-win-crt-[^\s]*\.DLL)\s*$'
+          $invalid = @([regex]::Matches($dependencyText, $forbidden) | ForEach-Object Value)
+          if ($invalid.Count -ne 0) {
+            throw "eha-tool.exe 仍依赖外部 Visual C++ 运行库: $($invalid -join ', ')"
+          }
+
+      - name: 构造私有运行时发行包
+        shell: bash
+        run: |
+          python scripts/package_tool.py \
+            --binary target/${{ matrix.target }}/release/${{ matrix.binary }} \
+            --target ${{ matrix.target }} \
+            --output dist/eha-tool-${{ matrix.target }} \
+            --archive
+
+      - name: 在解压后的包中做无设备自检
+        shell: bash
+        run: python scripts/smoke_tool_bundle.py dist/eha-tool-${{ matrix.target }}${{ matrix.archive }}
+
+      # main 推送和手工运行保留可下载发行包；不创建 GitHub Release。
+      - name: 上传可下载发行包
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        uses: actions/upload-artifact@v4
+        with:
+          name: eha-tool-${{ matrix.target }}
+          path: dist/eha-tool-${{ matrix.target }}${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  bundle_linux:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: eha-tool
+            archive: .tar.gz
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: eha-tool
+            archive: .tar.gz
+
+    steps:
+      - name: 安装构建环境
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential ca-certificates curl git python3
+
+      - name: 检出 SDK
+        uses: actions/checkout@v4
+
+      - name: 准备 Ubuntu 22.04 原生 Rust 稳定版
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+          . "$HOME/.cargo/env"
+          python3 - <<'PY'
+          import subprocess
+
+          host = next(
+              line.split(':', 1)[1].strip()
+              for line in subprocess.check_output(['rustc', '-vV'], text=True).splitlines()
+              if line.startswith('host:')
+          )
+          expected = '${{ matrix.target }}'
+          if host != expected:
+              raise SystemExit(f'runner Rust host {host} does not match expected {expected}')
+          PY
+          ldd --version | head -n 1
+
+      - name: 构建 eha-tool
+        shell: bash
+        run: |
+          . "$HOME/.cargo/env"
+          cargo build -p eha-tool --release --locked
+
+      - name: 构造私有运行时发行包
+        shell: bash
+        run: |
+          python3 scripts/package_tool.py \
+            --binary target/release/${{ matrix.binary }} \
+            --target ${{ matrix.target }} \
+            --output dist/eha-tool-${{ matrix.target }} \
+            --archive
+
+      - name: 在解压后的包中做无设备自检
+        shell: bash
+        run: python3 scripts/smoke_tool_bundle.py dist/eha-tool-${{ matrix.target }}${{ matrix.archive }}
+
+      - name: 上传可下载发行包
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        uses: actions/upload-artifact@v4
+        with:
+          name: eha-tool-${{ matrix.target }}
+          path: dist/eha-tool-${{ matrix.target }}${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14

@@ -1,6 +1,7 @@
 # Copyright The eha-sdk Contributors
 
 /target/
+/dist/
 /.venv/
 .DS_Store
 .env

@@ -128,13 +128,17 @@ fn resolve(
 }
 
 fn bundled_python(runtime: &Path) -> PathBuf {
-    #[cfg(windows)]
-    {
-        runtime.join("python").join("python.exe")
-    }
-    #[cfg(not(windows))]
-    {
-        runtime.join("python").join("bin").join("python3")
+    bundled_python_for_platform(runtime, cfg!(windows))
+}
+
+/// `python-build-standalone` 的 Windows 安装包把解释器放在 `python/`，Unix 包则放在
+/// `python/bin/`。独立出这个纯函数，让非 Windows CI 也能验证 Windows 发行布局。
+fn bundled_python_for_platform(runtime: &Path, windows: bool) -> PathBuf {
+    let python = runtime.join("python");
+    if windows {
+        python.join("python.exe")
+    } else {
+        python.join("bin").join("python3")
     }
 }
 
@@ -190,7 +194,7 @@ fn verify(python: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Resolution, bundled_python, resolve};
+    use super::{Resolution, bundled_python, bundled_python_for_platform, resolve};
     use std::{
         fs,
         path::PathBuf,
@@ -238,6 +242,19 @@ mod tests {
         assert_eq!(
             resolve(&executable, None, None),
             Ok(Resolution::Bundled(python))
+        );
+    }
+
+    #[test]
+    fn windows_distribution_layout_uses_python_exe() {
+        let runtime = PathBuf::from("C:/eha-tool/runtime");
+        assert_eq!(
+            bundled_python_for_platform(&runtime, true),
+            runtime.join("python").join("python.exe")
+        );
+        assert_eq!(
+            bundled_python_for_platform(&runtime, false),
+            runtime.join("python").join("bin").join("python3")
         );
     }
 

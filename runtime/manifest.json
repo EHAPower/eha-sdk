@@ -7,6 +7,26 @@
       "archive_name": "cpython-3.13.16+20261009-aarch64-apple-darwin-install_only.tar.gz",
       "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.13.16%2B20261009-aarch64-apple-darwin-install_only.tar.gz",
       "sha256": "3338fcd572a670ec45ac9ef75480b95595ea9b6b5dd320952fcf5df185089941"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "archive_name": "cpython-3.13.16+20261009-aarch64-unknown-linux-gnu-install_only.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.13.16%2B20261009-aarch64-unknown-linux-gnu-install_only.tar.gz",
+      "sha256": "397ca401f416c3c99330a6be16d735d0cbeaf53e82070b80395b2fb4a8891f34"
+    },
+    "aarch64-pc-windows-msvc": {
+      "archive_name": "cpython-3.13.16+20261009-aarch64-pc-windows-msvc-install_only.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.13.16%2B20261009-aarch64-pc-windows-msvc-install_only.tar.gz",
+      "sha256": "76b76cbc2f3036b62cfa03bcc50acd24266be4099abd5b4e908844e761126fc2"
+    },
+    "x86_64-pc-windows-msvc": {
+      "archive_name": "cpython-3.13.16+20261009-x86_64-pc-windows-msvc-install_only.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.13.16%2B20261009-x86_64-pc-windows-msvc-install_only.tar.gz",
+      "sha256": "286285f159bc711e4f0d89bd3d01993d3a321b84bd6593bd66dc816c23609388"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "archive_name": "cpython-3.13.16+20261009-x86_64-unknown-linux-gnu-install_only.tar.gz",
+      "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261009/cpython-3.13.16%2B20261009-x86_64-unknown-linux-gnu-install_only.tar.gz",
+      "sha256": "1cca1041f693f110a2e0d16417090b8996258c7a121e90eeab66c2f40ea407f2"
     }
   }
 }

@@ -9,7 +9,7 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::Arc,
     thread,
@@ -88,7 +88,19 @@ pub(crate) struct ConnectionStore {
 
 impl ConnectionStore {
     pub(crate) fn load_default() -> Self {
-        Self::load(default_path())
+        match default_path() {
+            Ok(path) => Self::load(path),
+            Err(error) => Self::unavailable(error),
+        }
+    }
+
+    fn unavailable(error: String) -> Self {
+        Self {
+            path: PathBuf::new(),
+            profiles: BTreeMap::new(),
+            load_error: Some(error),
+            autoconnect: json!({"attempted":false,"status":"idle","error":null}),
+        }
     }
 
     pub(crate) fn load(path: PathBuf) -> Self {
@@ -133,7 +145,7 @@ impl ConnectionStore {
         json!({
             "ok": self.load_error.is_none(),
             "profiles": self.profiles.values().collect::<Vec<_>>(),
-            "path": self.path,
+            "path": (!self.path.as_os_str().is_empty()).then_some(&self.path),
             "load_error": self.load_error,
             "autoconnect": self.autoconnect,
         })
@@ -395,26 +407,69 @@ pub(crate) fn expected_uid_matches(expected: Option<&str>, identity: &Value) -> 
     }
 }
 
-pub(crate) fn default_path() -> PathBuf {
-    if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(path)
-            .join("eha-tool")
-            .join("connections.json");
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = env::var_os("HOME") {
-        return PathBuf::from(home)
-            .join("Library")
-            .join("Application Support")
-            .join("eha-tool")
-            .join("connections.json");
-    }
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| Path::new(".").to_path_buf())
-        .join(".config")
+pub(crate) fn default_path() -> Result<PathBuf, String> {
+    default_path_for_platform(
+        if cfg!(windows) {
+            Platform::Windows
+        } else if cfg!(target_os = "macos") {
+            Platform::MacOs
+        } else {
+            Platform::Unix
+        },
+        env::var_os("XDG_CONFIG_HOME"),
+        env::var_os("HOME"),
+        env::var_os("LOCALAPPDATA"),
+        env::var_os("APPDATA"),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum Platform {
+    Windows,
+    MacOs,
+    Unix,
+}
+
+fn default_path_for_platform(
+    platform: Platform,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    local_app_data: Option<std::ffi::OsString>,
+    app_data: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    let root = match platform {
+        Platform::Windows => local_app_data.or(app_data).ok_or_else(|| {
+            "无法确定 Windows 连接档案目录：请设置 LOCALAPPDATA 或 APPDATA 后重试".to_owned()
+        })?,
+        Platform::MacOs => {
+            if let Some(xdg) = xdg_config_home {
+                return Ok(PathBuf::from(xdg).join("eha-tool").join("connections.json"));
+            }
+            let home = home.ok_or_else(|| {
+                "无法确定 macOS 连接档案目录：请设置 HOME 或 XDG_CONFIG_HOME 后重试".to_owned()
+            })?;
+            return Ok(PathBuf::from(home)
+                .join("Library")
+                .join("Application Support")
+                .join("eha-tool")
+                .join("connections.json"));
+        }
+        Platform::Unix => {
+            if let Some(xdg) = xdg_config_home {
+                return Ok(PathBuf::from(xdg).join("eha-tool").join("connections.json"));
+            }
+            let home = home.ok_or_else(|| {
+                "无法确定连接档案目录：请设置 HOME 或 XDG_CONFIG_HOME 后重试".to_owned()
+            })?;
+            return Ok(PathBuf::from(home)
+                .join(".config")
+                .join("eha-tool")
+                .join("connections.json"));
+        }
+    };
+    Ok(PathBuf::from(root)
         .join("eha-tool")
-        .join("connections.json")
+        .join("connections.json"))
 }
 
 fn valid_id(value: &str) -> bool {
@@ -431,6 +486,59 @@ fn valid_uid(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_profile_path_is_platform_specific_without_current_directory_fallback() {
+        assert_eq!(
+            default_path_for_platform(
+                Platform::Windows,
+                Some("C:/ignored-xdg".into()),
+                Some("C:/Users/eha".into()),
+                Some("C:/Users/eha/AppData/Local".into()),
+                Some("C:/Users/eha/AppData/Roaming".into()),
+            ),
+            Ok(PathBuf::from("C:/Users/eha/AppData/Local")
+                .join("eha-tool")
+                .join("connections.json"))
+        );
+        assert_eq!(
+            default_path_for_platform(
+                Platform::Windows,
+                None,
+                None,
+                None,
+                Some("C:/Users/eha/AppData/Roaming".into()),
+            ),
+            Ok(PathBuf::from("C:/Users/eha/AppData/Roaming")
+                .join("eha-tool")
+                .join("connections.json"))
+        );
+        let error = default_path_for_platform(Platform::Windows, None, None, None, None)
+            .expect_err("Windows needs a user data directory");
+        assert!(error.contains("LOCALAPPDATA"));
+
+        assert_eq!(
+            default_path_for_platform(
+                Platform::MacOs,
+                Some("/tmp/xdg".into()),
+                Some("/Users/eha".into()),
+                None,
+                None,
+            ),
+            Ok(PathBuf::from("/tmp/xdg")
+                .join("eha-tool")
+                .join("connections.json"))
+        );
+        assert_eq!(
+            default_path_for_platform(Platform::Unix, None, Some("/home/eha".into()), None, None,),
+            Ok(PathBuf::from("/home/eha")
+                .join(".config")
+                .join("eha-tool")
+                .join("connections.json"))
+        );
+        assert!(default_path_for_platform(Platform::Unix, None, None, None, None).is_err());
+    }
+
     #[test]
     fn profile_rejects_unstable_or_unsafe_values() {
         let mut profile = ConnectionProfile {
