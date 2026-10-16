@@ -5,6 +5,7 @@
 - 配置字段、schema 与纯换算归 [`eha-config`](crates/config/README.md)，完整静态检查归 SDK；固件算法、板级接入、存储实现和产品出厂参数留在 firmware。公开资料必须能在独立 SDK 检出中使用。
 - [`eha-tool`](crates/tool/README.md) 的 CLI、Shell、WebUI 复用 SDK，不复制协议、配置检查或固件决策。公开 API 或结果语义变化须说明兼容影响；区分本地提交、收到回复和设备效果，未知副作用不得自动重放。
 - SDK 只定义通道上的通用帧 I/O，不发现、初始化或恢复物理 CAN 设备，也不实现厂商协议。官方 `eha-tool` 可维护每用户连接档案和随包 runtime；其受支持适配器、身份绑定、候选歧义、显式恢复和高级 `python-can` 边界由 [CAN 接入指南](CAN接入指南.md)唯一维护。连接或物理重连不启心跳、不恢复控制或重放动作。
+- SDK、公共合同和 `eha-tool` 的问题在[本仓 GitHub Issues](https://github.com/EHAPower/eha-sdk/issues)跟踪，不维护仓内问题台账；公开内容不得包含未公开的固件或产品资料。
 - 技能或脚本指引失效时，在已授权范围内修正并验证原失败步骤；按实际失败场景选择检查，不为简单编排新增测试框架。
 
 - 自有 Rust 业务浮点字段、状态、计算与测试使用 `f32`；计数和时间保持整数。输入按原始十进制文本一次舍入为 binary32，遵循公共数值约定；不得把 JSON `Value` 或显示精度回流业务数值。变更后按影响运行 `scripts/check.py`，该入口检查业务代码数值规则。
